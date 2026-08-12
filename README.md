@@ -1,4 +1,8 @@
-# SquashBot
+<p align="center">
+  <img src="assets/squashbot-logo.png" alt="SquashBot logo" width="220">
+</p>
+
+<h1 align="center">SquashBot</h1>
 
 Telegram group bot for tracking squash court bookings on one pinned board.
 
