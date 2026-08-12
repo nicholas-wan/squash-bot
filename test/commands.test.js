@@ -40,5 +40,7 @@ describe('Telegram commands', () => {
     });
     const send = requests.find((request) => request.url.endsWith('/sendMessage'));
     expect(send.body.text).toContain('<b>SquashBot</b>');
+    const removed = requests.find((request) => request.url.endsWith('/deleteMessage'));
+    expect(removed.body.message_id).toBe(5);
   });
 });

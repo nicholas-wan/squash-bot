@@ -1,5 +1,8 @@
-import { cancelBooking, runMaintenance, updateBoard } from './bookings.js';
-import { deleteMessage, escapeHtml, sendMessage, telegram } from './telegram.js';
+import {
+  cancelBooking, restoreBoardButtons, runMaintenance, showBoardManager,
+  showCancelConfirmation, updateBoard,
+} from './bookings.js';
+import { answerCallback, deleteMessage, escapeHtml, sendMessage, telegram } from './telegram.js';
 import {
   beginBooking, handleBookingCallback, handleBookingReply, pruneBookingDrafts,
 } from './wizard.js';
@@ -22,12 +25,54 @@ function helpHtml() {
     '/book — open a blank booking form';
 }
 
+async function handleBoardCallback(env, callback) {
+  const data = String(callback.data || '');
+  if (!data.startsWith('sb:') || !callback.message) return false;
+  const chatId = callback.message.chat.id;
+  const messageId = callback.message.message_id;
+
+  if (data === 'sb:add') {
+    await beginBooking(env, {
+      chat: callback.message.chat,
+      from: callback.from,
+      message_id: messageId,
+    }, '', { forceIntent: true });
+    await answerCallback(env, callback.id, 'Booking form opened');
+    return true;
+  }
+  if (data === 'sb:manage') {
+    await showBoardManager(env, chatId, messageId);
+    await answerCallback(env, callback.id);
+    return true;
+  }
+  if (data === 'sb:back') {
+    await restoreBoardButtons(env, chatId, messageId);
+    await answerCallback(env, callback.id);
+    return true;
+  }
+  const pick = data.match(/^sb:pick:(\d+)$/);
+  if (pick) {
+    const found = await showCancelConfirmation(env, chatId, messageId, Number(pick[1]));
+    await answerCallback(env, callback.id, found ? '' : 'That booking has already gone.', !found);
+    if (!found) await updateBoard(env, chatId);
+    return true;
+  }
+  const cancel = data.match(/^sb:cancel:(\d+)$/);
+  if (cancel) {
+    const removed = await cancelBooking(env, chatId, Number(cancel[1]));
+    await answerCallback(env, callback.id,
+      removed ? 'Booking cancelled' : 'That booking has already gone.', !removed);
+    return true;
+  }
+  return false;
+}
+
 export async function handleUpdate(env, update) {
   const callback = update.callback_query;
   if (callback && callback.message) {
     if (!chatAllowed(env, callback.message.chat && callback.message.chat.id)) return;
     try {
-      await handleBookingCallback(env, callback);
+      if (!(await handleBoardCallback(env, callback))) await handleBookingCallback(env, callback);
     } catch (error) {
       console.log(`Callback failed: ${error.stack || error}`);
     }
@@ -49,6 +94,12 @@ export async function handleUpdate(env, update) {
     if (!match) return;
     const command = match[1].toLowerCase();
     const args = (match[2] || '').trim();
+    const knownCommands = new Set(['start', 'help', 'book', 'courts', 'cancel']);
+    if (knownCommands.has(command)) {
+      // Telegram commands are normal group messages, so they exist briefly.
+      // With Delete Messages permission the bot removes them immediately.
+      await deleteMessage(env, msg.chat.id, msg.message_id);
+    }
 
     if (command === 'start' || command === 'help') {
       await sendMessage(env, msg.chat.id, helpHtml());
@@ -56,12 +107,10 @@ export async function handleUpdate(env, update) {
     }
     if (command === 'book') {
       await beginBooking(env, msg, args, { forceIntent: true });
-      await deleteMessage(env, msg.chat.id, msg.message_id);
       return;
     }
     if (command === 'courts') {
       await updateBoard(env, msg.chat.id);
-      await deleteMessage(env, msg.chat.id, msg.message_id);
       return;
     }
     if (command === 'cancel') {
@@ -74,7 +123,6 @@ export async function handleUpdate(env, update) {
         removed ? `🗑 Removed booking <b>#${escapeHtml(args)}</b>.` : `I couldn't find booking <b>#${escapeHtml(args)}</b>.`,
         { silent: true }
       );
-      if (removed) await deleteMessage(env, msg.chat.id, msg.message_id);
       return;
     }
   } catch (error) {
@@ -134,6 +182,14 @@ export default {
         : JSON.stringify({ webhook, commands, profile, chats }), {
         status: ok ? 200 : 500,
       });
+    }
+
+    if (url.pathname === '/refresh') {
+      if (request.method !== 'POST') return new Response('method not allowed', { status: 405 });
+      if (!adminAuthorized(request, env)) return new Response('forbidden', { status: 403 });
+      const chatIds = String(env.ALLOWED_CHATS || '').split(',').map((id) => id.trim()).filter(Boolean);
+      await Promise.all(chatIds.map((chatId) => updateBoard(env, Number(chatId))));
+      return new Response(`Refreshed ${chatIds.length} pinned board(s).`);
     }
 
     return new Response('squashbot is running');

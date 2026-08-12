@@ -1,9 +1,10 @@
 import { formatDate, formatTime, localParts } from './time.js';
 import {
-  deleteMessage, editMessage, escapeHtml, mentionHtml, pinMessage, sendMessage, unpinMessage,
+  deleteMessage, editMessage, editReplyMarkup, escapeHtml, mentionHtml, pinMessage, sendMessage, unpinMessage,
 } from './telegram.js';
 
 const DEFAULT_TZ = 'Asia/Singapore';
+const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 export async function getTimezone(env, chatId) {
   const row = await env.DB.prepare('SELECT tz FROM settings WHERE chat_id = ?').bind(chatId).first();
@@ -35,23 +36,56 @@ export async function cancelBooking(env, chatId, id) {
   return Boolean(result.meta.changes);
 }
 
+function clock(epochMs, tz) {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, hour: 'numeric', minute: '2-digit', hour12: true,
+  }).format(new Date(epochMs));
+}
+
+// Same hybrid countdown used by NagBot's pinned dashboard.
+export function formatCountdown(epochMs, tz, now = Date.now()) {
+  const target = localParts(epochMs, tz);
+  const current = localParts(now, tz);
+  const days = Math.round((
+    Date.UTC(target.y, target.mo - 1, target.d)
+    - Date.UTC(current.y, current.mo - 1, current.d)
+  ) / 86400000);
+  const time = clock(epochMs, tz);
+  if (days <= 0) return `today ${time}`;
+  if (days === 1) return `tomorrow ${time}`;
+  const weekday = DAY_NAMES[new Date(Date.UTC(target.y, target.mo - 1, target.d)).getUTCDay()];
+  const absolute = days < 7 ? `${weekday} ${time}` : new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true,
+  }).format(new Date(epochMs));
+  return `in ${days} days · ${absolute}`;
+}
+
+async function activeBookings(env, chatId, now = Date.now()) {
+  return (await env.DB.prepare(
+    'SELECT * FROM bookings WHERE chat_id = ? AND ends_at > ? ORDER BY starts_at, court, id'
+  ).bind(chatId, now).all()).results;
+}
+
+function defaultBoardButtons(hasBookings) {
+  const row = [{ text: '➕ Add booking', callback_data: 'sb:add' }];
+  if (hasBookings) row.push({ text: '⚙️ Manage bookings', callback_data: 'sb:manage' });
+  return { inline_keyboard: [row] };
+}
+
 export async function boardHtml(env, chatId, now = Date.now()) {
   const tz = await getTimezone(env, chatId);
-  const { results } = await env.DB.prepare(
-    'SELECT * FROM bookings WHERE chat_id = ? AND ends_at > ? ORDER BY starts_at, court, id'
-  ).bind(chatId, now).all();
+  const results = await activeBookings(env, chatId, now);
   if (!results.length) return null;
 
   const lines = ['🎾 <b>Upcoming squash courts</b>', ''];
   for (const booking of results) {
-    const owner = booking.created_by_name ? ` · ${escapeHtml(booking.created_by_name)}` : '';
     lines.push(
-      `<b>#${booking.id} · ${escapeHtml(booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`)}</b>`,
-      `${formatDate(booking.starts_at, tz)} · ${formatTime(booking.starts_at, tz)}–${formatTime(booking.ends_at, tz)}${owner}`
+      `${formatCountdown(booking.starts_at, tz, now)} · <b>${escapeHtml(booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`)}</b>`,
+      `      <i>${formatDate(booking.starts_at, tz)} · ${formatTime(booking.starts_at, tz)}–${formatTime(booking.ends_at, tz)}</i>`
     );
+    lines.push('');
   }
-  lines.push('', 'Add: <code>13 Aug Court 4 9pm</code>', 'Cancel: <code>/cancel ID</code>');
-  return lines.join('\n');
+  return lines.join('\n').trimEnd();
 }
 
 export async function updateBoard(env, chatId, now = Date.now()) {
@@ -71,11 +105,13 @@ export async function updateBoard(env, chatId, now = Date.now()) {
   }
 
   if (existingId) {
-    const edited = await editMessage(env, chatId, existingId, html);
+    const edited = await editMessage(env, chatId, existingId, html, defaultBoardButtons(true));
     if (edited.ok || String(edited.description || '').includes('message is not modified')) return;
   }
 
-  const sent = await sendMessage(env, chatId, html, { silent: true });
+  const sent = await sendMessage(env, chatId, html, {
+    silent: true, replyMarkup: defaultBoardButtons(true),
+  });
   if (!sent.ok) throw new Error(`Could not create court board: ${sent.description || 'unknown Telegram error'}`);
   const pinned = await pinMessage(env, chatId, sent.result.message_id);
   if (!pinned.ok) {
@@ -86,6 +122,35 @@ export async function updateBoard(env, chatId, now = Date.now()) {
     `INSERT INTO settings (chat_id, board_message_id) VALUES (?, ?)
      ON CONFLICT(chat_id) DO UPDATE SET board_message_id = excluded.board_message_id`
   ).bind(chatId, sent.result.message_id).run();
+}
+
+export async function showBoardManager(env, chatId, messageId, now = Date.now()) {
+  const bookings = await activeBookings(env, chatId, now);
+  const rows = bookings.map((booking) => [{
+    text: `✏️ #${booking.id} · ${booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`}`,
+    callback_data: `sb:pick:${booking.id}`,
+  }]);
+  rows.push([{ text: '➕ Add booking', callback_data: 'sb:add' }]);
+  rows.push([{ text: '← Back', callback_data: 'sb:back' }]);
+  return editReplyMarkup(env, chatId, messageId, { inline_keyboard: rows });
+}
+
+export async function showCancelConfirmation(env, chatId, messageId, bookingId) {
+  const booking = await env.DB.prepare(
+    'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
+  ).bind(bookingId, chatId, Date.now()).first();
+  if (!booking) return false;
+  const court = booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`;
+  await editReplyMarkup(env, chatId, messageId, { inline_keyboard: [
+    [{ text: `🗑 Cancel #${booking.id} · ${court}`, callback_data: `sb:cancel:${booking.id}` }],
+    [{ text: '← Back to bookings', callback_data: 'sb:manage' }],
+  ] });
+  return true;
+}
+
+export async function restoreBoardButtons(env, chatId, messageId) {
+  const bookings = await activeBookings(env, chatId);
+  return editReplyMarkup(env, chatId, messageId, defaultBoardButtons(bookings.length > 0));
 }
 
 async function sendDueReminders(env, now) {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { analyzeBooking, BookingParseError, draftComplete, parseBooking } from '../src/parser.js';
 import { localParts } from '../src/time.js';
+import { formatCountdown } from '../src/bookings.js';
 
 const TZ = 'Asia/Singapore';
 const NOW = Date.UTC(2026, 7, 12, 12, 0, 0); // 12 Aug 2026, 8pm SGT
@@ -94,5 +95,13 @@ describe('confidence-based natural language parsing', () => {
 
   it('ignores unrelated group conversation', () => {
     expect(analyzeBooking('Dinner tomorrow at 9pm', NOW, TZ)).toBeNull();
+  });
+});
+
+describe('pinned-board countdown', () => {
+  it('matches NagBot wording for today, tomorrow, and later dates', () => {
+    expect(formatCountdown(Date.UTC(2026, 7, 12, 13, 0), TZ, NOW)).toBe('today 9:00 PM');
+    expect(formatCountdown(Date.UTC(2026, 7, 13, 13, 0), TZ, NOW)).toBe('tomorrow 9:00 PM');
+    expect(formatCountdown(Date.UTC(2026, 7, 15, 13, 0), TZ, NOW)).toBe('in 3 days · Sat 9:00 PM');
   });
 });

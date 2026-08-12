@@ -34,6 +34,12 @@ export function editMessage(env, chatId, messageId, html, replyMarkup = null) {
   return telegram(env, 'editMessageText', body);
 }
 
+export function editReplyMarkup(env, chatId, messageId, replyMarkup) {
+  return telegram(env, 'editMessageReplyMarkup', {
+    chat_id: chatId, message_id: messageId, reply_markup: replyMarkup,
+  });
+}
+
 export function deleteMessage(env, chatId, messageId) {
   return telegram(env, 'deleteMessage', { chat_id: chatId, message_id: messageId });
 }
