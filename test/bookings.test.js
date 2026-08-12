@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  addBooking, boardHtml, cancelBooking, showBoardManager, showCancelConfirmation,
+  addBooking, boardHtml, cancelBooking, runMaintenance, showBoardManager,
+  showCancelConfirmation,
 } from '../src/bookings.js';
 
 const startsAt = Date.UTC(2026, 7, 19, 13, 0);
@@ -106,5 +107,43 @@ describe('public booking announcements', () => {
       'in 7 days · Aug 19 · 9:00–10:00 PM · <b>Court 4</b>'
     );
     expect(html.split('\n')).toHaveLength(3);
+  });
+
+  it('sends a public reminder two hours before squash', async () => {
+    const requests = captureTelegram();
+    const reminderBooking = {
+      ...storedBooking,
+      created_by_user_id: 7,
+      created_by_name: 'Nick',
+      pre_reminder_at: startsAt - 2 * 60 * 60 * 1000,
+      pre_reminder_sent: 0,
+    };
+    const db = {
+      prepare(sql) {
+        return {
+          bind() {
+            return {
+              async first() {
+                return sql.includes('SELECT tz') ? { tz: 'Asia/Singapore' } : null;
+              },
+              async all() {
+                if (sql.includes('pre_reminder_sent = 0')) {
+                  return { results: [reminderBooking] };
+                }
+                return { results: [] };
+              },
+              async run() { return { meta: { changes: 1 } }; },
+            };
+          },
+        };
+      },
+    };
+    await runMaintenance(
+      { BOT_TOKEN: 'test', DB: db }, startsAt - 2 * 60 * 60 * 1000
+    );
+    const reminder = requests.find((request) => request.url.endsWith('/sendMessage'));
+    expect(reminder.body.text).toContain('squash in 2 hours!');
+    expect(reminder.body.text).toContain('Court 4');
+    expect(reminder.body).not.toHaveProperty('receiver_user_id');
   });
 });

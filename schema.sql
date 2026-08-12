@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS bookings (
   ends_at INTEGER NOT NULL,
   reminder_at INTEGER NOT NULL,
   reminder_sent INTEGER NOT NULL DEFAULT 0,
+  pre_reminder_at INTEGER NOT NULL,
+  pre_reminder_sent INTEGER NOT NULL DEFAULT 0,
   created_by_user_id INTEGER,
   created_by_name TEXT,
   source_text TEXT,
@@ -41,6 +43,10 @@ CREATE INDEX IF NOT EXISTS idx_bookings_board
 CREATE INDEX IF NOT EXISTS idx_bookings_reminder
   ON bookings (reminder_sent, reminder_at)
   WHERE reminder_sent = 0;
+
+CREATE INDEX IF NOT EXISTS idx_bookings_pre_reminder
+  ON bookings (pre_reminder_sent, pre_reminder_at)
+  WHERE pre_reminder_sent = 0;
 
 CREATE INDEX IF NOT EXISTS idx_bookings_cleanup
   ON bookings (ends_at);

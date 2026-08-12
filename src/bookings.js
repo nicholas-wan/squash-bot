@@ -28,13 +28,18 @@ async function announceBookingChange(env, chatId, booking, action) {
 }
 
 export async function addBooking(env, chatId, parsed, from, sourceText = null) {
+  const now = Date.now();
+  const preReminderAt = parsed.startsAt - 2 * 60 * 60 * 1000;
+  const preReminderSent = preReminderAt <= now ? 1 : 0;
   const result = await env.DB.prepare(
     `INSERT INTO bookings
-      (chat_id, court, starts_at, ends_at, reminder_at, created_by_user_id, created_by_name, source_text, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      (chat_id, court, starts_at, ends_at, reminder_at, pre_reminder_at,
+       pre_reminder_sent, created_by_user_id, created_by_name, source_text, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     chatId, parsed.court, parsed.startsAt, parsed.endsAt, parsed.reminderAt,
-    from && from.id || null, ownerName(from), sourceText, Date.now()
+    preReminderAt, preReminderSent, from && from.id || null,
+    ownerName(from), sourceText, now
   ).run();
   await updateBoard(env, chatId);
   await announceBookingChange(env, chatId, parsed, 'booked');
@@ -226,6 +231,39 @@ async function sendDueReminders(env, now) {
   }
 }
 
+async function sendPreReminders(env, now) {
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM bookings
+     WHERE pre_reminder_sent = 0 AND pre_reminder_at <= ? AND starts_at > ?
+     ORDER BY pre_reminder_at LIMIT 100`
+  ).bind(now, now).all();
+
+  for (const booking of results) {
+    try {
+      const claim = await env.DB.prepare(
+        'UPDATE bookings SET pre_reminder_sent = 1 WHERE id = ? AND pre_reminder_sent = 0'
+      ).bind(booking.id).run();
+      if (!claim.meta.changes) continue;
+      const tz = await getTimezone(env, booking.chat_id);
+      const who = mentionHtml(booking.created_by_user_id, booking.created_by_name || 'Squash player');
+      const court = escapeHtml(
+        booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`
+      );
+      const sent = await sendMessage(env, booking.chat_id,
+        `🎾 ${who}, squash in 2 hours!\n` +
+        `<b>${court}</b> · ${formatTime(booking.starts_at, tz)}–${formatTime(booking.ends_at, tz)}`
+      );
+      if (!sent.ok) {
+        await env.DB.prepare(
+          'UPDATE bookings SET pre_reminder_sent = 0 WHERE id = ?'
+        ).bind(booking.id).run();
+      }
+    } catch (error) {
+      console.log(`Two-hour reminder ${booking.id} failed: ${error.stack || error}`);
+    }
+  }
+}
+
 async function removeExpiredBookings(env, now) {
   const { results } = await env.DB.prepare(
     'SELECT DISTINCT chat_id FROM bookings WHERE ends_at <= ?'
@@ -244,6 +282,11 @@ async function removeExpiredBookings(env, now) {
 }
 
 export async function runMaintenance(env, now = Date.now()) {
+  try {
+    await sendPreReminders(env, now);
+  } catch (error) {
+    console.log(`Two-hour reminder maintenance failed: ${error.stack || error}`);
+  }
   try {
     await sendDueReminders(env, now);
   } catch (error) {

@@ -22,8 +22,9 @@ display who created a booking or written add/cancel instructions. Cancellation
 requires a button confirmation on the same pinned message. The edit menu identifies every booking
 by court, date, and time; internal booking IDs are hidden from its labels.
 
-SquashBot sends an 8am same-day reminder (or one hour before early bookings),
-removes expired slots, and deletes the pinned board when no bookings remain.
+SquashBot sends a public reminder two hours before each booking, plus an 8am
+same-day reminder (or one hour before early bookings). It removes expired slots
+and deletes the pinned board when no bookings remain.
 
 ## Commands
 
