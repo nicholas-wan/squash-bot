@@ -25,6 +25,19 @@ function helpHtml() {
     '/book — open a blank booking form';
 }
 
+async function helpBoardMarkup(env, chatId) {
+  const setting = await env.DB.prepare(
+    'SELECT board_message_id FROM settings WHERE chat_id = ?'
+  ).bind(chatId).first();
+  if (!setting || !setting.board_message_id) return null;
+  const internalChatId = String(chatId).replace(/^-100/, '');
+  if (!/^\d+$/.test(internalChatId)) return null;
+  return { inline_keyboard: [[{
+    text: '📌 View pinned court board',
+    url: `https://t.me/c/${internalChatId}/${setting.board_message_id}`,
+  }]] };
+}
+
 async function handleBoardCallback(env, callback) {
   const data = String(callback.data || '');
   if (!data.startsWith('sb:') || !callback.message) return false;
@@ -76,7 +89,8 @@ async function handleBoardCallback(env, callback) {
     const removed = await cancelBooking(env, chatId, Number(cancel[1]));
     if (ephemeralMessageId) {
       await showBoardManager(
-        env, chatId, receiverUserId, callback.id, ephemeralMessageId
+        env, chatId, receiverUserId, callback.id, ephemeralMessageId,
+        Date.now(), removed ? `✅ Removed booking <b>#${Number(cancel[1])}</b>.` : ''
       );
     }
     await answerCallback(env, callback.id,
@@ -121,9 +135,11 @@ export async function handleUpdate(env, update) {
     }
 
     if (command === 'start' || command === 'help') {
+      const replyMarkup = await helpBoardMarkup(env, msg.chat.id);
       await sendMessage(env, msg.chat.id, helpHtml(), {
         receiverUserId: msg.from.id,
         replyToEphemeral: msg.ephemeral_message_id || null,
+        replyMarkup,
       });
       return;
     }

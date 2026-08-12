@@ -30,12 +30,18 @@ removes expired slots, and deletes the pinned board when no bookings remain.
 /help           Show examples
 ```
 
-Commands and SquashBot's help, forms, confirmations, errors, and booking manager
-are ephemeral: only the requester and bot can see them. The shared pinned board
-and same-day reminders remain visible to the group. Older Telegram clients may
-send commands normally; SquashBot deletes those immediately when it has Delete
+When a pinned board exists, `/help` includes a button linking directly to it.
+
+Commands and SquashBot's help, forms, private confirmations, errors, and booking
+manager are ephemeral: only the requester and bot can see them. Every successful
+booking addition or removal is also announced to the whole group. The pinned
+board and same-day reminders remain shared. Older Telegram clients may send
+commands normally; SquashBot deletes those immediately when it has Delete
 Messages permission. Telegram does not guarantee ephemeral delivery when the
 requester is offline.
+
+Adding or removing a booking leaves a private confirmation for the requester,
+updates the shared pinned board, and posts a public group announcement.
 
 ## Deploy
 

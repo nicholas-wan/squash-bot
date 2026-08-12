@@ -68,6 +68,32 @@ describe('Telegram commands', () => {
     expect(send.body.text).toContain('Manage squash bookings');
   });
 
+  it('links help to the current pinned court board', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify({ ok: true, result: { ephemeral_message_id: 12 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const db = {
+      prepare() {
+        return { bind() { return { async first() { return { board_message_id: 20 }; } }; } };
+      },
+    };
+    await handleUpdate({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-1004418632524', DB: db }, {
+      message: {
+        ephemeral_message_id: 8,
+        chat: { id: -1004418632524 },
+        from: { id: 7, first_name: 'Nick' },
+        text: '/help',
+      },
+    });
+    const send = requests.find((request) => request.url.endsWith('/sendMessage'));
+    expect(send.body.reply_markup.inline_keyboard[0][0].url)
+      .toBe('https://t.me/c/4418632524/20');
+  });
+
   it('registers every command as ephemeral', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {

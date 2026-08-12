@@ -17,6 +17,17 @@ function ownerName(from) {
   return from.username ? `@${from.username}` : from.first_name || null;
 }
 
+async function announceBookingChange(env, chatId, booking, action) {
+  const tz = await getTimezone(env, chatId);
+  const startsAt = booking.startsAt ?? booking.starts_at;
+  const endsAt = booking.endsAt ?? booking.ends_at;
+  const court = booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`;
+  await sendMessage(env, chatId,
+    `🎾 <b>${escapeHtml(court)} ${action}</b>\n` +
+    `${formatDate(startsAt, tz)} · ${formatTime(startsAt, tz)}–${formatTime(endsAt, tz)}`
+  );
+}
+
 export async function addBooking(env, chatId, parsed, from) {
   const result = await env.DB.prepare(
     `INSERT INTO bookings
@@ -27,13 +38,20 @@ export async function addBooking(env, chatId, parsed, from) {
     from && from.id || null, ownerName(from), Date.now()
   ).run();
   await updateBoard(env, chatId);
+  await announceBookingChange(env, chatId, parsed, 'booked');
   return result.meta.last_row_id;
 }
 
 export async function cancelBooking(env, chatId, id) {
+  const booking = await env.DB.prepare('SELECT * FROM bookings WHERE id = ? AND chat_id = ?')
+    .bind(id, chatId).first();
+  if (!booking) return false;
   const result = await env.DB.prepare('DELETE FROM bookings WHERE id = ? AND chat_id = ?')
     .bind(id, chatId).run();
-  if (result.meta.changes) await updateBoard(env, chatId);
+  if (result.meta.changes) {
+    await updateBoard(env, chatId);
+    await announceBookingChange(env, chatId, booking, 'removed');
+  }
   return Boolean(result.meta.changes);
 }
 
@@ -136,12 +154,14 @@ function managerMarkup(bookings) {
 }
 
 export async function showBoardManager(
-  env, chatId, receiverUserId, callbackQueryId, ephemeralMessageId = null, now = Date.now()
+  env, chatId, receiverUserId, callbackQueryId, ephemeralMessageId = null,
+  now = Date.now(), noticeHtml = ''
 ) {
   const bookings = await activeBookings(env, chatId, now);
-  const html = bookings.length
+  const body = bookings.length
     ? '⚙️ <b>Manage squash bookings</b>\n\nSelect a booking to cancel it.'
     : '⚙️ <b>Manage squash bookings</b>\n\nThere are no upcoming bookings.';
+  const html = noticeHtml ? `${noticeHtml}\n\n${body}` : body;
   const replyMarkup = managerMarkup(bookings);
   if (ephemeralMessageId) {
     return editEphemeralMessage(
