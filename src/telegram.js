@@ -17,12 +17,16 @@ export async function telegram(env, method, body) {
 
 export function sendMessage(env, chatId, html, {
   silent = false, replyMarkup = null, replyTo = null,
+  receiverUserId = null, callbackQueryId = null, replyToEphemeral = null,
 } = {}) {
   const body = {
     chat_id: chatId, text: html, parse_mode: 'HTML', disable_notification: silent,
   };
   if (replyMarkup) body.reply_markup = replyMarkup;
   if (replyTo) body.reply_parameters = { message_id: replyTo };
+  if (replyToEphemeral) body.reply_parameters = { ephemeral_message_id: replyToEphemeral };
+  if (receiverUserId) body.receiver_user_id = receiverUserId;
+  if (callbackQueryId) body.callback_query_id = callbackQueryId;
   return telegram(env, 'sendMessage', body);
 }
 
@@ -37,6 +41,26 @@ export function editMessage(env, chatId, messageId, html, replyMarkup = null) {
 export function editReplyMarkup(env, chatId, messageId, replyMarkup) {
   return telegram(env, 'editMessageReplyMarkup', {
     chat_id: chatId, message_id: messageId, reply_markup: replyMarkup,
+  });
+}
+
+export function editEphemeralMessage(env, chatId, receiverUserId, ephemeralMessageId, html, replyMarkup = null) {
+  const body = {
+    chat_id: chatId,
+    receiver_user_id: receiverUserId,
+    ephemeral_message_id: ephemeralMessageId,
+    text: html,
+    parse_mode: 'HTML',
+  };
+  if (replyMarkup) body.reply_markup = replyMarkup;
+  return telegram(env, 'editEphemeralMessageText', body);
+}
+
+export function deleteEphemeralMessage(env, chatId, receiverUserId, ephemeralMessageId) {
+  return telegram(env, 'deleteEphemeralMessage', {
+    chat_id: chatId,
+    receiver_user_id: receiverUserId,
+    ephemeral_message_id: ephemeralMessageId,
   });
 }
 

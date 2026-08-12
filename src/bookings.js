@@ -1,6 +1,7 @@
 import { formatDate, formatTime, localParts } from './time.js';
 import {
-  deleteMessage, editMessage, editReplyMarkup, escapeHtml, mentionHtml, pinMessage, sendMessage, unpinMessage,
+  deleteMessage, editEphemeralMessage, editMessage, escapeHtml, mentionHtml,
+  pinMessage, sendMessage, unpinMessage,
 } from './telegram.js';
 
 const DEFAULT_TZ = 'Asia/Singapore';
@@ -124,33 +125,58 @@ export async function updateBoard(env, chatId, now = Date.now()) {
   ).bind(chatId, sent.result.message_id).run();
 }
 
-export async function showBoardManager(env, chatId, messageId, now = Date.now()) {
-  const bookings = await activeBookings(env, chatId, now);
+function managerMarkup(bookings) {
   const rows = bookings.map((booking) => [{
     text: `✏️ #${booking.id} · ${booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`}`,
     callback_data: `sb:pick:${booking.id}`,
   }]);
   rows.push([{ text: '➕ Add booking', callback_data: 'sb:add' }]);
-  rows.push([{ text: '← Back', callback_data: 'sb:back' }]);
-  return editReplyMarkup(env, chatId, messageId, { inline_keyboard: rows });
+  rows.push([{ text: '✕ Close', callback_data: 'sb:close' }]);
+  return { inline_keyboard: rows };
 }
 
-export async function showCancelConfirmation(env, chatId, messageId, bookingId) {
+export async function showBoardManager(
+  env, chatId, receiverUserId, callbackQueryId, ephemeralMessageId = null, now = Date.now()
+) {
+  const bookings = await activeBookings(env, chatId, now);
+  const html = bookings.length
+    ? '⚙️ <b>Manage squash bookings</b>\n\nSelect a booking to cancel it.'
+    : '⚙️ <b>Manage squash bookings</b>\n\nThere are no upcoming bookings.';
+  const replyMarkup = managerMarkup(bookings);
+  if (ephemeralMessageId) {
+    return editEphemeralMessage(
+      env, chatId, receiverUserId, ephemeralMessageId, html, replyMarkup
+    );
+  }
+  return sendMessage(env, chatId, html, {
+    receiverUserId, callbackQueryId, replyMarkup,
+  });
+}
+
+export async function showCancelConfirmation(
+  env, chatId, receiverUserId, ephemeralMessageId, bookingId
+) {
   const booking = await env.DB.prepare(
     'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
   ).bind(bookingId, chatId, Date.now()).first();
   if (!booking) return false;
   const court = booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`;
-  await editReplyMarkup(env, chatId, messageId, { inline_keyboard: [
-    [{ text: `🗑 Cancel #${booking.id} · ${court}`, callback_data: `sb:cancel:${booking.id}` }],
-    [{ text: '← Back to bookings', callback_data: 'sb:manage' }],
-  ] });
+  await editEphemeralMessage(
+    env, chatId, receiverUserId, ephemeralMessageId,
+    `🗑 <b>Cancel booking #${booking.id}?</b>\n\n${escapeHtml(court)}`,
+    { inline_keyboard: [
+      [{ text: `🗑 Yes, cancel #${booking.id}`, callback_data: `sb:cancel:${booking.id}` }],
+      [{ text: '← Back to bookings', callback_data: 'sb:manage' }],
+    ] }
+  );
   return true;
 }
 
-export async function restoreBoardButtons(env, chatId, messageId) {
-  const bookings = await activeBookings(env, chatId);
-  return editReplyMarkup(env, chatId, messageId, defaultBoardButtons(bookings.length > 0));
+export async function closeManager(env, chatId, receiverUserId, ephemeralMessageId) {
+  return editEphemeralMessage(
+    env, chatId, receiverUserId, ephemeralMessageId,
+    '✓ <i>Booking manager closed.</i>', { inline_keyboard: [] }
+  );
 }
 
 async function sendDueReminders(env, now) {

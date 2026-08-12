@@ -14,9 +14,9 @@ inline wizard for the requester to choose or type the date, court, and time,
 then confirm before saving. A missing end time defaults to one hour.
 
 The pinned board uses NagBot-style countdowns (`today`, `tomorrow`, or
-`in N days`), with buttons to add and manage bookings. It does not display who
-created a booking or written add/cancel instructions. Cancellation requires a
-button confirmation.
+`in N days`), with buttons to add and privately manage bookings. It does not
+display who created a booking or written add/cancel instructions. Cancellation
+requires a private button confirmation.
 
 SquashBot sends an 8am same-day reminder (or one hour before early bookings),
 removes expired slots, and deletes the pinned board when no bookings remain.
@@ -30,8 +30,12 @@ removes expired slots, and deletes the pinned board when no bookings remain.
 /help           Show examples
 ```
 
-Recognized command messages are deleted immediately when the bot has Delete
-Messages permission. Pinned-board buttons are the preferred group interface.
+Commands and SquashBot's help, forms, confirmations, errors, and booking manager
+are ephemeral: only the requester and bot can see them. The shared pinned board
+and same-day reminders remain visible to the group. Older Telegram clients may
+send commands normally; SquashBot deletes those immediately when it has Delete
+Messages permission. Telegram does not guarantee ephemeral delivery when the
+requester is offline.
 
 ## Deploy
 

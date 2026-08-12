@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS booking_drafts (
   payload TEXT NOT NULL,
   source_message_id INTEGER,
   wizard_message_id INTEGER,
+  wizard_ephemeral INTEGER NOT NULL DEFAULT 0,
   reply_prompt_message_id INTEGER,
   pending_field TEXT,
   created_at INTEGER NOT NULL

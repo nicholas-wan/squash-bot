@@ -4,7 +4,8 @@ import {
 } from './parser.js';
 import { formatDate, zonedEpoch } from './time.js';
 import {
-  answerCallback, deleteMessage, editMessage, escapeHtml, mentionHtml, sendMessage,
+  answerCallback, deleteEphemeralMessage, deleteMessage, editEphemeralMessage,
+  editMessage, escapeHtml, mentionHtml, sendMessage,
 } from './telegram.js';
 
 const DRAFT_LIFETIME_MS = 24 * 60 * 60 * 1000;
@@ -136,7 +137,13 @@ async function saveAndRender(env, row, payload, now = Date.now()) {
   await env.DB.prepare(
     'UPDATE booking_drafts SET payload = ?, pending_field = NULL, reply_prompt_message_id = NULL WHERE id = ?'
   ).bind(JSON.stringify(view.payload), row.id).run();
-  await editMessage(env, row.chat_id, row.wizard_message_id, view.html, view.replyMarkup);
+  if (row.wizard_ephemeral) {
+    await editEphemeralMessage(
+      env, row.chat_id, row.user_id, row.wizard_message_id, view.html, view.replyMarkup
+    );
+  } else {
+    await editMessage(env, row.chat_id, row.wizard_message_id, view.html, view.replyMarkup);
+  }
 }
 
 function applyParsedField(payload, field, parsed) {
@@ -154,7 +161,9 @@ function applyParsedField(payload, field, parsed) {
   }
 }
 
-export async function beginBooking(env, msg, text, { forceIntent = false } = {}) {
+export async function beginBooking(env, msg, text, {
+  forceIntent = false, callbackQueryId = null,
+} = {}) {
   const now = Date.now();
   const tz = await getTimezone(env, msg.chat.id);
   const payload = analyzeBooking(text, now, tz, { forceIntent });
@@ -165,7 +174,11 @@ export async function beginBooking(env, msg, text, { forceIntent = false } = {})
     const id = await addBooking(env, msg.chat.id, booking, msg.from);
     await sendMessage(env, msg.chat.id,
       `✅ Added court booking <b>#${id}</b>. The pinned court board is up to date.`,
-      { silent: true }
+      {
+        silent: true,
+        receiverUserId: msg.from.id,
+        callbackQueryId,
+      }
     );
     return true;
   }
@@ -184,13 +197,20 @@ export async function beginBooking(env, msg, text, { forceIntent = false } = {})
   ).run();
   const id = inserted.meta.last_row_id;
   const view = wizardView(id, payload, now, tz);
-  const sent = await sendMessage(env, msg.chat.id, view.html, { replyMarkup: view.replyMarkup });
+  const sent = await sendMessage(env, msg.chat.id, view.html, {
+    replyMarkup: view.replyMarkup,
+    receiverUserId: msg.from.id,
+    callbackQueryId,
+  });
   if (!sent.ok) {
     await env.DB.prepare('DELETE FROM booking_drafts WHERE id = ?').bind(id).run();
     throw new Error(`Could not start booking wizard: ${sent.description || 'Telegram error'}`);
   }
-  await env.DB.prepare('UPDATE booking_drafts SET payload = ?, wizard_message_id = ? WHERE id = ?')
-    .bind(JSON.stringify(view.payload), sent.result.message_id, id).run();
+  const ephemeralId = sent.result.ephemeral_message_id || null;
+  const messageId = ephemeralId || sent.result.message_id;
+  await env.DB.prepare(
+    'UPDATE booking_drafts SET payload = ?, wizard_message_id = ?, wizard_ephemeral = ? WHERE id = ?'
+  ).bind(JSON.stringify(view.payload), messageId, ephemeralId ? 1 : 0, id).run();
   return true;
 }
 
@@ -209,12 +229,15 @@ async function requestTypedField(env, row, field, callbackId) {
         input_field_placeholder: `Type the ${name}`,
         selective: false,
       },
+      receiverUserId: row.user_id,
+      callbackQueryId: callbackId,
     }
   );
   if (prompt.ok) {
+    const promptId = prompt.result.ephemeral_message_id || prompt.result.message_id;
     await env.DB.prepare(
       'UPDATE booking_drafts SET pending_field = ?, reply_prompt_message_id = ? WHERE id = ?'
-    ).bind(field, prompt.result.message_id, row.id).run();
+    ).bind(field, promptId, row.id).run();
   }
   await answerCallback(env, callbackId, prompt.ok ? '' : 'Could not open the input box.', !prompt.ok);
 }
@@ -241,7 +264,15 @@ export async function handleBookingCallback(env, callback) {
   if (action === 'n') {
     await env.DB.prepare('DELETE FROM booking_drafts WHERE id = ? AND user_id = ?')
       .bind(id, callback.from.id).run();
-    await editMessage(env, chatId, row.wizard_message_id, '✕ <i>Booking cancelled.</i>', { inline_keyboard: [] });
+    if (row.wizard_ephemeral) {
+      await editEphemeralMessage(
+        env, chatId, row.user_id, row.wizard_message_id,
+        '✕ <i>Booking cancelled.</i>', { inline_keyboard: [] }
+      );
+    } else {
+      await editMessage(env, chatId, row.wizard_message_id,
+        '✕ <i>Booking cancelled.</i>', { inline_keyboard: [] });
+    }
     await answerCallback(env, callback.id);
     return true;
   }
@@ -297,10 +328,15 @@ export async function handleBookingCallback(env, callback) {
       return true;
     }
     const bookingId = await addBooking(env, chatId, booking, callback.from);
-    await editMessage(env, chatId, row.wizard_message_id,
-      `✅ Added court booking <b>#${bookingId}</b>. The pinned court board is up to date.`,
-      { inline_keyboard: [] }
-    );
+    const confirmation = `✅ Added court booking <b>#${bookingId}</b>. The pinned court board is up to date.`;
+    if (row.wizard_ephemeral) {
+      await editEphemeralMessage(
+        env, chatId, row.user_id, row.wizard_message_id,
+        confirmation, { inline_keyboard: [] }
+      );
+    } else {
+      await editMessage(env, chatId, row.wizard_message_id, confirmation, { inline_keyboard: [] });
+    }
     await answerCallback(env, callback.id, 'Booking added');
     return true;
   }
@@ -308,7 +344,8 @@ export async function handleBookingCallback(env, callback) {
 }
 
 export async function handleBookingReply(env, msg) {
-  const replyId = msg.reply_to_message && msg.reply_to_message.message_id;
+  const replyId = msg.reply_to_message
+    && (msg.reply_to_message.ephemeral_message_id || msg.reply_to_message.message_id);
   if (!replyId || !msg.from) return false;
   const row = await env.DB.prepare(
     `SELECT * FROM booking_drafts
@@ -330,18 +367,25 @@ export async function handleBookingReply(env, msg) {
           input_field_placeholder: `Type the ${field}`,
           selective: false,
         },
+        receiverUserId: msg.from.id,
+        replyToEphemeral: msg.ephemeral_message_id || null,
       }
     );
     if (prompt.ok) {
+      const promptId = prompt.result.ephemeral_message_id || prompt.result.message_id;
       await env.DB.prepare('UPDATE booking_drafts SET reply_prompt_message_id = ? WHERE id = ?')
-        .bind(prompt.result.message_id, row.id).run();
+        .bind(promptId, row.id).run();
     }
     return true;
   }
 
   await saveAndRender(env, row, payload);
-  await deleteMessage(env, msg.chat.id, replyId);
-  await deleteMessage(env, msg.chat.id, msg.message_id);
+  if (row.wizard_ephemeral) {
+    await deleteEphemeralMessage(env, msg.chat.id, msg.from.id, replyId);
+  } else {
+    await deleteMessage(env, msg.chat.id, replyId);
+    if (msg.message_id) await deleteMessage(env, msg.chat.id, msg.message_id);
+  }
   return true;
 }
 

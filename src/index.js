@@ -1,5 +1,5 @@
 import {
-  cancelBooking, restoreBoardButtons, runMaintenance, showBoardManager,
+  cancelBooking, closeManager, runMaintenance, showBoardManager,
   showCancelConfirmation, updateBoard,
 } from './bookings.js';
 import { answerCallback, deleteMessage, escapeHtml, sendMessage, telegram } from './telegram.js';
@@ -30,36 +30,55 @@ async function handleBoardCallback(env, callback) {
   if (!data.startsWith('sb:') || !callback.message) return false;
   const chatId = callback.message.chat.id;
   const messageId = callback.message.message_id;
+  const ephemeralMessageId = callback.message.ephemeral_message_id || null;
+  const receiverUserId = callback.from.id;
 
   if (data === 'sb:add') {
     await beginBooking(env, {
       chat: callback.message.chat,
       from: callback.from,
       message_id: messageId,
-    }, '', { forceIntent: true });
+    }, '', { forceIntent: true, callbackQueryId: callback.id });
     await answerCallback(env, callback.id, 'Booking form opened');
     return true;
   }
   if (data === 'sb:manage') {
-    await showBoardManager(env, chatId, messageId);
+    await showBoardManager(
+      env, chatId, receiverUserId, callback.id, ephemeralMessageId
+    );
     await answerCallback(env, callback.id);
     return true;
   }
-  if (data === 'sb:back') {
-    await restoreBoardButtons(env, chatId, messageId);
+  if (data === 'sb:close') {
+    if (ephemeralMessageId) {
+      await closeManager(env, chatId, receiverUserId, ephemeralMessageId);
+    }
     await answerCallback(env, callback.id);
     return true;
   }
   const pick = data.match(/^sb:pick:(\d+)$/);
   if (pick) {
-    const found = await showCancelConfirmation(env, chatId, messageId, Number(pick[1]));
+    const found = ephemeralMessageId
+      ? await showCancelConfirmation(
+        env, chatId, receiverUserId, ephemeralMessageId, Number(pick[1])
+      )
+      : false;
     await answerCallback(env, callback.id, found ? '' : 'That booking has already gone.', !found);
-    if (!found) await updateBoard(env, chatId);
+    if (!found && ephemeralMessageId) {
+      await showBoardManager(
+        env, chatId, receiverUserId, callback.id, ephemeralMessageId
+      );
+    }
     return true;
   }
   const cancel = data.match(/^sb:cancel:(\d+)$/);
   if (cancel) {
     const removed = await cancelBooking(env, chatId, Number(cancel[1]));
+    if (ephemeralMessageId) {
+      await showBoardManager(
+        env, chatId, receiverUserId, callback.id, ephemeralMessageId
+      );
+    }
     await answerCallback(env, callback.id,
       removed ? 'Booking cancelled' : 'That booking has already gone.', !removed);
     return true;
@@ -95,14 +114,17 @@ export async function handleUpdate(env, update) {
     const command = match[1].toLowerCase();
     const args = (match[2] || '').trim();
     const knownCommands = new Set(['start', 'help', 'book', 'courts', 'cancel']);
-    if (knownCommands.has(command)) {
-      // Telegram commands are normal group messages, so they exist briefly.
-      // With Delete Messages permission the bot removes them immediately.
+    if (knownCommands.has(command) && msg.message_id) {
+      // Older clients may still send a normal group message. Native ephemeral
+      // commands have no public copy, so there is nothing to delete.
       await deleteMessage(env, msg.chat.id, msg.message_id);
     }
 
     if (command === 'start' || command === 'help') {
-      await sendMessage(env, msg.chat.id, helpHtml());
+      await sendMessage(env, msg.chat.id, helpHtml(), {
+        receiverUserId: msg.from.id,
+        replyToEphemeral: msg.ephemeral_message_id || null,
+      });
       return;
     }
     if (command === 'book') {
@@ -115,20 +137,31 @@ export async function handleUpdate(env, update) {
     }
     if (command === 'cancel') {
       if (!/^\d+$/.test(args)) {
-        await sendMessage(env, msg.chat.id, 'Use <code>/cancel ID</code>, for example <code>/cancel 3</code>.');
+        await sendMessage(env, msg.chat.id,
+          'Use <code>/cancel ID</code>, for example <code>/cancel 3</code>.', {
+            receiverUserId: msg.from.id,
+            replyToEphemeral: msg.ephemeral_message_id || null,
+          });
         return;
       }
       const removed = await cancelBooking(env, msg.chat.id, Number(args));
       await sendMessage(env, msg.chat.id,
         removed ? `🗑 Removed booking <b>#${escapeHtml(args)}</b>.` : `I couldn't find booking <b>#${escapeHtml(args)}</b>.`,
-        { silent: true }
+        {
+          silent: true,
+          receiverUserId: msg.from.id,
+          replyToEphemeral: msg.ephemeral_message_id || null,
+        }
       );
       return;
     }
   } catch (error) {
     console.log(`Update failed: ${error.stack || error}`);
     await sendMessage(env, msg.chat.id,
-      `⚠️ ${escapeHtml(error.message || 'Something went wrong. Please try again.')}`);
+      `⚠️ ${escapeHtml(error.message || 'Something went wrong. Please try again.')}`, {
+        receiverUserId: msg.from.id,
+        replyToEphemeral: msg.ephemeral_message_id || null,
+      });
   }
 }
 
@@ -167,10 +200,10 @@ export default {
         allowed_updates: ['message', 'callback_query'],
       });
       const commands = await telegram(env, 'setMyCommands', { commands: [
-        { command: 'book', description: 'Add a court booking' },
-        { command: 'courts', description: 'Show or refresh the pinned court board' },
-        { command: 'cancel', description: 'Cancel a booking by ID' },
-        { command: 'help', description: 'Show examples' },
+        { command: 'book', description: 'Add a court booking', is_ephemeral: true },
+        { command: 'courts', description: 'Show or refresh the pinned court board', is_ephemeral: true },
+        { command: 'cancel', description: 'Cancel a booking by ID', is_ephemeral: true },
+        { command: 'help', description: 'Show examples', is_ephemeral: true },
       ] });
       const profile = await telegram(env, 'setMyName', { name: 'SquashBot' });
       const allowedChatIds = String(env.ALLOWED_CHATS || '').split(',').map((id) => id.trim()).filter(Boolean);
