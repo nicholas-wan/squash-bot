@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  addBooking, cancelBooking, showBoardManager, showCancelConfirmation,
+  addBooking, boardHtml, cancelBooking, showBoardManager, showCancelConfirmation,
 } from '../src/bookings.js';
 
 const startsAt = Date.UTC(2026, 7, 19, 13, 0);
@@ -96,5 +96,15 @@ describe('public booking announcements', () => {
     expect(deleteLabel).toContain('🗑 Delete · Court 4');
     expect(deleteLabel).toContain('19 Aug');
     expect(deleteLabel).toContain('9:00 pm');
+  });
+
+  it('renders each pinned booking on one consistent concise line', async () => {
+    const html = await boardHtml(
+      { DB: bookingDb([storedBooking]) }, -123, Date.UTC(2026, 7, 12, 12, 0)
+    );
+    expect(html).toContain(
+      'in 7 days · Aug 19 · 9:00–10:00 PM · <b>Court 4</b>'
+    );
+    expect(html.split('\n')).toHaveLength(3);
   });
 });

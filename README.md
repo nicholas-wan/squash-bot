@@ -15,8 +15,9 @@ then confirm before saving. A missing end time defaults to one hour.
 “Next Monday” means the nearest upcoming Monday. Original booking text is kept
 with saved bookings for future auditing.
 
-The pinned board uses NagBot-style countdowns (`today`, `tomorrow`, or
-`in N days`), with buttons to add and manage bookings in place. It does not
+The pinned board renders one concise line per booking, for example
+`in 5 days · Aug 17 · 9:00–10:00 PM · Court 4`, with buttons to add and manage
+bookings in place. It does not
 display who created a booking or written add/cancel instructions. Cancellation
 requires a button confirmation on the same pinned message. The edit menu identifies every booking
 by court, date, and time; internal booking IDs are hidden from its labels.

@@ -5,7 +5,6 @@ import {
 } from './telegram.js';
 
 const DEFAULT_TZ = 'Asia/Singapore';
-const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 export async function getTimezone(env, chatId) {
   const row = await env.DB.prepare('SELECT tz FROM settings WHERE chat_id = ?').bind(chatId).first();
@@ -61,7 +60,6 @@ function clock(epochMs, tz) {
   }).format(new Date(epochMs));
 }
 
-// Same hybrid countdown used by NagBot's pinned dashboard.
 export function formatCountdown(epochMs, tz, now = Date.now()) {
   const target = localParts(epochMs, tz);
   const current = localParts(now, tz);
@@ -69,14 +67,23 @@ export function formatCountdown(epochMs, tz, now = Date.now()) {
     Date.UTC(target.y, target.mo - 1, target.d)
     - Date.UTC(current.y, current.mo - 1, current.d)
   ) / 86400000);
-  const time = clock(epochMs, tz);
-  if (days <= 0) return `today ${time}`;
-  if (days === 1) return `tomorrow ${time}`;
-  const weekday = DAY_NAMES[new Date(Date.UTC(target.y, target.mo - 1, target.d)).getUTCDay()];
-  const absolute = days < 7 ? `${weekday} ${time}` : new Intl.DateTimeFormat('en-US', {
-    timeZone: tz, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true,
+  if (days <= 0) return 'today';
+  if (days === 1) return 'tomorrow';
+  const date = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, month: 'short', day: 'numeric',
   }).format(new Date(epochMs));
-  return `in ${days} days · ${absolute}`;
+  return `in ${days} days · ${date}`;
+}
+
+function compactTimeRange(startsAt, endsAt, tz) {
+  const start = clock(startsAt, tz);
+  const end = clock(endsAt, tz);
+  const startPeriod = start.match(/\s([AP]M)$/);
+  const endPeriod = end.match(/\s([AP]M)$/);
+  if (startPeriod && endPeriod && startPeriod[1] === endPeriod[1]) {
+    return `${start.replace(/\s[AP]M$/, '')}–${end}`;
+  }
+  return `${start}–${end}`;
 }
 
 async function activeBookings(env, chatId, now = Date.now()) {
@@ -98,13 +105,14 @@ export async function boardHtml(env, chatId, now = Date.now()) {
 
   const lines = ['🎾 <b>Upcoming squash courts</b>', ''];
   for (const booking of results) {
+    const court = booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`;
     lines.push(
-      `${formatCountdown(booking.starts_at, tz, now)} · <b>${escapeHtml(booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`)}</b>`,
-      `      <i>${formatDate(booking.starts_at, tz)} · ${formatTime(booking.starts_at, tz)}–${formatTime(booking.ends_at, tz)}</i>`
+      `${formatCountdown(booking.starts_at, tz, now)} · ` +
+      `${compactTimeRange(booking.starts_at, booking.ends_at, tz)} · ` +
+      `<b>${escapeHtml(court)}</b>`
     );
-    lines.push('');
   }
-  return lines.join('\n').trimEnd();
+  return lines.join('\n');
 }
 
 export async function updateBoard(env, chatId, now = Date.now()) {
