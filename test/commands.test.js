@@ -113,4 +113,30 @@ describe('Telegram commands', () => {
     expect(commandRequest.body.commands).toHaveLength(4);
     expect(commandRequest.body.commands.every((command) => command.is_ephemeral)).toBe(true);
   });
+
+  it('updates the bot profile photo through the protected admin route', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init = {}) => {
+      requests.push({ url: String(url), body: init.body });
+      if (String(url).startsWith('https://raw.githubusercontent.com/')) {
+        return new Response(new Uint8Array([255, 216, 255, 217]), {
+          status: 200, headers: { 'Content-Type': 'image/jpeg' },
+        });
+      }
+      return new Response(JSON.stringify({ ok: true, result: true }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const response = await worker.fetch(new Request('https://worker.example/profile-photo', {
+      method: 'POST', headers: { Authorization: 'Bearer admin-secret' },
+    }), { BOT_TOKEN: 'test-token', ADMIN_SECRET: 'admin-secret' });
+    expect(response.status).toBe(200);
+    const telegramRequest = requests.find(
+      (request) => request.url.endsWith('/setMyProfilePhoto')
+    );
+    expect(telegramRequest.body).toBeInstanceOf(FormData);
+    expect(JSON.parse(telegramRequest.body.get('photo'))).toEqual({
+      type: 'static', photo: 'attach://profile_photo',
+    });
+  });
 });

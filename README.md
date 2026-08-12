@@ -85,5 +85,12 @@ curl.exe -X POST -H "Authorization: Bearer YOUR_ADMIN_SECRET" `
   https://YOUR-WORKER.workers.dev/setup
 ```
 
+Update the Telegram bot profile photo from `assets/squashbot-logo.jpg`:
+
+```powershell
+curl.exe -X POST -H "Authorization: Bearer YOUR_ADMIN_SECRET" `
+  https://YOUR-WORKER.workers.dev/profile-photo
+```
+
 `WEBHOOK_SECRET` must contain only letters, numbers, underscores, or hyphens.
 The default timezone is `Asia/Singapore`.

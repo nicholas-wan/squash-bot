@@ -15,6 +15,28 @@ export async function telegram(env, method, body) {
   }
 }
 
+export async function setBotProfilePhoto(env, imageUrl) {
+  if (!env.BOT_TOKEN) return { ok: false, description: 'BOT_TOKEN is missing' };
+  try {
+    const imageResponse = await fetch(imageUrl);
+    if (!imageResponse.ok) {
+      return { ok: false, description: `Could not download profile photo (${imageResponse.status})` };
+    }
+    const form = new FormData();
+    form.append('photo', JSON.stringify({ type: 'static', photo: 'attach://profile_photo' }));
+    form.append('profile_photo', new Blob([await imageResponse.arrayBuffer()], {
+      type: 'image/jpeg',
+    }), 'squashbot-logo.jpg');
+    const response = await fetch(
+      `https://api.telegram.org/bot${env.BOT_TOKEN.trim()}/setMyProfilePhoto`,
+      { method: 'POST', body: form }
+    );
+    return await response.json();
+  } catch (error) {
+    return { ok: false, description: String(error) };
+  }
+}
+
 export function sendMessage(env, chatId, html, {
   silent = false, replyMarkup = null, replyTo = null,
   receiverUserId = null, callbackQueryId = null, replyToEphemeral = null,

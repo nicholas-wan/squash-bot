@@ -2,7 +2,9 @@ import {
   cancelBooking, restoreBoardButtons, runMaintenance, showBoardManager,
   showCancelConfirmation, updateBoard,
 } from './bookings.js';
-import { answerCallback, deleteMessage, escapeHtml, sendMessage, telegram } from './telegram.js';
+import {
+  answerCallback, deleteMessage, escapeHtml, sendMessage, setBotProfilePhoto, telegram,
+} from './telegram.js';
 import {
   beginBooking, handleBookingCallback, handleBookingReply, pruneBookingDrafts,
 } from './wizard.js';
@@ -219,6 +221,16 @@ export default {
       const chatIds = String(env.ALLOWED_CHATS || '').split(',').map((id) => id.trim()).filter(Boolean);
       await Promise.all(chatIds.map((chatId) => updateBoard(env, Number(chatId))));
       return new Response(`Refreshed ${chatIds.length} pinned board(s).`);
+    }
+
+    if (url.pathname === '/profile-photo') {
+      if (request.method !== 'POST') return new Response('method not allowed', { status: 405 });
+      if (!adminAuthorized(request, env)) return new Response('forbidden', { status: 403 });
+      const result = await setBotProfilePhoto(env,
+        'https://raw.githubusercontent.com/nicholas-wan/squash-bot/main/assets/squashbot-logo.jpg');
+      return new Response(result.ok ? 'SquashBot profile photo updated.' : JSON.stringify(result), {
+        status: result.ok ? 200 : 502,
+      });
     }
 
     return new Response('squashbot is running');
