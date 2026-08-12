@@ -1,0 +1,18 @@
+name = "squashbot"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+[vars]
+ALLOWED_CHATS = "-123456789"
+DEFAULT_TIMEZONE = "Asia/Singapore"
+
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "squashbot"
+database_id = "YOUR_D1_DATABASE_ID"
+
+[observability]
+enabled = true
