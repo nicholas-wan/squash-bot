@@ -94,6 +94,48 @@ describe('Telegram commands', () => {
       .toBe('https://t.me/c/4418632524/20');
   });
 
+  it('always asks for confirmation before saving a complete message', async () => {
+    const requests = [];
+    const sqlSeen = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify({
+        ok: true, result: { ephemeral_message_id: 12 },
+      }), { headers: { 'Content-Type': 'application/json' } });
+    }));
+    const db = {
+      prepare(sql) {
+        sqlSeen.push(sql);
+        return { bind() { return {
+          async first() {
+            return sql.includes('SELECT tz') ? { tz: 'Asia/Singapore' } : null;
+          },
+          async run() {
+            if (sql.includes('INSERT INTO booking_drafts')) {
+              return { meta: { changes: 1, last_row_id: 41 } };
+            }
+            return { meta: { changes: 1 } };
+          },
+        }; } };
+      },
+    };
+    await handleUpdate({
+      BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db,
+    }, {
+      message: {
+        message_id: 5,
+        chat: { id: -123456789 },
+        from: { id: 7, first_name: 'Nick' },
+        text: '20 Aug 2026 Court 4 9pm',
+      },
+    });
+    const send = requests.find((request) => request.url.endsWith('/sendMessage'));
+    expect(send.body.text).toContain('Confirm this squash booking');
+    const labels = send.body.reply_markup.inline_keyboard.flat().map((button) => button.text);
+    expect(labels).toContain('✅ Add booking');
+    expect(sqlSeen.some((sql) => sql.includes('INSERT INTO bookings'))).toBe(false);
+  });
+
   it('registers every command as ephemeral', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {

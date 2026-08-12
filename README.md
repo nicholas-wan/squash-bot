@@ -13,18 +13,21 @@ Friday 9pm-10:30pm, Court 2
 tmr c4 2100
 ```
 
-Clear bookings are added immediately. Missing or ambiguous details open an
-inline wizard for the requester to choose or type the date, court, and time,
-then confirm before saving. A missing end time defaults to one hour.
+Every booking opens a private confirmation form before it is saved. Missing or
+ambiguous details can be chosen or typed without guessing. A missing end time
+defaults to one hour.
 “Next Monday” means the nearest upcoming Monday. Original booking text is kept
 with saved bookings for future auditing.
 
 The pinned board renders one concise line per booking, for example
-`in 5 days · Aug 17 · 9:00–10:00 PM · Court 4`, with buttons to add and manage
-bookings in place. It does not
-display who created a booking or written add/cancel instructions. Cancellation
-requires a button confirmation on the same pinned message. The edit menu identifies every booking
-by court, date, and time; internal booking IDs are hidden from its labels.
+`in 5 days · Aug 17 · 9:00–10:00 PM · Court 4`. Its buttons add, edit, or delete
+bookings; edits can change the date, court, and time. Destructive changes need
+confirmation, and labels use court/date/time instead of internal IDs.
+
+Overlapping bookings on the same court are blocked atomically unless the
+requester reviews the conflict and explicitly chooses **Add anyway** or **Save
+anyway**. Additions, edits, and deletions keep append-only audit snapshots with
+the actor and source text.
 
 SquashBot sends a public reminder two hours before each booking, plus an 8am
 same-day reminder (or one hour before early bookings). It removes expired slots
@@ -43,13 +46,13 @@ When a pinned board exists, `/help` includes a button linking directly to it.
 
 Commands and SquashBot's help, forms, private confirmations, and errors are
 ephemeral: only the requester and bot can see them. Every successful
-booking addition or removal is also announced to the whole group. The pinned
+booking addition, edit, or removal is also announced to the whole group. The pinned
 board and same-day reminders remain shared. Older Telegram clients may send
 commands normally; SquashBot deletes those immediately when it has Delete
 Messages permission. Telegram does not guarantee ephemeral delivery when the
 requester is offline.
 
-Adding or removing a booking leaves a private confirmation for the requester,
+Adding, editing, or removing a booking leaves a private confirmation for the requester,
 updates the shared pinned board, and posts a public group announcement.
 
 ## Deploy

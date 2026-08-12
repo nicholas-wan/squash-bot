@@ -1,8 +1,10 @@
-import { addBooking, getTimezone } from './bookings.js';
 import {
-  analyzeBooking, bookingFromDraft, BookingParseError, draftComplete, formatClock, parseField,
+  addBooking, BookingConflictError, getTimezone, updateBooking,
+} from './bookings.js';
+import {
+  analyzeBooking, bookingFromDraft, BookingParseError, formatClock, parseField,
 } from './parser.js';
-import { formatDate, zonedEpoch } from './time.js';
+import { formatDate, formatTime, localParts, zonedEpoch } from './time.js';
 import {
   answerCallback, deleteEphemeralMessage, deleteMessage, editEphemeralMessage,
   editMessage, escapeHtml, mentionHtml, sendMessage,
@@ -80,7 +82,9 @@ function chunk(items, size) {
 function wizardView(id, payload, now, tz) {
   const field = prepareChoices(payload, now, tz);
   const lines = [
-    '🎾 <b>Check this squash booking</b>',
+    payload.operation === 'edit'
+      ? '✏️ <b>Review booking changes</b>'
+      : '🎾 <b>Confirm this squash booking</b>',
     '',
     `Date: ${payload.date ? `<b>${escapeHtml(dateLabel(payload.date, tz))}</b>` : '❓ Need your input'}`,
     `Court: ${payload.court ? `<b>Court ${escapeHtml(payload.court)}</b>` : '❓ Need your input'}`,
@@ -89,6 +93,17 @@ function wizardView(id, payload, now, tz) {
   if (payload.sourceText) lines.push('', `From: <code>${escapeHtml(payload.sourceText.slice(0, 180))}</code>`);
   if (payload.issues && payload.issues.length) {
     lines.push('', `⚠️ ${payload.issues.map(escapeHtml).join(' ')}`);
+  }
+  if (payload.conflicts && payload.conflicts.length) {
+    lines.push('', '⚠️ <b>This overlaps an existing booking:</b>');
+    for (const conflict of payload.conflicts) {
+      const court = conflict.court.startsWith('Court ')
+        ? conflict.court : `Court ${conflict.court}`;
+      lines.push(
+        `• ${escapeHtml(court)} · ${formatDate(conflict.starts_at, tz)} · ` +
+        `${formatTime(conflict.starts_at, tz)}–${formatTime(conflict.ends_at, tz)}`
+      );
+    }
   }
 
   let keyboard;
@@ -117,9 +132,17 @@ function wizardView(id, payload, now, tz) {
       { text: '✍️ Type another time', callback_data: `bw:${id}:u:t` },
     ]];
   } else {
-    lines.push('', 'Nothing is saved until you tap <b>Add booking</b>.');
+    const editing = payload.operation === 'edit';
+    lines.push('', editing
+      ? 'Nothing changes until you tap <b>Save changes</b>.'
+      : 'Nothing is saved until you tap <b>Add booking</b>.');
     keyboard = [
-      [{ text: '✅ Add booking', callback_data: `bw:${id}:y` }],
+      [{
+        text: payload.conflicts && payload.conflicts.length
+          ? (editing ? '⚠️ Save anyway' : '⚠️ Add anyway')
+          : (editing ? '✅ Save changes' : '✅ Add booking'),
+        callback_data: `bw:${id}:${payload.conflicts && payload.conflicts.length ? 'o' : 'y'}`,
+      }],
       [
         { text: '📅 Change date', callback_data: `bw:${id}:x:d` },
         { text: '🔢 Change court', callback_data: `bw:${id}:x:c` },
@@ -129,6 +152,39 @@ function wizardView(id, payload, now, tz) {
   }
   keyboard.push([{ text: '✕ Cancel', callback_data: `bw:${id}:n` }]);
   return { html: lines.join('\n'), replyMarkup: { inline_keyboard: keyboard }, payload };
+}
+
+async function startWizard(env, msg, text, payload, callbackQueryId, bookingId = null) {
+  const now = Date.now();
+  const tz = await getTimezone(env, msg.chat.id);
+  await env.DB.prepare('DELETE FROM booking_drafts WHERE chat_id = ? AND user_id = ?')
+    .bind(msg.chat.id, msg.from.id).run();
+  const inserted = await env.DB.prepare(
+    `INSERT INTO booking_drafts
+      (chat_id, user_id, user_name, source_text, booking_id, payload,
+       source_message_id, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    msg.chat.id, msg.from.id, userName(msg.from), String(text), bookingId,
+    JSON.stringify(payload), msg.message_id || null, now
+  ).run();
+  const id = inserted.meta.last_row_id;
+  const view = wizardView(id, payload, now, tz);
+  const sent = await sendMessage(env, msg.chat.id, view.html, {
+    replyMarkup: view.replyMarkup,
+    receiverUserId: msg.from.id,
+    callbackQueryId,
+  });
+  if (!sent.ok) {
+    await env.DB.prepare('DELETE FROM booking_drafts WHERE id = ?').bind(id).run();
+    throw new Error(`Could not start booking wizard: ${sent.description || 'Telegram error'}`);
+  }
+  const ephemeralId = sent.result.ephemeral_message_id || null;
+  const messageId = ephemeralId || sent.result.message_id;
+  await env.DB.prepare(
+    'UPDATE booking_drafts SET payload = ?, wizard_message_id = ?, wizard_ephemeral = ? WHERE id = ?'
+  ).bind(JSON.stringify(view.payload), messageId, ephemeralId ? 1 : 0, id).run();
+  return true;
 }
 
 async function saveAndRender(env, row, payload, now = Date.now()) {
@@ -148,6 +204,7 @@ async function saveAndRender(env, row, payload, now = Date.now()) {
 
 function applyParsedField(payload, field, parsed) {
   payload.issues = parsed.issue ? [parsed.issue] : [];
+  payload.conflicts = [];
   if (field === 'date') {
     payload.date = parsed.value;
     payload.dateChoices = parsed.choices || [];
@@ -168,50 +225,40 @@ export async function beginBooking(env, msg, text, {
   const tz = await getTimezone(env, msg.chat.id);
   const payload = analyzeBooking(text, now, tz, { forceIntent });
   if (!payload) return false;
+  payload.operation = 'add';
+  payload.bookingId = null;
+  payload.conflicts = [];
+  return startWizard(env, msg, text, payload, callbackQueryId);
+}
 
-  if (draftComplete(payload)) {
-    const booking = bookingFromDraft(payload, now, tz);
-    const id = await addBooking(env, msg.chat.id, booking, msg.from, text);
-    await sendMessage(env, msg.chat.id,
-      `✅ Added court booking <b>#${id}</b>. The pinned court board is up to date.`,
-      {
-        silent: true,
-        receiverUserId: msg.from.id,
-        callbackQueryId,
-      }
-    );
-    return true;
-  }
-
-  // One active wizard per requester per chat. A new booking supersedes an
-  // abandoned one, without affecting anyone else's wizard.
-  await env.DB.prepare('DELETE FROM booking_drafts WHERE chat_id = ? AND user_id = ?')
-    .bind(msg.chat.id, msg.from.id).run();
-  const inserted = await env.DB.prepare(
-    `INSERT INTO booking_drafts
-      (chat_id, user_id, user_name, source_text, payload, source_message_id, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).bind(
-    msg.chat.id, msg.from.id, userName(msg.from), String(text), JSON.stringify(payload),
-    msg.message_id || null, now
-  ).run();
-  const id = inserted.meta.last_row_id;
-  const view = wizardView(id, payload, now, tz);
-  const sent = await sendMessage(env, msg.chat.id, view.html, {
-    replyMarkup: view.replyMarkup,
-    receiverUserId: msg.from.id,
-    callbackQueryId,
-  });
-  if (!sent.ok) {
-    await env.DB.prepare('DELETE FROM booking_drafts WHERE id = ?').bind(id).run();
-    throw new Error(`Could not start booking wizard: ${sent.description || 'Telegram error'}`);
-  }
-  const ephemeralId = sent.result.ephemeral_message_id || null;
-  const messageId = ephemeralId || sent.result.message_id;
-  await env.DB.prepare(
-    'UPDATE booking_drafts SET payload = ?, wizard_message_id = ?, wizard_ephemeral = ? WHERE id = ?'
-  ).bind(JSON.stringify(view.payload), messageId, ephemeralId ? 1 : 0, id).run();
-  return true;
+export async function beginEditBooking(env, callback, bookingId, field) {
+  const chatId = callback.message.chat.id;
+  const booking = await env.DB.prepare(
+    'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
+  ).bind(bookingId, chatId, Date.now()).first();
+  if (!booking) return false;
+  const tz = await getTimezone(env, chatId);
+  const start = localParts(booking.starts_at, tz);
+  const end = localParts(booking.ends_at, tz);
+  const payload = {
+    operation: 'edit',
+    bookingId,
+    sourceText: booking.source_text || '',
+    editSourceText: '',
+    date: { y: start.y, mo: start.mo, d: start.d },
+    court: booking.court,
+    start: { h: start.h, mi: start.mi },
+    end: { h: end.h, mi: end.mi },
+    dateChoices: [], courtChoices: [], timeChoices: [], issues: [], conflicts: [],
+  };
+  if (field === 'date') payload.date = null;
+  if (field === 'court') payload.court = null;
+  if (field === 'time') { payload.start = null; payload.end = null; }
+  return startWizard(env, {
+    chat: callback.message.chat,
+    from: callback.from,
+    message_id: callback.message.message_id,
+  }, `Edit booking ${bookingId}`, payload, callback.id, bookingId);
 }
 
 async function requestTypedField(env, row, field, callbackId) {
@@ -243,7 +290,7 @@ async function requestTypedField(env, row, field, callbackId) {
 }
 
 export async function handleBookingCallback(env, callback) {
-  const match = String(callback.data || '').match(/^bw:(\d+):([dctuynx])(?::([dct]|\d+))?$/);
+  const match = String(callback.data || '').match(/^bw:(\d+):([dctuynxo])(?::([dct]|\d+))?$/);
   if (!match || !callback.message) return false;
   const id = Number(match[1]);
   const action = match[2];
@@ -285,7 +332,7 @@ export async function handleBookingCallback(env, callback) {
     if (value === 'd') { payload.date = null; payload.dateChoices = []; }
     if (value === 'c') { payload.court = null; payload.courtChoices = []; }
     if (value === 't') { payload.start = null; payload.end = null; payload.timeChoices = []; }
-    payload.issues = [];
+    payload.issues = []; payload.conflicts = [];
     await saveAndRender(env, row, payload);
     await answerCallback(env, callback.id);
     return true;
@@ -304,12 +351,12 @@ export async function handleBookingCallback(env, callback) {
       await answerCallback(env, callback.id, 'That option is no longer available.', true);
       return true;
     }
-    payload.issues = [];
+    payload.issues = []; payload.conflicts = [];
     await saveAndRender(env, row, payload);
     await answerCallback(env, callback.id);
     return true;
   }
-  if (action === 'y') {
+  if (action === 'y' || action === 'o') {
     const tz = await getTimezone(env, chatId);
     let booking;
     try {
@@ -321,16 +368,49 @@ export async function handleBookingCallback(env, callback) {
       await answerCallback(env, callback.id, message, true);
       return true;
     }
-    const claim = await env.DB.prepare('DELETE FROM booking_drafts WHERE id = ? AND user_id = ?')
-      .bind(id, callback.from.id).run();
+    const claim = await env.DB.prepare(
+      `UPDATE booking_drafts SET pending_field = '__saving__'
+       WHERE id = ? AND user_id = ? AND (pending_field IS NULL OR pending_field != '__saving__')`
+    ).bind(id, callback.from.id).run();
     if (!claim.meta.changes) {
       await answerCallback(env, callback.id, 'This booking was already handled.', true);
       return true;
     }
-    const bookingId = await addBooking(
-      env, chatId, booking, callback.from, payload.sourceText || null
-    );
-    const confirmation = `✅ Added court booking <b>#${bookingId}</b>. The pinned court board is up to date.`;
+    let saved;
+    try {
+      if (payload.operation === 'edit') {
+        saved = await updateBooking(
+          env, chatId, payload.bookingId, booking, callback.from,
+          payload.editSourceText || 'Edited with SquashBot', { allowConflict: action === 'o' }
+        );
+      } else {
+        saved = await addBooking(
+          env, chatId, booking, callback.from, payload.sourceText || null,
+          { allowConflict: action === 'o' }
+        );
+      }
+    } catch (error) {
+      if (error instanceof BookingConflictError) {
+        payload.conflicts = error.conflicts;
+        payload.issues = [];
+        await saveAndRender(env, row, payload);
+        await answerCallback(env, callback.id, 'This overlaps another booking. Confirm again to continue.', true);
+        return true;
+      }
+      await env.DB.prepare('UPDATE booking_drafts SET pending_field = NULL WHERE id = ?')
+        .bind(id).run();
+      throw error;
+    }
+    await env.DB.prepare('DELETE FROM booking_drafts WHERE id = ? AND user_id = ?')
+      .bind(id, callback.from.id).run();
+    if (!saved) {
+      await answerCallback(env, callback.id, 'That booking no longer exists.', true);
+      return true;
+    }
+    const editing = payload.operation === 'edit';
+    const confirmation = editing
+      ? '✅ Booking updated. The pinned court board is up to date.'
+      : '✅ Booking added. The pinned court board is up to date.';
     if (row.wizard_ephemeral) {
       await editEphemeralMessage(
         env, chatId, row.user_id, row.wizard_message_id,
@@ -339,7 +419,7 @@ export async function handleBookingCallback(env, callback) {
     } else {
       await editMessage(env, chatId, row.wizard_message_id, confirmation, { inline_keyboard: [] });
     }
-    await answerCallback(env, callback.id, 'Booking added');
+    await answerCallback(env, callback.id, editing ? 'Booking updated' : 'Booking added');
     return true;
   }
   return false;
@@ -359,6 +439,10 @@ export async function handleBookingReply(env, msg) {
   const tz = await getTimezone(env, msg.chat.id);
   const parsed = parseField(row.pending_field, msg.text, Date.now(), tz);
   applyParsedField(payload, row.pending_field, parsed);
+  if (payload.operation === 'edit') {
+    payload.editSourceText = [payload.editSourceText, `${row.pending_field}: ${msg.text}`]
+      .filter(Boolean).join('; ');
+  }
   if (!parsed.value && !(parsed.choices && parsed.choices.length)) {
     const field = row.pending_field;
     const prompt = await sendMessage(env, msg.chat.id,

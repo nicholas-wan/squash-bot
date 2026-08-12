@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  addBooking, boardHtml, cancelBooking, runMaintenance, showBoardManager,
-  showCancelConfirmation,
+  addBooking, BookingConflictError, boardHtml, cancelBooking, runMaintenance,
+  showBoardManager, showCancelConfirmation, showDeleteConfirmation, updateBooking,
 } from '../src/bookings.js';
 
 const startsAt = Date.UTC(2026, 7, 19, 13, 0);
@@ -84,17 +84,30 @@ describe('public booking announcements', () => {
     expect(label).not.toContain('#3');
   });
 
-  it('shows full details and an explicit delete confirmation', async () => {
+  it('shows edit actions before an explicit delete confirmation', async () => {
     const requests = captureTelegram();
     const found = await showCancelConfirmation(
       { BOT_TOKEN: 'test', DB: bookingDb([storedBooking]) }, -123, 99, 3
     );
     expect(found).toBe(true);
+    const actions = requests.find(
+      (request) => request.url.endsWith('/editMessageReplyMarkup')
+    );
+    const labels = actions.body.reply_markup.inline_keyboard.flat().map((button) => button.text);
+    expect(labels).toContain('📅 Change date');
+    expect(labels).toContain('🔢 Change court');
+    expect(labels).toContain('🕐 Change time');
+    expect(labels).toContain('🗑 Delete booking');
+
+    requests.length = 0;
+    await showDeleteConfirmation(
+      { BOT_TOKEN: 'test', DB: bookingDb([storedBooking]) }, -123, 99, 3
+    );
     const confirmation = requests.find(
       (request) => request.url.endsWith('/editMessageReplyMarkup')
     );
     const deleteLabel = confirmation.body.reply_markup.inline_keyboard[0][0].text;
-    expect(deleteLabel).toContain('🗑 Delete · Court 4');
+    expect(deleteLabel).toContain('🗑 Confirm delete · Court 4');
     expect(deleteLabel).toContain('19 Aug');
     expect(deleteLabel).toContain('9:00 pm');
   });
@@ -107,6 +120,41 @@ describe('public booking announcements', () => {
       'in 7 days · Aug 19 · 9:00–10:00 PM · <b>Court 4</b>'
     );
     expect(html.split('\n')).toHaveLength(3);
+  });
+
+  it('rejects an overlapping court booking in the insert itself', async () => {
+    const db = {
+      prepare(sql) {
+        return { bind() { return {
+          async all() {
+            return { results: sql.includes('LOWER(TRIM(court))') ? [storedBooking] : [] };
+          },
+          async run() { return { meta: { changes: 0 } }; },
+        }; } };
+      },
+    };
+    await expect(addBooking({ DB: db }, -123, {
+      court: '4', startsAt, endsAt, reminderAt: startsAt - 3600000,
+    }, { id: 7, first_name: 'Nick' })).rejects.toBeInstanceOf(BookingConflictError);
+  });
+
+  it('records an immutable audit row and announces an edit', async () => {
+    const requests = captureTelegram();
+    const sqlSeen = [];
+    const base = bookingDb([storedBooking]);
+    const db = {
+      prepare(sql) {
+        sqlSeen.push(sql);
+        return base.prepare(sql);
+      },
+    };
+    const changed = await updateBooking({ BOT_TOKEN: 'test', DB: db }, -123, 3, {
+      court: '5', startsAt, endsAt, reminderAt: startsAt - 3600000,
+    }, { id: 7, first_name: 'Nick' }, 'Changed court');
+    expect(changed).toBe(true);
+    expect(sqlSeen.some((sql) => sql.includes('INSERT INTO booking_audit'))).toBe(true);
+    const announcement = requests.find((request) => request.url.endsWith('/sendMessage'));
+    expect(announcement.body.text).toContain('Court 5 updated');
   });
 
   it('sends a public reminder two hours before squash', async () => {

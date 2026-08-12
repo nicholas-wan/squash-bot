@@ -1,12 +1,13 @@
 import {
   cancelBooking, restoreBoardButtons, runMaintenance, showBoardManager,
-  showCancelConfirmation, updateBoard,
+  showCancelConfirmation, showDeleteConfirmation, updateBoard,
 } from './bookings.js';
 import {
   answerCallback, deleteMessage, escapeHtml, sendMessage, setBotProfilePhoto, telegram,
 } from './telegram.js';
 import {
-  beginBooking, handleBookingCallback, handleBookingReply, pruneBookingDrafts,
+  beginBooking, beginEditBooking, handleBookingCallback, handleBookingReply,
+  pruneBookingDrafts,
 } from './wizard.js';
 
 function chatAllowed(env, chatId) {
@@ -72,9 +73,27 @@ async function handleBoardCallback(env, callback) {
     if (!found) await updateBoard(env, chatId);
     return true;
   }
+  const edit = data.match(/^sb:edit:(\d+):([dct])$/);
+  if (edit) {
+    const field = { d: 'date', c: 'court', t: 'time' }[edit[2]];
+    const found = await beginEditBooking(env, callback, Number(edit[1]), field);
+    if (found) await restoreBoardButtons(env, chatId, messageId);
+    await answerCallback(env, callback.id,
+      found ? `Change ${field} form opened` : 'That booking has already gone.', !found);
+    return true;
+  }
+  const remove = data.match(/^sb:delete:(\d+)$/);
+  if (remove) {
+    const found = await showDeleteConfirmation(env, chatId, messageId, Number(remove[1]));
+    await answerCallback(env, callback.id, found ? '' : 'That booking has already gone.', !found);
+    if (!found) await updateBoard(env, chatId);
+    return true;
+  }
   const cancel = data.match(/^sb:cancel:(\d+)$/);
   if (cancel) {
-    const removed = await cancelBooking(env, chatId, Number(cancel[1]));
+    const removed = await cancelBooking(
+      env, chatId, Number(cancel[1]), callback.from, 'Deleted from pinned booking manager'
+    );
     await answerCallback(env, callback.id,
       removed ? 'Booking cancelled' : 'That booking has already gone.', !removed);
     return true;
@@ -142,7 +161,9 @@ export async function handleUpdate(env, update) {
           });
         return;
       }
-      const removed = await cancelBooking(env, msg.chat.id, Number(args));
+      const removed = await cancelBooking(
+        env, msg.chat.id, Number(args), msg.from, `/cancel ${args}`
+      );
       await sendMessage(env, msg.chat.id,
         removed ? `🗑 Removed booking <b>#${escapeHtml(args)}</b>.` : `I couldn't find booking <b>#${escapeHtml(args)}</b>.`,
         {

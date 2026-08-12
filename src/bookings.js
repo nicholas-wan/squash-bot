@@ -16,6 +16,54 @@ function ownerName(from) {
   return from.username ? `@${from.username}` : from.first_name || null;
 }
 
+function bookingSnapshot(booking) {
+  return {
+    court: String(booking.court),
+    startsAt: booking.startsAt ?? booking.starts_at,
+    endsAt: booking.endsAt ?? booking.ends_at,
+    reminderAt: booking.reminderAt ?? booking.reminder_at,
+  };
+}
+
+async function recordAudit(
+  env, bookingId, chatId, action, from, sourceText, before = null, after = null
+) {
+  await env.DB.prepare(
+    `INSERT INTO booking_audit
+      (booking_id, chat_id, action, actor_user_id, actor_name, source_text,
+       before_json, after_json, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    bookingId, chatId, action, from && from.id || null, ownerName(from),
+    sourceText || null, before ? JSON.stringify(bookingSnapshot(before)) : null,
+    after ? JSON.stringify(bookingSnapshot(after)) : null, Date.now()
+  ).run();
+}
+
+export class BookingConflictError extends Error {
+  constructor(conflicts) {
+    super('That court overlaps an existing booking.');
+    this.conflicts = conflicts;
+  }
+}
+
+export async function findBookingConflicts(
+  env, chatId, booking, excludeBookingId = null
+) {
+  const query = excludeBookingId == null
+    ? `SELECT id, court, starts_at, ends_at FROM bookings
+       WHERE chat_id = ? AND LOWER(TRIM(court)) = LOWER(TRIM(?))
+         AND starts_at < ? AND ends_at > ?
+       ORDER BY starts_at`
+    : `SELECT id, court, starts_at, ends_at FROM bookings
+       WHERE chat_id = ? AND LOWER(TRIM(court)) = LOWER(TRIM(?))
+         AND starts_at < ? AND ends_at > ? AND id != ?
+       ORDER BY starts_at`;
+  const args = [chatId, String(booking.court), booking.endsAt, booking.startsAt];
+  if (excludeBookingId != null) args.push(excludeBookingId);
+  return (await env.DB.prepare(query).bind(...args).all()).results;
+}
+
 async function announceBookingChange(env, chatId, booking, action) {
   const tz = await getTimezone(env, chatId);
   const startsAt = booking.startsAt ?? booking.starts_at;
@@ -27,7 +75,9 @@ async function announceBookingChange(env, chatId, booking, action) {
   );
 }
 
-export async function addBooking(env, chatId, parsed, from, sourceText = null) {
+export async function addBooking(
+  env, chatId, parsed, from, sourceText = null, { allowConflict = false } = {}
+) {
   const now = Date.now();
   const preReminderAt = parsed.startsAt - 2 * 60 * 60 * 1000;
   const preReminderSent = preReminderAt <= now ? 1 : 0;
@@ -35,24 +85,74 @@ export async function addBooking(env, chatId, parsed, from, sourceText = null) {
     `INSERT INTO bookings
       (chat_id, court, starts_at, ends_at, reminder_at, pre_reminder_at,
        pre_reminder_sent, created_by_user_id, created_by_name, source_text, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+     WHERE ? = 1 OR NOT EXISTS (
+       SELECT 1 FROM bookings
+       WHERE chat_id = ? AND LOWER(TRIM(court)) = LOWER(TRIM(?))
+         AND starts_at < ? AND ends_at > ?
+     )`
   ).bind(
     chatId, parsed.court, parsed.startsAt, parsed.endsAt, parsed.reminderAt,
     preReminderAt, preReminderSent, from && from.id || null,
-    ownerName(from), sourceText, now
+    ownerName(from), sourceText, now, allowConflict ? 1 : 0,
+    chatId, parsed.court, parsed.endsAt, parsed.startsAt
   ).run();
+  if (!result.meta.changes) {
+    throw new BookingConflictError(await findBookingConflicts(env, chatId, parsed));
+  }
+  await recordAudit(
+    env, result.meta.last_row_id, chatId, 'added', from, sourceText, null, parsed
+  );
   await updateBoard(env, chatId);
   await announceBookingChange(env, chatId, parsed, 'booked');
   return result.meta.last_row_id;
 }
 
-export async function cancelBooking(env, chatId, id) {
+export async function updateBooking(
+  env, chatId, id, parsed, from, sourceText = null, { allowConflict = false } = {}
+) {
+  const before = await env.DB.prepare('SELECT * FROM bookings WHERE id = ? AND chat_id = ?')
+    .bind(id, chatId).first();
+  if (!before) return false;
+  const now = Date.now();
+  const preReminderAt = parsed.startsAt - 2 * 60 * 60 * 1000;
+  const result = await env.DB.prepare(
+    `UPDATE bookings SET
+       court = ?, starts_at = ?, ends_at = ?, reminder_at = ?,
+       reminder_sent = ?, pre_reminder_at = ?, pre_reminder_sent = ?
+     WHERE id = ? AND chat_id = ? AND (
+       ? = 1 OR NOT EXISTS (
+         SELECT 1 FROM bookings AS other
+         WHERE other.chat_id = ?
+           AND LOWER(TRIM(other.court)) = LOWER(TRIM(?))
+           AND other.starts_at < ? AND other.ends_at > ? AND other.id != ?
+       )
+     )`
+  ).bind(
+    parsed.court, parsed.startsAt, parsed.endsAt, parsed.reminderAt,
+    parsed.reminderAt <= now ? 1 : 0, preReminderAt,
+    preReminderAt <= now ? 1 : 0, id, chatId, allowConflict ? 1 : 0,
+    chatId, parsed.court, parsed.endsAt, parsed.startsAt, id
+  ).run();
+  if (!result.meta.changes) {
+    const conflicts = await findBookingConflicts(env, chatId, parsed, id);
+    if (conflicts.length) throw new BookingConflictError(conflicts);
+    return false;
+  }
+  await recordAudit(env, id, chatId, 'edited', from, sourceText, before, parsed);
+  await updateBoard(env, chatId);
+  await announceBookingChange(env, chatId, parsed, 'updated');
+  return true;
+}
+
+export async function cancelBooking(env, chatId, id, from = null, sourceText = null) {
   const booking = await env.DB.prepare('SELECT * FROM bookings WHERE id = ? AND chat_id = ?')
     .bind(id, chatId).first();
   if (!booking) return false;
   const result = await env.DB.prepare('DELETE FROM bookings WHERE id = ? AND chat_id = ?')
     .bind(id, chatId).run();
   if (result.meta.changes) {
+    await recordAudit(env, id, chatId, 'deleted', from, sourceText, booking, null);
     await updateBoard(env, chatId);
     await announceBookingChange(env, chatId, booking, 'removed');
   }
@@ -188,13 +288,32 @@ export async function showCancelConfirmation(env, chatId, messageId, bookingId) 
   const tz = await getTimezone(env, chatId);
   await editReplyMarkup(
     env, chatId, messageId, { inline_keyboard: [
-      [{
-        text: `🗑 Delete · ${bookingLabel(booking, tz)}`,
-        callback_data: `sb:cancel:${booking.id}`,
-      }],
+      [{ text: `✏️ ${bookingLabel(booking, tz)}`, callback_data: `sb:pick:${booking.id}` }],
+      [
+        { text: '📅 Change date', callback_data: `sb:edit:${booking.id}:d` },
+        { text: '🔢 Change court', callback_data: `sb:edit:${booking.id}:c` },
+      ],
+      [{ text: '🕐 Change time', callback_data: `sb:edit:${booking.id}:t` }],
+      [{ text: '🗑 Delete booking', callback_data: `sb:delete:${booking.id}` }],
       [{ text: '← Back to bookings', callback_data: 'sb:manage' }],
     ] }
   );
+  return true;
+}
+
+export async function showDeleteConfirmation(env, chatId, messageId, bookingId) {
+  const booking = await env.DB.prepare(
+    'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
+  ).bind(bookingId, chatId, Date.now()).first();
+  if (!booking) return false;
+  const tz = await getTimezone(env, chatId);
+  await editReplyMarkup(env, chatId, messageId, { inline_keyboard: [
+    [{
+      text: `🗑 Confirm delete · ${bookingLabel(booking, tz)}`,
+      callback_data: `sb:cancel:${booking.id}`,
+    }],
+    [{ text: '← Keep booking', callback_data: `sb:pick:${booking.id}` }],
+  ] });
   return true;
 }
 
@@ -265,16 +384,25 @@ async function sendPreReminders(env, now) {
 }
 
 async function removeExpiredBookings(env, now) {
-  const { results } = await env.DB.prepare(
-    'SELECT DISTINCT chat_id FROM bookings WHERE ends_at <= ?'
+  const { results: expired } = await env.DB.prepare(
+    'SELECT * FROM bookings WHERE ends_at <= ? ORDER BY chat_id, id'
   ).bind(now).all();
-  for (const { chat_id: chatId } of results) {
+  const chatIds = [...new Set(expired.map((booking) => booking.chat_id))];
+  for (const chatId of chatIds) {
     try {
       // Render without expired rows first. If Telegram fails, keep the rows so
       // the next minute retries the board cleanup.
       await updateBoard(env, chatId, now);
-      await env.DB.prepare('DELETE FROM bookings WHERE chat_id = ? AND ends_at <= ?')
-        .bind(chatId, now).run();
+      for (const booking of expired.filter((row) => row.chat_id === chatId)) {
+        const deleted = await env.DB.prepare(
+          'DELETE FROM bookings WHERE id = ? AND chat_id = ? AND ends_at <= ?'
+        ).bind(booking.id, chatId, now).run();
+        if (deleted.meta.changes) {
+          await recordAudit(
+            env, booking.id, chatId, 'deleted', null, 'Expired automatically', booking, null
+          );
+        }
+      }
     } catch (error) {
       console.log(`Cleanup for chat ${chatId} failed: ${error.stack || error}`);
     }
