@@ -112,7 +112,9 @@ export function extractDate(text, nowMs = Date.now(), tz = 'Asia/Singapore') {
     const weekday = WEEKDAYS.get(match[2].toLowerCase());
     const todayWeekday = new Date(Date.UTC(current.y, current.mo - 1, current.d)).getUTCDay();
     let ahead = (weekday - todayWeekday + 7) % 7;
-    if (match[1]) ahead = ahead === 0 ? 7 : ahead + 7;
+    // In booking language, "next Monday" means the nearest upcoming Monday.
+    // Only advance a full week when today is already that weekday.
+    if (match[1] && ahead === 0) ahead = 7;
     return { value: dateAdd(current.y, current.mo, current.d, ahead), choices: [] };
   }
 

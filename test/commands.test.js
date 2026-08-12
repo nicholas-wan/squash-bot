@@ -45,7 +45,7 @@ describe('Telegram commands', () => {
     expect(removed.body.message_id).toBe(5);
   });
 
-  it('opens the booking manager as an ephemeral callback response', async () => {
+  it('opens the booking manager on the original pinned message', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
       requests.push({ url: String(url), body: JSON.parse(init.body) });
@@ -62,10 +62,10 @@ describe('Telegram commands', () => {
         message: { message_id: 5, chat: { id: -123456789 } },
       },
     });
-    const send = requests.find((request) => request.url.endsWith('/sendMessage'));
-    expect(send.body.receiver_user_id).toBe(7);
-    expect(send.body.callback_query_id).toBe('callback-1');
-    expect(send.body.text).toContain('Manage squash bookings');
+    const edit = requests.find((request) => request.url.endsWith('/editMessageReplyMarkup'));
+    expect(edit.body.chat_id).toBe(-123456789);
+    expect(edit.body.message_id).toBe(5);
+    expect(requests.some((request) => request.url.endsWith('/sendMessage'))).toBe(false);
   });
 
   it('links help to the current pinned court board', async () => {

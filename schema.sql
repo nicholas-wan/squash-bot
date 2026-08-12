@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS bookings (
   reminder_sent INTEGER NOT NULL DEFAULT 0,
   created_by_user_id INTEGER,
   created_by_name TEXT,
+  source_text TEXT,
   created_at INTEGER NOT NULL
 );
 

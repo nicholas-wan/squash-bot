@@ -12,11 +12,14 @@ tmr c4 2100
 Clear bookings are added immediately. Missing or ambiguous details open an
 inline wizard for the requester to choose or type the date, court, and time,
 then confirm before saving. A missing end time defaults to one hour.
+“Next Monday” means the nearest upcoming Monday. Original booking text is kept
+with saved bookings for future auditing.
 
 The pinned board uses NagBot-style countdowns (`today`, `tomorrow`, or
-`in N days`), with buttons to add and privately manage bookings. It does not
+`in N days`), with buttons to add and manage bookings in place. It does not
 display who created a booking or written add/cancel instructions. Cancellation
-requires a private button confirmation.
+requires a button confirmation on the same pinned message. The edit menu identifies every booking
+by court, date, and time; internal booking IDs are hidden from its labels.
 
 SquashBot sends an 8am same-day reminder (or one hour before early bookings),
 removes expired slots, and deletes the pinned board when no bookings remain.
@@ -32,8 +35,8 @@ removes expired slots, and deletes the pinned board when no bookings remain.
 
 When a pinned board exists, `/help` includes a button linking directly to it.
 
-Commands and SquashBot's help, forms, private confirmations, errors, and booking
-manager are ephemeral: only the requester and bot can see them. Every successful
+Commands and SquashBot's help, forms, private confirmations, and errors are
+ephemeral: only the requester and bot can see them. Every successful
 booking addition or removal is also announced to the whole group. The pinned
 board and same-day reminders remain shared. Older Telegram clients may send
 commands normally; SquashBot deletes those immediately when it has Delete

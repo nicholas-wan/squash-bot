@@ -1,5 +1,5 @@
 import {
-  cancelBooking, closeManager, runMaintenance, showBoardManager,
+  cancelBooking, restoreBoardButtons, runMaintenance, showBoardManager,
   showCancelConfirmation, updateBoard,
 } from './bookings.js';
 import { answerCallback, deleteMessage, escapeHtml, sendMessage, telegram } from './telegram.js';
@@ -43,8 +43,6 @@ async function handleBoardCallback(env, callback) {
   if (!data.startsWith('sb:') || !callback.message) return false;
   const chatId = callback.message.chat.id;
   const messageId = callback.message.message_id;
-  const ephemeralMessageId = callback.message.ephemeral_message_id || null;
-  const receiverUserId = callback.from.id;
 
   if (data === 'sb:add') {
     await beginBooking(env, {
@@ -56,43 +54,25 @@ async function handleBoardCallback(env, callback) {
     return true;
   }
   if (data === 'sb:manage') {
-    await showBoardManager(
-      env, chatId, receiverUserId, callback.id, ephemeralMessageId
-    );
-    await answerCallback(env, callback.id);
+    await showBoardManager(env, chatId, messageId);
+    await answerCallback(env, callback.id, 'Choose a booking on the pinned message');
     return true;
   }
-  if (data === 'sb:close') {
-    if (ephemeralMessageId) {
-      await closeManager(env, chatId, receiverUserId, ephemeralMessageId);
-    }
+  if (data === 'sb:back') {
+    await restoreBoardButtons(env, chatId, messageId);
     await answerCallback(env, callback.id);
     return true;
   }
   const pick = data.match(/^sb:pick:(\d+)$/);
   if (pick) {
-    const found = ephemeralMessageId
-      ? await showCancelConfirmation(
-        env, chatId, receiverUserId, ephemeralMessageId, Number(pick[1])
-      )
-      : false;
+    const found = await showCancelConfirmation(env, chatId, messageId, Number(pick[1]));
     await answerCallback(env, callback.id, found ? '' : 'That booking has already gone.', !found);
-    if (!found && ephemeralMessageId) {
-      await showBoardManager(
-        env, chatId, receiverUserId, callback.id, ephemeralMessageId
-      );
-    }
+    if (!found) await updateBoard(env, chatId);
     return true;
   }
   const cancel = data.match(/^sb:cancel:(\d+)$/);
   if (cancel) {
     const removed = await cancelBooking(env, chatId, Number(cancel[1]));
-    if (ephemeralMessageId) {
-      await showBoardManager(
-        env, chatId, receiverUserId, callback.id, ephemeralMessageId,
-        Date.now(), removed ? `✅ Removed booking <b>#${Number(cancel[1])}</b>.` : ''
-      );
-    }
     await answerCallback(env, callback.id,
       removed ? 'Booking cancelled' : 'That booking has already gone.', !removed);
     return true;

@@ -171,7 +171,7 @@ export async function beginBooking(env, msg, text, {
 
   if (draftComplete(payload)) {
     const booking = bookingFromDraft(payload, now, tz);
-    const id = await addBooking(env, msg.chat.id, booking, msg.from);
+    const id = await addBooking(env, msg.chat.id, booking, msg.from, text);
     await sendMessage(env, msg.chat.id,
       `✅ Added court booking <b>#${id}</b>. The pinned court board is up to date.`,
       {
@@ -327,7 +327,9 @@ export async function handleBookingCallback(env, callback) {
       await answerCallback(env, callback.id, 'This booking was already handled.', true);
       return true;
     }
-    const bookingId = await addBooking(env, chatId, booking, callback.from);
+    const bookingId = await addBooking(
+      env, chatId, booking, callback.from, payload.sourceText || null
+    );
     const confirmation = `✅ Added court booking <b>#${bookingId}</b>. The pinned court board is up to date.`;
     if (row.wizard_ephemeral) {
       await editEphemeralMessage(

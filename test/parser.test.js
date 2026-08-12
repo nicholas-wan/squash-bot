@@ -27,6 +27,11 @@ describe('parseBooking', () => {
     expect(local(booking.startsAt)).toMatchObject({ mo: 8, d: 13, h: 21 });
   });
 
+  it('treats next Monday as the nearest upcoming Monday', () => {
+    const booking = parseBooking('next Monday court 4 9pm', NOW, TZ);
+    expect(local(booking.startsAt)).toMatchObject({ y: 2026, mo: 8, d: 17, h: 21 });
+  });
+
   it('uses next year for an omitted date that has passed', () => {
     const booking = parseBooking('1 Aug Court 2 7pm', NOW, TZ);
     expect(local(booking.startsAt).y).toBe(2027);

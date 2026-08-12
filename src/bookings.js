@@ -1,6 +1,6 @@
 import { formatDate, formatTime, localParts } from './time.js';
 import {
-  deleteMessage, editEphemeralMessage, editMessage, escapeHtml, mentionHtml,
+  deleteMessage, editMessage, editReplyMarkup, escapeHtml, mentionHtml,
   pinMessage, sendMessage, unpinMessage,
 } from './telegram.js';
 
@@ -28,14 +28,14 @@ async function announceBookingChange(env, chatId, booking, action) {
   );
 }
 
-export async function addBooking(env, chatId, parsed, from) {
+export async function addBooking(env, chatId, parsed, from, sourceText = null) {
   const result = await env.DB.prepare(
     `INSERT INTO bookings
-      (chat_id, court, starts_at, ends_at, reminder_at, created_by_user_id, created_by_name, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      (chat_id, court, starts_at, ends_at, reminder_at, created_by_user_id, created_by_name, source_text, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     chatId, parsed.court, parsed.startsAt, parsed.endsAt, parsed.reminderAt,
-    from && from.id || null, ownerName(from), Date.now()
+    from && from.id || null, ownerName(from), sourceText, Date.now()
   ).run();
   await updateBoard(env, chatId);
   await announceBookingChange(env, chatId, parsed, 'booked');
@@ -143,60 +143,51 @@ export async function updateBoard(env, chatId, now = Date.now()) {
   ).bind(chatId, sent.result.message_id).run();
 }
 
-function managerMarkup(bookings) {
+function bookingLabel(booking, tz) {
+  const court = booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`;
+  const date = new Intl.DateTimeFormat('en-SG', {
+    timeZone: tz, weekday: 'short', day: 'numeric', month: 'short',
+  }).format(new Date(booking.starts_at));
+  return `${court} · ${date} · ${formatTime(booking.starts_at, tz)}`;
+}
+
+function managerMarkup(bookings, tz) {
   const rows = bookings.map((booking) => [{
-    text: `✏️ #${booking.id} · ${booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`}`,
+    text: `✏️ ${bookingLabel(booking, tz)}`,
     callback_data: `sb:pick:${booking.id}`,
   }]);
   rows.push([{ text: '➕ Add booking', callback_data: 'sb:add' }]);
-  rows.push([{ text: '✕ Close', callback_data: 'sb:close' }]);
+  rows.push([{ text: '← Done', callback_data: 'sb:back' }]);
   return { inline_keyboard: rows };
 }
 
-export async function showBoardManager(
-  env, chatId, receiverUserId, callbackQueryId, ephemeralMessageId = null,
-  now = Date.now(), noticeHtml = ''
-) {
+export async function showBoardManager(env, chatId, messageId, now = Date.now()) {
   const bookings = await activeBookings(env, chatId, now);
-  const body = bookings.length
-    ? '⚙️ <b>Manage squash bookings</b>\n\nSelect a booking to cancel it.'
-    : '⚙️ <b>Manage squash bookings</b>\n\nThere are no upcoming bookings.';
-  const html = noticeHtml ? `${noticeHtml}\n\n${body}` : body;
-  const replyMarkup = managerMarkup(bookings);
-  if (ephemeralMessageId) {
-    return editEphemeralMessage(
-      env, chatId, receiverUserId, ephemeralMessageId, html, replyMarkup
-    );
-  }
-  return sendMessage(env, chatId, html, {
-    receiverUserId, callbackQueryId, replyMarkup,
-  });
+  const tz = await getTimezone(env, chatId);
+  return editReplyMarkup(env, chatId, messageId, managerMarkup(bookings, tz));
 }
 
-export async function showCancelConfirmation(
-  env, chatId, receiverUserId, ephemeralMessageId, bookingId
-) {
+export async function showCancelConfirmation(env, chatId, messageId, bookingId) {
   const booking = await env.DB.prepare(
     'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
   ).bind(bookingId, chatId, Date.now()).first();
   if (!booking) return false;
-  const court = booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`;
-  await editEphemeralMessage(
-    env, chatId, receiverUserId, ephemeralMessageId,
-    `🗑 <b>Cancel booking #${booking.id}?</b>\n\n${escapeHtml(court)}`,
-    { inline_keyboard: [
-      [{ text: `🗑 Yes, cancel #${booking.id}`, callback_data: `sb:cancel:${booking.id}` }],
+  const tz = await getTimezone(env, chatId);
+  await editReplyMarkup(
+    env, chatId, messageId, { inline_keyboard: [
+      [{
+        text: `🗑 Delete · ${bookingLabel(booking, tz)}`,
+        callback_data: `sb:cancel:${booking.id}`,
+      }],
       [{ text: '← Back to bookings', callback_data: 'sb:manage' }],
     ] }
   );
   return true;
 }
 
-export async function closeManager(env, chatId, receiverUserId, ephemeralMessageId) {
-  return editEphemeralMessage(
-    env, chatId, receiverUserId, ephemeralMessageId,
-    '✓ <i>Booking manager closed.</i>', { inline_keyboard: [] }
-  );
+export async function restoreBoardButtons(env, chatId, messageId) {
+  const bookings = await activeBookings(env, chatId);
+  return editReplyMarkup(env, chatId, messageId, defaultBoardButtons(bookings.length > 0));
 }
 
 async function sendDueReminders(env, now) {
