@@ -1,6 +1,6 @@
 import {
-  cancelBooking, notifyRemovedPlayer, restoreBoardButtons, runMaintenance,
-  showBoardManager, showCancelConfirmation, showDeleteConfirmation,
+  authorizeBookingChange, cancelBooking, notifyRemovedPlayer, restoreBoardButtons,
+  runMaintenance, showBoardManager, showCancelConfirmation, showDeleteConfirmation,
   joinPickerView, showRemovePlayer, updateBoard,
 } from './bookings.js';
 import {
@@ -102,6 +102,13 @@ async function handleBoardCallback(env, callback) {
   }
   const edit = data.match(/^sb:edit:(\d+):([dct])$/);
   if (edit) {
+    const permitted = await authorizeBookingChange(
+      env, chatId, Number(edit[1]), callback.from, 'edit'
+    );
+    if (!permitted.allowed) {
+      await answerCallback(env, callback.id, permitted.message, true);
+      return true;
+    }
     const field = { d: 'date', c: 'court', t: 'time' }[edit[2]];
     const found = await beginEditBooking(env, callback, Number(edit[1]), field);
     if (found) await restoreBoardButtons(env, chatId, messageId);
@@ -111,6 +118,13 @@ async function handleBoardCallback(env, callback) {
   }
   const remove = data.match(/^sb:delete:(\d+)$/);
   if (remove) {
+    const permitted = await authorizeBookingChange(
+      env, chatId, Number(remove[1]), callback.from, 'delete'
+    );
+    if (!permitted.allowed) {
+      await answerCallback(env, callback.id, permitted.message, true);
+      return true;
+    }
     const found = await showDeleteConfirmation(env, chatId, messageId, Number(remove[1]));
     await answerCallback(env, callback.id, found ? '' : 'That booking has already gone.', !found);
     if (!found) await updateBoard(env, chatId);
@@ -118,11 +132,12 @@ async function handleBoardCallback(env, callback) {
   }
   const cancel = data.match(/^sb:cancel:(\d+)$/);
   if (cancel) {
-    const removed = await cancelBooking(
+    const result = await cancelBooking(
       env, chatId, Number(cancel[1]), callback.from, 'Deleted from pinned booking manager'
     );
+    const removed = result.status === 'cancelled';
     await answerCallback(env, callback.id,
-      removed ? 'Booking cancelled' : 'That booking has already gone.', !removed);
+      removed ? 'Booking cancelled' : result.message, !removed);
     return true;
   }
   if (data === 'sb:join') {
@@ -370,11 +385,15 @@ export async function handleUpdate(env, update) {
           });
         return;
       }
-      const removed = await cancelBooking(
+      const result = await cancelBooking(
         env, msg.chat.id, Number(args), msg.from, `/cancel ${args}`
       );
+      const replies = {
+        cancelled: `🗑 Removed booking <b>#${escapeHtml(args)}</b>.`,
+        gone: `I couldn't find booking <b>#${escapeHtml(args)}</b>.`,
+      };
       await sendMessage(env, msg.chat.id,
-        removed ? `🗑 Removed booking <b>#${escapeHtml(args)}</b>.` : `I couldn't find booking <b>#${escapeHtml(args)}</b>.`,
+        replies[result.status] || escapeHtml(result.message),
         {
           silent: true,
           receiverUserId: msg.from.id,
@@ -384,9 +403,12 @@ export async function handleUpdate(env, update) {
       return;
     }
   } catch (error) {
+    // The detail belongs in the log, not in the chat: an internal message can
+    // carry SQL, ids, or configuration. The wizard sends its own wording for
+    // anything the person can actually act on before it throws.
     console.log(`Update failed: ${error.stack || error}`);
     await sendMessage(env, msg.chat.id,
-      `⚠️ ${escapeHtml(error.message || 'Something went wrong. Please try again.')}`, {
+      '⚠️ Something went wrong. Please try again.', {
         receiverUserId: msg.from.id,
         replyToEphemeral: msg.ephemeral_message_id || null,
       });

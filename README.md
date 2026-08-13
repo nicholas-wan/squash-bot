@@ -27,9 +27,11 @@ in 5 days · Mon 17 Aug · 9pm · Court 4
 ```
 
 **🙋 Join** opens a private court list: Join for courts you are not on, Leave for
-the ones you are. **⚙️ Manage** edits the date, court, or time, deletes a
-booking, and lets group admins open extra slots (up to twelve) or take a player
-off. The roster locks once a court starts.
+the ones you are. Both close the moment a court starts, so nobody can play the
+hour and then drop off the roster to dodge their share. **⚙️ Manage** edits the
+date, court, or time, deletes a booking, and lets group admins open extra slots
+(up to twelve) or take a player off; those two admin actions stay open until the
+court ends, which is how a no-show is kept off the tab.
 
 Every booking seats `DEFAULT_PLAYERS` plus whoever booked it. Players are keyed
 on their Telegram username, so someone named in config is the same person who
@@ -42,30 +44,41 @@ later taps a button; anyone without a username is keyed on their numeric id.
 | From 6pm, weekends, Singapore public holidays | $6/hour |
 | Otherwise | $3/hour |
 
-The court is split evenly across the roster once it has been played, so a
-cancelled booking — or a no-show an admin removes in time — is never billed.
-`OWNER`, `DEFAULT_PLAYERS`, and `UNBILLED_PLAYERS` play free, and the organiser
-absorbs the rounding remainder.
+The court is split once it has been played, so a cancelled booking — or a player
+an admin takes off before the slot ends — is never billed. The cost is divided by
+everyone on the roster, and `OWNER`, `DEFAULT_PLAYERS`, and `UNBILLED_PLAYERS`
+are then skipped rather than having their shares spread over the rest, so the
+organiser absorbs those shares along with the rounding remainder. With the
+example config a $6 evening court seats the organiser, one household player, and
+whoever booked it: the booker pays $2.00 and the organiser is left with $4.00.
+Because the divisor is the whole roster, taking a no-show off raises what
+everyone still on it owes.
 
 A second pinned message lists who owes the organiser. Group admins clear a
 balance from it, which appends a payment to the ledger rather than erasing
 anything. It unpins itself once everyone is settled.
 
 The 2026 holiday list in `src/pricing.js` should be checked against mom.gov.sg
-each December, or overridden with `PUBLIC_HOLIDAYS`.
+each December. `PUBLIC_HOLIDAYS` replaces that list rather than adding to it, so
+setting it in December 2026 with only 2027 dates un-prices the rest of December
+2026 — carry the dates still ahead over with it. Pricing a weekday in a year the
+list in force never reaches charges it off-peak and logs a warning that
+`npx wrangler tail` shows.
 
 ## Privacy
 
-Nothing SquashBot sends is addressed to the group. Commands, forms, receipts,
+Three things SquashBot sends are addressed to the group: the pinned board, the
+pinned tab, and the reminder fallback below. Commands, forms, receipts,
 reminders, and errors are ephemeral: only the recipient and the bot see them.
 Booking by message deletes the message, and the booker gets a private receipt
-with an **OK** button. The pinned board and the tab are the only shared
-messages, so a new booking is discovered there rather than announced.
+with an **OK** button, so a new booking is discovered on the board rather than
+announced.
 
 Each player is reminded two hours before their court and again at 8am on the
 day. Reminders and receipts clear themselves at the end of the day they are
 about. Telegram does not guarantee ephemeral delivery when the recipient is
-offline; if it refuses, one public reminder is sent instead of one per player.
+offline; if it refuses, the private copy is deleted and the whole roster is
+reminded once in the group rather than one public post per player.
 
 ## Commands
 
@@ -73,9 +86,14 @@ offline; if it refuses, one public reminder is sent instead of one per player.
 /book [details]  Add a booking or open a blank form
 /courts          Refresh the pinned board
 /tab             Refresh the pinned money tab
-/cancel ID       Remove a booking
-/help            Show examples
+/cancel ID       Remove a booking you made
+/help, /start    Show examples
 ```
+
+Booking ids are small sequential numbers, so editing or removing one — by command
+or from **⚙️ Manage** — is limited to whoever booked the court and to group
+admins. A court that has already been played cannot be cancelled at all; it has
+to reach the tab.
 
 ## Configuration
 
@@ -85,17 +103,17 @@ offline; if it refuses, one public reminder is sent instead of one per player.
 |---|---|
 | `ALLOWED_CHATS` | Group ids the bot answers in. Every other chat is ignored |
 | `DATA_CHAT_ID` | Optional; one of the above. Makes every listed group share one set of bookings, rosters, history, and one tab. Each group keeps its own pinned messages |
-| `OWNER`, `OWNER_NAME` | Who pays the courts. Always an admin, never billed |
+| `OWNER`, `OWNER_NAME` | Who pays the courts. Always an admin, never billed. `OWNER_USER_ID` is read as an alias when `OWNER` is unset |
 | `DEFAULT_PLAYERS` | Seated on every new booking, never billed |
 | `UNBILLED_PLAYERS` | Never billed, but not seated automatically |
 | `DEFAULT_CAPACITY` | Players per court before an admin opens more (default 3) |
 | `PUBLIC_HOLIDAYS` | Optional `YYYY-MM-DD` list replacing the built-in one |
 | `DEFAULT_TIMEZONE` | Defaults to `Asia/Singapore` |
 
-Secrets: `BOT_TOKEN`, `WEBHOOK_SECRET` (letters, numbers, `_`, `-` only), and
-`ADMIN_SECRET`. Promoting the bot can convert a basic group to a supergroup,
-which changes its id — `npx wrangler tail` logs the id of any chat the bot
-ignores.
+The D1 database is bound as `DB`. Secrets: `BOT_TOKEN`, `WEBHOOK_SECRET`
+(letters, numbers, `_`, `-` only), and `ADMIN_SECRET`. Promoting the bot can
+convert a basic group to a supergroup, which changes its id — `npx wrangler tail`
+logs the id of any chat the bot ignores.
 
 ## Deploy
 
@@ -137,16 +155,28 @@ curl.exe -X POST -H "Authorization: Bearer YOUR_ADMIN_SECRET" `
 
 ## Upgrading a live database
 
-`npm run db:init` only creates missing tables; it cannot add a column to a table
-that already exists. An existing database needs the migrations, or the pinned
-board and every new booking fail at runtime:
+`npm run db:init` runs `schema.sql`, which is entirely `IF NOT EXISTS`: safe on a
+live database, and it creates every table and index. What it cannot do is add a
+column to a table that already exists, so an existing database also needs the
+migrations, or the pinned board and every new booking fail at runtime:
 
 ```powershell
+npm run db:init
 npm run db:migrate:002
 npm run db:migrate:003
 npm run db:migrate:004
+npm run db:verify
 ```
 
-Run them in order, and run each even if an earlier one fails: an already applied
-migration reports `duplicate column name` from its `ALTER TABLE` lines, which is
-expected. Everything else in them is `IF NOT EXISTS`.
+Run them in that order. Everything the migrations used to create now lives in
+`schema.sql`, leaving 002 and 003 as `ALTER TABLE` alone and 004 as a no-op,
+because `wrangler d1 execute --file` is atomic: one failed statement rolls the
+whole file back, so a `CREATE` sharing a file with an `ALTER` would be skipped on
+a re-run rather than applied. That is what makes a re-run harmless — an already
+applied migration fails whole with `duplicate column name`, having had nothing
+else to lose, and the next file can still be run.
+
+`npm run db:verify` prints `schema_ok` once every migrated column is present, and
+otherwise fails naming the one that is missing. It is worth running because that
+same atomicity can leave a hand-patched database short: a file whose first
+`ALTER` duplicates rolls back the later ones too, and they are never retried.

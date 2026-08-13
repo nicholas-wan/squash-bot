@@ -1,11 +1,18 @@
 import { deleteMessage, editMessage, pinMessage, sendMessage, unpinMessage } from './telegram.js';
 
 const DEFAULT_TZ = 'Asia/Singapore';
+// Must match the DEFAULT on settings.tz in schema.sql.
+const SCHEMA_DEFAULT_TZ = 'Asia/Singapore';
 const PINNED_COLUMNS = new Set(['board_message_id', 'tab_message_id']);
 
+// The settings row is created by pinning a board, which never writes tz, so the
+// column falls to its NOT NULL default. Reading that default back as a per-chat
+// choice would silently retire DEFAULT_TIMEZONE the moment a chat pins anything,
+// so it counts as unset here and only a tz written on purpose outranks the env.
 export async function getTimezone(env, chatId) {
   const row = await env.DB.prepare('SELECT tz FROM settings WHERE chat_id = ?').bind(chatId).first();
-  return (row && row.tz) || env.DEFAULT_TIMEZONE || DEFAULT_TZ;
+  const chosen = row && row.tz !== SCHEMA_DEFAULT_TZ ? row.tz : null;
+  return chosen || env.DEFAULT_TIMEZONE || DEFAULT_TZ;
 }
 
 // Keeps one pinned message per column in sync. A null html removes the pin

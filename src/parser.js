@@ -84,7 +84,18 @@ export function extractDate(text, nowMs = Date.now(), tz = 'Asia/Singapore') {
     return dateExists(value) ? { value, choices: [] } : { value: null, choices: [], issue: 'That date does not exist.' };
   }
 
-  match = input.match(/\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b/);
+  // “courts 3/4” lists two courts and “8-9” is a time range, so a numeric pair
+  // only counts as a date once those readings are ruled out. Anything left over
+  // still beats a weekday name, because “sat 15/8” means the 15th.
+  match = null;
+  for (const numeric of input.matchAll(/\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b/g)) {
+    if (/\b(?:courts?|crt|ct|c)\s*#?\s*$/.test(input.slice(0, numeric.index))) continue;
+    if (numeric[0].includes('-') && !numeric[3]
+      && readsAsTimeRange(numeric[1], numeric[2])
+      && !statesClockElsewhere(input, numeric.index, numeric[0].length)) continue;
+    match = numeric;
+    break;
+  }
   if (match) {
     const first = Number(match[1]);
     const second = Number(match[2]);
@@ -181,6 +192,8 @@ function clockCandidates(raw, inheritedMeridiem = null) {
   }
   if (h > 23) return [];
   if (h === 0 || h > 12) return [{ h, mi }];
+  // 12 is midnight or noon; adding 12 to it would invent an hour 24.
+  if (h === 12) return [{ h: 0, mi }, { h: 12, mi }];
   return [{ h, mi }, { h: h + 12, mi }];
 }
 
@@ -206,11 +219,26 @@ function validRange(start, end) {
   return duration > 0 && duration <= 360;
 }
 
+function readsAsTimeRange(first, second) {
+  for (const start of clockCandidates(first)) {
+    for (const end of clockCandidates(second)) if (validRange(start, end)) return true;
+  }
+  return false;
+}
+
+// A bare “15-8” is both a plausible date and a plausible 3pm–8pm range. What
+// settles it is the rest of the message: “court 4 15-8 9pm” already says 9pm, so
+// the pair is the date, while “friday 8-9” has no other clock and so is the
+// range. Both readers ask this, which is what keeps them from disagreeing.
+function statesClockElsewhere(input, index, length) {
+  return CLOCK_TOKEN.test(`${input.slice(0, index)} ${input.slice(index + length)}`);
+}
+
 export function extractTime(text) {
   const input = String(text).toLowerCase();
   const atom = '(?:\\d{1,2}(?:(?::|\\.)\\d{2})?\\s*(?:am|pm)?|\\d{3,4}|noon|midnight)';
   const range = input.match(new RegExp(`\\b(${atom})\\s*(?:-|–|—|to|until)\\s*(${atom})\\b`, 'i'));
-  if (range) {
+  if (range && !statesClockElsewhere(input, range.index, range[0].length)) {
     const firstMeridiem = (range[1].match(/(am|pm)/i) || [])[1] || null;
     const secondMeridiem = (range[2].match(/(am|pm)/i) || [])[1] || null;
     const starts = clockCandidates(range[1], secondMeridiem);
@@ -253,11 +281,19 @@ export function extractTime(text) {
   return { value: null, choices: [], issue: 'I could not read that time.' };
 }
 
+const COURT_ABBREVIATION = /\b(?:ct|c)\s*#?\s*(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)\b/i;
+const CLOCK_TOKEN = /\b(?:\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm)|\d{1,2}[:.]\d{2}|(?:[01]?\d|2[0-3])[0-5]\d|noon|midnight)\b/i;
+
 export function looksLikeBooking(text, forceIntent = false) {
   if (forceIntent) return true;
   const input = String(text);
-  return /\b(?:court|courts|crt|squash|book(?:ed|ing)?)\b/i.test(input)
-    && (/\d/.test(input) || /\b(?:today|tonight|tomorrow|tmr|noon|midnight)\b/i.test(input));
+  if (/\b(?:court|courts|crt|squash|book(?:ed|ing)?)\b/i.test(input)) {
+    return /\d/.test(input) || /\b(?:today|tonight|tomorrow|tmr|noon|midnight)\b/i.test(input);
+  }
+  // “tmr c4 2100” never says court, so the c/ct abbreviation counts as well —
+  // but only next to a real clock time. On its own a “c4” or a “2100” in
+  // conversation must not hijack the message into a booking form.
+  return COURT_ABBREVIATION.test(input) && CLOCK_TOKEN.test(input);
 }
 
 export function analyzeBooking(text, nowMs = Date.now(), tz = 'Asia/Singapore', { forceIntent = false } = {}) {

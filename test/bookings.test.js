@@ -76,6 +76,109 @@ describe('public booking announcements', () => {
     expect(requests.some((request) => request.url.endsWith('/sendMessage'))).toBe(false);
   });
 
+  // Every write is recorded so a test can tell a refusal from a deletion.
+  function auditedDb(booking) {
+    const ran = [];
+    return {
+      ran,
+      prepare(sql) {
+        return { bind(...args) { return {
+          async first() {
+            if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+            if (sql.includes('board_message_id')) return { board_message_id: 55 };
+            if (sql.includes('SELECT * FROM bookings WHERE id')) return booking;
+            return null;
+          },
+          async all() { return { results: [] }; },
+          async run() { ran.push({ sql, args }); return { meta: { changes: 1 } }; },
+        }; } };
+      },
+    };
+  }
+
+  function captureTelegramAs(memberStatus) {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      const result = String(url).endsWith('/getChatMember')
+        ? { status: memberStatus } : { message_id: 1 };
+      return new Response(JSON.stringify({ ok: true, result }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    return requests;
+  }
+
+  // Cancelling is refused once a court has been played, so this fixture has to
+  // stay in the future as the wall clock moves rather than pinning a date.
+  const bookedByNick = {
+    ...storedBooking, created_by_user_id: 7, created_by_name: '@nick',
+    starts_at: Date.now() + 24 * 60 * 60 * 1000,
+    ends_at: Date.now() + 25 * 60 * 60 * 1000,
+    source_text: '19 Aug Court 4 9pm',
+  };
+
+  it('refuses a cancellation from anyone but the booker or an admin', async () => {
+    captureTelegramAs('member');
+    const db = auditedDb(bookedByNick);
+    const result = await cancelBooking(
+      { BOT_TOKEN: 'test', DB: db }, -123, 3, { id: 11, username: 'alice' }, '/cancel 3'
+    );
+    expect(result.status).toBe('forbidden');
+    expect(result.message).toBe('Only @nick or a group admin can cancel that booking.');
+    // The refusal says who to ask and nothing else about the booking.
+    expect(result.booking).toBeNull();
+    expect(db.ran.some((query) => query.sql.startsWith('DELETE FROM bookings'))).toBe(false);
+  });
+
+  it('refuses to cancel a court that has already been played', async () => {
+    captureTelegramAs('creator');
+    const played = {
+      ...bookedByNick,
+      starts_at: Date.now() - 2 * 60 * 60 * 1000,
+      ends_at: Date.now() - 60 * 60 * 1000,
+    };
+    const db = auditedDb(played);
+    const result = await cancelBooking(
+      { BOT_TOKEN: 'test', DB: db }, -123, 3, { id: 7, first_name: 'Nick' }, '/cancel 3'
+    );
+    // The tab is charged when a booking expires, so deleting it erases the bill.
+    expect(result.status).toBe('played');
+    expect(db.ran.some((query) => query.sql.startsWith('DELETE FROM bookings'))).toBe(false);
+  });
+
+  it('lets the booker cancel, and keeps the original text in the audit trail', async () => {
+    captureTelegramAs('member');
+    const db = auditedDb(bookedByNick);
+    const result = await cancelBooking(
+      { BOT_TOKEN: 'test', DB: db }, -123, 3, { id: 7, first_name: 'Nick' }, '/cancel 3'
+    );
+    expect(result.status).toBe('cancelled');
+    expect(db.ran.some((query) => query.sql.startsWith('DELETE FROM bookings'))).toBe(true);
+    const audit = db.ran.find((query) => query.sql.includes('INSERT INTO booking_audit'));
+    expect(JSON.parse(audit.args[6])).toMatchObject({
+      court: '4', sourceText: '19 Aug Court 4 9pm',
+    });
+  });
+
+  it('deletes a booking receipt Telegram could not keep private', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 77 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    await addBooking({ BOT_TOKEN: 'test', DB: bookingDb([storedBooking]) }, -123, {
+      court: '4', startsAt, endsAt, reminderAt: startsAt - 3600000,
+    }, { id: 7, first_name: 'Nick' });
+    const receipt = requests.find((request) => request.url.endsWith('/sendMessage'));
+    expect(receipt.body.text).toContain('Court 4 booked');
+    // The roster would otherwise sit in the group until the end of the day.
+    const deleted = requests.filter((request) => request.url.endsWith('/deleteMessage'));
+    expect(deleted.map((request) => request.body.message_id)).toContain(77);
+  });
+
   it('labels edit buttons with court, date, and time instead of an ID', async () => {
     const requests = captureTelegram();
     await showBoardManager(
@@ -254,6 +357,147 @@ describe('public booking announcements', () => {
         '<a href="tg://user?id=7">Nick</a>, <a href="tg://user?id=9">@alice</a>, @dodgerblueee'
       );
     }
+  });
+
+  // Rosters are seeded with their own flags unspent, so a booking made inside a
+  // reminder window can only be silenced by the booking-level flag.
+  function lateBookingDb() {
+    const due = roster.filter((player) => player.user_id).map((player) => ({
+      ...storedBooking,
+      reminder_sent: 1,
+      pre_reminder_sent: 1,
+      pre_reminder_at: startsAt - 2 * 60 * 60 * 1000,
+      player_row_id: player.id,
+      player_user_id: player.user_id,
+      player_chat_id: player.chat_id,
+    }));
+    return {
+      prepare(sql) {
+        return { bind() { return {
+          async first() {
+            return sql.includes('SELECT tz') ? { tz: 'Asia/Singapore' } : null;
+          },
+          async all() {
+            if (!sql.includes('FROM booking_players AS p')) return { results: [] };
+            return { results: /b\.(pre_)?reminder_sent = 0/.test(sql) ? [] : due };
+          },
+          async run() { return { meta: { changes: 1 } }; },
+        }; } };
+      },
+    };
+  }
+
+  it('marks the reminders of a booking made inside their window as spent', async () => {
+    captureTelegram();
+    const inserts = [];
+    const db = {
+      prepare(sql) {
+        return { bind(...args) {
+          if (sql.startsWith('INSERT INTO bookings')) inserts.push({ sql, args });
+          return {
+            async first() {
+              return sql.includes('SELECT tz') ? { tz: 'Asia/Singapore' } : null;
+            },
+            async all() { return { results: [] }; },
+            async run() { return { meta: { changes: 1, last_row_id: 3 } }; },
+          };
+        } };
+      },
+    };
+    const soon = Date.now() + 30 * 60 * 1000;
+    await addBooking({ BOT_TOKEN: 'test', DB: db }, -123, {
+      court: '4', startsAt: soon, endsAt: soon + 60 * 60 * 1000, reminderAt: soon - 13 * 60 * 60 * 1000,
+    }, { id: 7, first_name: 'Nick' });
+    const [insert] = inserts;
+    const columns = insert.sql
+      .slice(insert.sql.indexOf('(') + 1, insert.sql.indexOf(')'))
+      .split(',').map((column) => column.trim());
+    // Neither "Squash today!" nor "Squash in 2 hours!" is news at 8:30pm.
+    expect(insert.args[columns.indexOf('reminder_sent')]).toBe(1);
+    expect(insert.args[columns.indexOf('pre_reminder_sent')]).toBe(1);
+  });
+
+  it('sends no roster reminder for a booking whose own flag is already spent', async () => {
+    const requests = captureTelegram();
+    await runMaintenance(
+      { BOT_TOKEN: 'test', DB: lateBookingDb() }, startsAt - 2 * 60 * 60 * 1000
+    );
+    expect(requests.filter((request) => request.url.endsWith('/sendMessage'))).toHaveLength(0);
+  });
+
+  it('hands the roster reminders back when a booking moves to another date', async () => {
+    captureTelegram();
+    const db = auditedDb(storedBooking);
+    const moved = startsAt + 7 * 24 * 60 * 60 * 1000;
+    await updateBooking({ BOT_TOKEN: 'test', DB: db }, -123, 3, {
+      court: '4', startsAt: moved, endsAt: moved + 60 * 60 * 1000,
+      reminderAt: moved - 13 * 60 * 60 * 1000,
+    }, { id: 7, first_name: 'Nick' }, 'Changed date');
+    const reset = db.ran.find(
+      (query) => query.sql.startsWith('UPDATE booking_players SET reminder_sent')
+    );
+    // Everyone already reminded about the old date has to hear about the new one.
+    expect(reset.args).toEqual([0, 0, 3]);
+  });
+
+  function strayChatDb(bookings) {
+    const seen = [];
+    const db = {
+      seen,
+      prepare(sql) {
+        return { bind(...args) {
+          seen.push({ sql, args });
+          return {
+            async first() {
+              if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+              if (sql.includes('board_message_id')) return { board_message_id: 55 };
+              return null;
+            },
+            async all() {
+              if (sql.includes('ends_at <=')) {
+                return {
+                  results: sql.includes('chat_id IN')
+                    ? bookings.filter((booking) => args.includes(booking.chat_id)) : bookings,
+                };
+              }
+              if (sql.includes('ends_at >')) return { results: bookings };
+              return { results: [] };
+            },
+            async run() { return { meta: { changes: 1 } }; },
+          };
+        } };
+      },
+    };
+    return db;
+  }
+
+  it('keeps cron maintenance inside ALLOWED_CHATS', async () => {
+    const now = Date.now();
+    // What a group promoted to a supergroup leaves behind: rows under an id the
+    // bot no longer serves.
+    const stray = { ...storedBooking, id: 9, chat_id: -999, ends_at: now - 1000 };
+    const requests = captureTelegram();
+    await runMaintenance(
+      { BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: strayChatDb([stray]) }, now
+    );
+    expect(requests.some((request) => request.body.chat_id === -999)).toBe(false);
+    expect(requests).toHaveLength(0);
+
+    requests.length = 0;
+    await runMaintenance({ BOT_TOKEN: 'test', DB: strayChatDb([stray]) }, now);
+    // With no allow list configured the sweep stays unscoped, as it always was.
+    expect(requests.some((request) => request.body.chat_id === -999)).toBe(true);
+  });
+
+  it('sweeps the shared data chat as well when DATA_CHAT_ID is set', async () => {
+    captureTelegram();
+    const db = strayChatDb([]);
+    await runMaintenance({
+      BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DATA_CHAT_ID: '-222', DB: db,
+    }, Date.now());
+    const sweep = db.seen.find((query) => query.sql.includes('ends_at <='));
+    expect(sweep.args).toContain(-222);
+    expect(sweep.args).toContain(-123);
   });
 
   it('falls back to one public reminder instead of one per player', async () => {

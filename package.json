@@ -10,6 +10,7 @@
     "db:migrate:002": "wrangler d1 execute squashbot --remote --file=migrations/002-players-and-tab.sql",
     "db:migrate:003": "wrangler d1 execute squashbot --remote --file=migrations/003-per-player-reminders.sql",
     "db:migrate:004": "wrangler d1 execute squashbot --remote --file=migrations/004-reminder-cleanup.sql",
+    "db:verify": "wrangler d1 execute squashbot --remote --command=\"SELECT (SELECT count(tab_message_id) FROM settings) + (SELECT count(capacity) + count(charged) FROM bookings) + (SELECT count(reminder_sent) + count(pre_reminder_sent) FROM booking_players) AS schema_ok\"",
     "test": "vitest run"
   },
   "devDependencies": {

@@ -5,6 +5,7 @@ import { formatCountdown } from '../src/bookings.js';
 
 const TZ = 'Asia/Singapore';
 const NOW = Date.UTC(2026, 7, 12, 12, 0, 0); // 12 Aug 2026, 8pm SGT
+const PAST_MIDNIGHT = Date.UTC(2026, 7, 13, 16, 30); // 14 Aug 2026, 12:30am SGT, still 13 Aug in UTC
 const local = (epoch) => localParts(epoch, TZ);
 
 describe('parseBooking', () => {
@@ -112,6 +113,81 @@ describe('confidence-based natural language parsing', () => {
 
   it('ignores unrelated group conversation', () => {
     expect(analyzeBooking('Dinner tomorrow at 9pm', NOW, TZ)).toBeNull();
+  });
+
+  it('offers noon and midnight for a bare 12', () => {
+    const draft = analyzeBooking('tomorrow Court 4 at 12', NOW, TZ);
+    expect(draft.start).toBeNull();
+    expect(draft.timeChoices.map((choice) => choice.label)).toEqual(['12am', '12pm']);
+    expect(draft.timeChoices.map((choice) => choice.start.h)).toEqual([0, 12]);
+    expect(draft.issues).toEqual(['Which time did you mean?']);
+    expect(local(parseBooking('13 Aug Court 4 noon', NOW, TZ).startsAt))
+      .toMatchObject({ d: 13, h: 12, mi: 0 });
+  });
+
+  it('reads a dashed time range as a time, not a numeric date', () => {
+    const draft = analyzeBooking('friday 8-9, court 2', NOW, TZ);
+    expect(draft.date).toMatchObject({ y: 2026, mo: 8, d: 14 });
+    expect(draft.dateChoices).toEqual([]);
+    expect(draft.timeChoices.map((choice) => choice.label)).toEqual(['8am–9am', '8pm–9pm']);
+  });
+
+  it('reads a dashed pair as a date when the message states the time elsewhere', () => {
+    // "15-8" is also a valid 3pm–8pm range, so only the trailing 9pm settles it.
+    const draft = analyzeBooking('court 4 15-8 9pm', NOW, TZ);
+    expect(draft.date).toMatchObject({ y: 2026, mo: 8, d: 15 });
+    expect(draft.dateChoices).toEqual([]);
+    expect(draft.start).toEqual({ h: 21, mi: 0 });
+    // 15-8 must not be claimed as the range either, or 9pm would be ignored.
+    expect(draft.timeChoices).toEqual([]);
+  });
+
+  it('keeps reading a dashed pair as a date when it cannot be a time range', () => {
+    const draft = analyzeBooking('court 4 20-9 8pm', NOW, TZ);
+    expect(draft.date).toMatchObject({ y: 2026, mo: 9, d: 20 });
+    expect(draft.start).toEqual({ h: 20, mi: 0 });
+  });
+
+  it('reads a slashed court list as courts, not a numeric date', () => {
+    const draft = analyzeBooking('courts 3/4 friday 9pm', NOW, TZ);
+    expect(draft.date).toMatchObject({ y: 2026, mo: 8, d: 14 });
+    expect(draft.courtChoices).toEqual(['3', '4']);
+    expect(draft.start).toEqual({ h: 21, mi: 0 });
+  });
+
+  it('still prefers an explicit numeric date over a weekday name', () => {
+    const draft = analyzeBooking('sat 15/8 court 2 9pm', NOW, TZ);
+    expect(draft.date).toMatchObject({ y: 2026, mo: 8, d: 15 });
+  });
+
+  it('reads relative dates in the club timezone, not UTC', () => {
+    const draft = analyzeBooking('tmr c4 2100', PAST_MIDNIGHT, TZ);
+    expect(draft.date).toMatchObject({ y: 2026, mo: 8, d: 15 });
+    const booking = parseBooking('court 4 today 9pm', PAST_MIDNIGHT, TZ);
+    expect(local(booking.startsAt)).toMatchObject({ y: 2026, mo: 8, d: 14, h: 21, mi: 0 });
+  });
+});
+
+describe('booking intent', () => {
+  it('recognises every README example as a plain group message', () => {
+    const examples = [
+      '13 Aug Court 4 9pm',
+      'court four tomorrow at 9pm',
+      'Friday 8pm-9:30pm, Court 2',
+      'tmr c4 2100',
+    ];
+    const drafts = examples.map((text) => analyzeBooking(text, NOW, TZ));
+    expect(drafts.map((draft) => draft !== null && draftComplete(draft)))
+      .toEqual([true, true, true, true]);
+    expect(drafts.map((draft) => draft.court)).toEqual(['4', '4', '2', '4']);
+    expect(drafts.map((draft) => draft.start.h)).toEqual([21, 21, 20, 21]);
+  });
+
+  it('needs both a court and a time before an abbreviation counts', () => {
+    expect(analyzeBooking('c4', NOW, TZ)).toBeNull();
+    expect(analyzeBooking('anyone up for a game at 9pm?', NOW, TZ)).toBeNull();
+    expect(analyzeBooking('he beat me 11-9, 11-7 last night', NOW, TZ)).toBeNull();
+    expect(analyzeBooking('c4 tomorrow 9pm', NOW, TZ)).not.toBeNull();
   });
 });
 
