@@ -5,6 +5,22 @@ compatibility_date = "2026-08-01"
 [vars]
 ALLOWED_CHATS = "-123456789"
 DEFAULT_TIMEZONE = "Asia/Singapore"
+# Whoever pays the courts. Always treated as an admin and never billed.
+OWNER = "@nicholaswan"
+OWNER_NAME = "Nicholas"
+# Players added to every new booking. Usernames are the stable key: a player
+# named here is the same person who later taps join. "123:Name" also works for
+# anyone without a username.
+DEFAULT_PLAYERS = "@nicholaswan,@Dodgerblueee"
+# Players per court before a group admin opens more slots.
+DEFAULT_CAPACITY = "3"
+# Optional. Set this to one of the ALLOWED_CHATS ids to make every listed group
+# share one set of bookings, rosters, history, and one tab. Leave it out and each
+# group keeps its own.
+# DATA_CHAT_ID = "-123456789"
+# Optional. Overrides the built-in Singapore public holiday list, which is
+# charged at the evening rate all day.
+# PUBLIC_HOLIDAYS = "2027-01-01,2027-02-06"
 
 [triggers]
 crons = ["* * * * *"]

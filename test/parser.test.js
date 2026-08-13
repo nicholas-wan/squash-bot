@@ -17,8 +17,8 @@ describe('parseBooking', () => {
   });
 
   it('supports an explicit end time', () => {
-    const booking = parseBooking('13 Aug Court 4 9pm-10:30pm', NOW, TZ);
-    expect(local(booking.endsAt)).toMatchObject({ d: 13, h: 22, mi: 30 });
+    const booking = parseBooking('13 Aug Court 4 8pm-9:30pm', NOW, TZ);
+    expect(local(booking.endsAt)).toMatchObject({ d: 13, h: 21, mi: 30 });
   });
 
   it('supports numeric dates and 24-hour time', () => {
@@ -42,8 +42,20 @@ describe('parseBooking', () => {
   });
 
   it('never schedules the same-day reminder on the previous day', () => {
-    const booking = parseBooking('13 Aug Court 2 12:30am', NOW, TZ);
-    expect(local(booking.reminderAt)).toMatchObject({ d: 13, h: 0, mi: 0 });
+    const booking = parseBooking('13 Aug Court 2 7am', NOW, TZ);
+    expect(local(booking.reminderAt)).toMatchObject({ d: 13, h: 6, mi: 0 });
+  });
+
+  it('keeps bookings inside the 7am to 10pm opening hours', () => {
+    expect(() => parseBooking('13 Aug Court 2 6am', NOW, TZ)).toThrow(/open at 7am/);
+    expect(() => parseBooking('13 Aug Court 2 12:30am', NOW, TZ)).toThrow(/open at 7am/);
+    expect(() => parseBooking('13 Aug Court 2 9:30pm', NOW, TZ)).toThrow(/last slot starts at 9pm/);
+    expect(() => parseBooking('13 Aug Court 2 8pm-11pm', NOW, TZ)).toThrow(/close at 10pm/);
+    // The last legal slot, and the first.
+    expect(local(parseBooking('13 Aug Court 2 9pm', NOW, TZ).endsAt))
+      .toMatchObject({ d: 13, h: 22, mi: 0 });
+    expect(local(parseBooking('13 Aug Court 2 7am', NOW, TZ).startsAt))
+      .toMatchObject({ d: 13, h: 7, mi: 0 });
   });
 
   it('ignores normal chat', () => {
@@ -65,10 +77,10 @@ describe('confidence-based natural language parsing', () => {
   });
 
   it('parses weekday, time range, and court in any order', () => {
-    const draft = analyzeBooking('Friday 9pm-10:30pm, Court 2', NOW, TZ);
+    const draft = analyzeBooking('Friday 8pm-9:30pm, Court 2', NOW, TZ);
     expect(draftComplete(draft)).toBe(true);
-    expect(draft.start).toEqual({ h: 21, mi: 0 });
-    expect(draft.end).toEqual({ h: 22, mi: 30 });
+    expect(draft.start).toEqual({ h: 20, mi: 0 });
+    expect(draft.end).toEqual({ h: 21, mi: 30 });
     expect(draft.date).toMatchObject({ d: 14 });
   });
 
@@ -104,10 +116,10 @@ describe('confidence-based natural language parsing', () => {
 });
 
 describe('pinned-board countdown', () => {
-  it('uses consistent month-and-day wording for later dates', () => {
-    expect(formatCountdown(Date.UTC(2026, 7, 12, 13, 0), TZ, NOW)).toBe('today');
-    expect(formatCountdown(Date.UTC(2026, 7, 13, 13, 0), TZ, NOW)).toBe('tomorrow');
-    expect(formatCountdown(Date.UTC(2026, 7, 17, 13, 0), TZ, NOW)).toBe('in 5 days · Aug 17');
-    expect(formatCountdown(Date.UTC(2026, 7, 19, 13, 0), TZ, NOW)).toBe('in 7 days · Aug 19');
+  it('names the weekday on every countdown', () => {
+    expect(formatCountdown(Date.UTC(2026, 7, 12, 13, 0), TZ, NOW)).toBe('today · Wed');
+    expect(formatCountdown(Date.UTC(2026, 7, 13, 13, 0), TZ, NOW)).toBe('tomorrow · Thu');
+    expect(formatCountdown(Date.UTC(2026, 7, 17, 13, 0), TZ, NOW)).toBe('in 5 days · Mon 17 Aug');
+    expect(formatCountdown(Date.UTC(2026, 7, 19, 13, 0), TZ, NOW)).toBe('in 7 days · Wed 19 Aug');
   });
 });

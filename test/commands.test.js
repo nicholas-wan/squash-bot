@@ -136,6 +136,105 @@ describe('Telegram commands', () => {
     expect(sqlSeen.some((sql) => sql.includes('INSERT INTO bookings'))).toBe(false);
   });
 
+  it('logs the id of any chat it ignores so a new group can be identified', async () => {
+    const logged = [];
+    vi.spyOn(console, 'log').mockImplementation((line) => logged.push(line));
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('an ignored chat must not reach Telegram');
+    }));
+    await handleUpdate({
+      BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: emptyDb(),
+    }, {
+      message: {
+        message_id: 5,
+        chat: { id: -1009999999999, title: 'Squash crew' },
+        from: { id: 7, first_name: 'Nick' },
+        text: 'hello',
+      },
+    });
+    expect(logged.join('\n')).toContain('Ignored update from chat -1009999999999 "Squash crew"');
+    vi.restoreAllMocks();
+  });
+
+  it('lets a member join a booking from the pinned board', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 55 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const booking = {
+      id: 3, chat_id: -123456789, court: '4', capacity: 3,
+      starts_at: Date.UTC(2026, 7, 19, 13, 0), ends_at: Date.UTC(2026, 7, 19, 14, 0),
+    };
+    const db = {
+      prepare(sql) {
+        return { bind() { return {
+          async first() {
+            if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+            if (sql.includes('board_message_id')) return { board_message_id: 55 };
+            if (sql.includes('SELECT * FROM bookings WHERE id')) return booking;
+            return null;
+          },
+          async all() {
+            if (sql.includes('FROM booking_players')) return { results: [] };
+            return { results: sql.includes('ends_at >') ? [booking] : [] };
+          },
+          async run() {
+            return { meta: { changes: sql.startsWith('DELETE FROM booking_players') ? 0 : 1 } };
+          },
+        }; } };
+      },
+    };
+    await handleUpdate({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db }, {
+      callback_query: {
+        id: 'callback-1', data: 'sb:join:3',
+        from: { id: 11, username: 'alice' },
+        message: { message_id: 55, chat: { id: -123456789 } },
+      },
+    });
+    const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+    expect(answer.body.text).toContain('You are in');
+    const board = requests.find((request) => request.url.endsWith('/editMessageText'));
+    expect(board.body.message_id).toBe(55);
+    // The board keeps one compact row; picking a court happens behind Join.
+    expect(board.body.reply_markup.inline_keyboard).toHaveLength(1);
+    expect(board.body.reply_markup.inline_keyboard[0].map((button) => button.callback_data))
+      .toEqual(['sb:join', 'sb:add', 'sb:manage']);
+  });
+
+  it('refuses extra slots and tab settlement to members who are not admins', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      const result = String(url).endsWith('/getChatMember')
+        ? { status: 'member' } : { message_id: 1 };
+      return new Response(JSON.stringify({ ok: true, result }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const env = {
+      BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789',
+      OWNER_USER_ID: '7', DB: emptyDb(),
+    };
+    for (const data of ['sb:cap:3', 'sb:kick:3', 'sb:kick:3:4', 'tb:pay']) {
+      requests.length = 0;
+      await handleUpdate(env, {
+        callback_query: {
+          id: 'callback-1', data,
+          from: { id: 11, username: 'alice' },
+          message: { message_id: 55, chat: { id: -123456789 } },
+        },
+      });
+      const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+      expect(answer.body.text).toContain('admins');
+      expect(answer.body.show_alert).toBe(true);
+      expect(requests.some((request) => request.url.endsWith('/editMessageReplyMarkup')))
+        .toBe(false);
+    }
+  });
+
   it('registers every command as ephemeral', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
@@ -152,7 +251,7 @@ describe('Telegram commands', () => {
     });
     expect(response.status).toBe(200);
     const commandRequest = requests.find((request) => request.url.endsWith('/setMyCommands'));
-    expect(commandRequest.body.commands).toHaveLength(4);
+    expect(commandRequest.body.commands).toHaveLength(5);
     expect(commandRequest.body.commands.every((command) => command.is_ephemeral)).toBe(true);
   });
 

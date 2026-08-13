@@ -4,6 +4,7 @@ import {
 import {
   analyzeBooking, bookingFromDraft, BookingParseError, formatClock, parseField,
 } from './parser.js';
+import { dataChatId } from './scope.js';
 import { formatDate, formatTime, localParts, zonedEpoch } from './time.js';
 import {
   answerCallback, deleteEphemeralMessage, deleteMessage, editEphemeralMessage,
@@ -57,8 +58,9 @@ function defaultDateChoices(now, tz) {
   return Array.from({ length: 7 }, (_, index) => dateAdd(p.y, p.mo, p.d, index));
 }
 
+// Courts run 7am to 10pm, so 9pm is the last slot that can be offered.
 function defaultTimeChoices() {
-  return [17, 18, 19, 20, 21, 22].map((h) => ({
+  return [7, 8, 18, 19, 20, 21].map((h) => ({
     start: { h, mi: 0 }, end: null, label: formatClock({ h, mi: 0 }),
   }));
 }
@@ -235,7 +237,7 @@ export async function beginEditBooking(env, callback, bookingId, field) {
   const chatId = callback.message.chat.id;
   const booking = await env.DB.prepare(
     'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
-  ).bind(bookingId, chatId, Date.now()).first();
+  ).bind(bookingId, dataChatId(env, chatId), Date.now()).first();
   if (!booking) return false;
   const tz = await getTimezone(env, chatId);
   const start = localParts(booking.starts_at, tz);
@@ -265,7 +267,7 @@ async function requestTypedField(env, row, field, callbackId) {
   const labels = {
     date: ['date', '13 Aug, tomorrow, or Friday'],
     court: ['court', '4 or Court A'],
-    time: ['time', '9pm or 9pm-10:30pm'],
+    time: ['time', '9pm or 8pm-9:30pm'],
   };
   const [name, example] = labels[field];
   const prompt = await sendMessage(env, row.chat_id,
