@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { chargeBooking, settleUser, tabHtml, tabMarkup } from '../src/tab.js';
+import {
+  chargeBooking, settleMarkup, settleUser, tabHtml, tabMarkup,
+} from '../src/tab.js';
 
 const env = {
   OWNER: '@nicholaswan',
@@ -87,6 +89,20 @@ describe('money tab', () => {
     expect(tabHtml(env, [])).toBe(null);
   });
 
+  it('offers the manage button for a debtor with no numeric id', async () => {
+    // Someone named by username in an imported balance has no Telegram id until
+    // they post. Keying the button on the id hid the whole menu.
+    const balances = [{ slug: '@thadduu', user_id: null, name: '@thadduu', balance: 1400 }];
+    expect(tabMarkup(balances).inline_keyboard[0][0].callback_data).toBe('tb:pay');
+    const db = { prepare() { return { bind() { return {
+      async all() { return { results: balances }; },
+    }; } }; } };
+    const markup = await settleMarkup({ ...env, DB: db }, -123);
+    expect(markup.inline_keyboard[0][0]).toEqual({
+      text: '✅ @thadduu · $14.00', callback_data: 'tb:pay:@thadduu',
+    });
+  });
+
   it('clears the settle button rather than leaving a stale one behind', () => {
     // editMessageText keeps the previous keyboard when reply_markup is omitted,
     // so an empty keyboard has to be sent explicitly.
@@ -123,8 +139,8 @@ describe('money tab', () => {
         };
       },
     };
-    const first = await settleUser({ ...env, DB: db }, -123, 9, { username: 'nicholaswan' });
-    const second = await settleUser({ ...env, DB: db }, -123, 9, { username: 'nicholaswan' });
+    const first = await settleUser({ ...env, DB: db }, -123, 'u9', { username: 'nicholaswan' });
+    const second = await settleUser({ ...env, DB: db }, -123, 'u9', { username: 'nicholaswan' });
     expect(first.balance).toBe(800);
     expect(second).toBe(null);
     expect(payments).toEqual([-800]);

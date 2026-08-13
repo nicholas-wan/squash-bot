@@ -265,27 +265,27 @@ async function handleTabCallback(env, callback) {
   }
   if (data === 'tb:pay') {
     await editReplyMarkup(env, chatId, messageId, await settleMarkup(env, chatId));
-    await answerCallback(env, callback.id, 'Choose who has paid');
+    await answerCallback(env, callback.id, 'Choose whose debt to clear');
     return true;
   }
-  const pick = data.match(/^tb:pay:(\d+)$/);
+  const paid = data.match(/^tb:paid:(.+)$/);
+  if (paid) {
+    const settled = await settleUser(env, chatId, paid[1], callback.from);
+    await answerCallback(env, callback.id,
+      settled ? `${settled.name} cleared · ${formatMoney(settled.balance)}`
+        : 'That balance is already clear.', !settled);
+    return true;
+  }
+  const pick = data.match(/^tb:pay:(.+)$/);
   if (pick) {
-    const confirmation = await confirmSettleMarkup(env, chatId, Number(pick[1]));
+    const confirmation = await confirmSettleMarkup(env, chatId, pick[1]);
     if (!confirmation) {
       await updateTab(env, chatId);
-      await answerCallback(env, callback.id, 'That balance is already settled.', true);
+      await answerCallback(env, callback.id, 'That balance is already clear.', true);
       return true;
     }
     await editReplyMarkup(env, chatId, messageId, confirmation.markup);
     await answerCallback(env, callback.id);
-    return true;
-  }
-  const paid = data.match(/^tb:paid:(\d+)$/);
-  if (paid) {
-    const settled = await settleUser(env, chatId, Number(paid[1]), callback.from);
-    await answerCallback(env, callback.id,
-      settled ? `${settled.name} settled ${formatMoney(settled.balance)}.`
-        : 'That balance is already settled.', !settled);
     return true;
   }
   return false;
@@ -314,7 +314,11 @@ export async function handleUpdate(env, update) {
     await rememberPlayer(env, msg.from);
     if (await handleBookingReply(env, msg)) return;
     if (!text.startsWith('/')) {
-      await beginBooking(env, msg, text);
+      // The booking form repeats the text back, and the pinned board is the
+      // record, so the original message is cleared out of the group.
+      if (await beginBooking(env, msg, text) && msg.message_id) {
+        await deleteMessage(env, msg.chat.id, msg.message_id);
+      }
       return;
     }
 

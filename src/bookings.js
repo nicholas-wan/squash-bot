@@ -2,7 +2,6 @@ import {
   clearRoster, defaultCapacity, DEFAULT_CAPACITY, identity, MAX_CAPACITY,
   rosterFor, rostersFor, seedRoster,
 } from './players.js';
-import { courtCostCents, formatMoney, publicHolidays } from './pricing.js';
 import { boardChats, dataChatId, reachableChat } from './scope.js';
 import { getTimezone, updatePinnedMessage } from './settings.js';
 import { chargeBooking, updateTab } from './tab.js';
@@ -73,11 +72,10 @@ async function announceNewBooking(env, chatId, bookingId, booking, capacity) {
   const startsAt = booking.startsAt ?? booking.starts_at;
   const endsAt = booking.endsAt ?? booking.ends_at;
   const court = booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`;
-  const cost = courtCostCents(startsAt, endsAt, tz, publicHolidays(env));
   const roster = await rosterFor(env, bookingId);
   const html = `🎾 <b>${escapeHtml(court)} booked</b>\n` +
-    `${formatDate(startsAt, tz)} · ${formatTime(startsAt, tz)}–${formatTime(endsAt, tz)}\n` +
-    `👥 ${playerTags(roster)} · ${slotsLabel(roster, capacity)} · ${formatMoney(cost)}`;
+    `${formatDate(startsAt, tz)} · ${compactTimeRange(startsAt, endsAt, tz)}\n` +
+    `👥 ${playerTags(roster)} · ${slotsLabel(roster, capacity)}`;
   // Every group sharing these bookings hears about it, so anyone can join. The
   // announcement is queued for removal at the end of the day it is about, so
   // old ones do not pile up in the chat.
@@ -432,7 +430,7 @@ export async function restoreBoardButtons(env, chatId, messageId) {
 function reminderHtml(booking, roster, headline, tz) {
   return `🎾 <b>${escapeHtml(headline)}</b>\n` +
     `${escapeHtml(courtName(booking))} · ${formatDate(booking.starts_at, tz)} · ` +
-    `${formatTime(booking.starts_at, tz)}–${formatTime(booking.ends_at, tz)}` +
+    `${compactTimeRange(booking.starts_at, booking.ends_at, tz)}` +
     (roster.length ? `\n👥 ${playerTags(roster)}` : '');
 }
 
