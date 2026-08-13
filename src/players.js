@@ -92,14 +92,32 @@ export async function isChatAdmin(env, chatId, from) {
   return member.result.status === 'creator' || member.result.status === 'administrator';
 }
 
-// Fills in the numeric id of a player who was seeded from config by username.
-// Without it that player can never be sent a reminder.
+// Fills in the numeric id of a player who was seeded from config by username,
+// and keeps that id pointing at one player. Without the id that player can never
+// be sent a reminder.
 export async function rememberPlayer(env, from) {
   const who = identity(from);
   if (!who.userId || !who.username) return;
   await env.DB.prepare(
     'UPDATE booking_players SET user_id = ? WHERE slug = ? AND user_id IS NULL'
   ).bind(who.userId, who.slug).run();
+  // Someone can set or change their username long after they were first seated,
+  // and config can name them by bare id, so the same human ends up spelled two
+  // ways. The numeric id is what proves the two spellings are one person: their
+  // old rows move onto the slug they key as now, because otherwise they are
+  // offered Join for a court they are already on, take a second seat on it, and
+  // are billed twice for the one game.
+  await env.DB.prepare(
+    `DELETE FROM booking_players
+      WHERE user_id = ? AND slug != ?
+        AND booking_id IN (SELECT booking_id FROM booking_players WHERE slug = ?)`
+  ).bind(who.userId, who.slug, who.slug).run();
+  // Both spellings can already sit on one booking, where UNIQUE
+  // (booking_id, slug) leaves no room to move the old row in: the delete above
+  // drops it first so the merge is one row, not a constraint failure.
+  await env.DB.prepare(
+    'UPDATE booking_players SET slug = ?, name = ? WHERE user_id = ? AND slug != ?'
+  ).bind(who.slug, who.name, who.userId, who.slug).run();
 }
 
 async function addPlayer(env, chatId, bookingId, player, addedByUserId) {
@@ -113,18 +131,19 @@ async function addPlayer(env, chatId, bookingId, player, addedByUserId) {
   ).run();
 }
 
-// Every booking starts with the organiser's household plus whoever booked it.
-// chatId is the real chat the booking was made in, which is where those players
-// are reachable for reminders.
+// Every booking starts with whoever booked it plus the organiser's household.
+// The booker is seated first because the slice below drops whoever does not fit,
+// and the one person who must never lose their seat is the one who made the
+// booking. chatId is the real chat the booking was made in, which is where those
+// players are reachable for reminders.
 export async function seedRoster(env, chatId, bookingId, from, capacity) {
   const seats = [];
-  const owner = ownerIdentity(env);
-  for (const player of defaultPlayers(env)) seats.push(player);
-  if (owner && !seats.some((player) => player.slug === owner.slug)) seats.unshift(owner);
-  if (from && from.id) {
-    const who = identity(from);
-    if (!seats.some((player) => player.slug === who.slug)) seats.push(who);
-  }
+  const seat = (player) => {
+    if (player && !seats.some((seated) => seated.slug === player.slug)) seats.push(player);
+  };
+  if (from && from.id) seat(identity(from));
+  seat(ownerIdentity(env));
+  for (const player of defaultPlayers(env)) seat(player);
   for (const player of seats.slice(0, capacity)) {
     await addPlayer(env, chatId, bookingId, player, from && from.id);
   }

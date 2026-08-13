@@ -12,6 +12,9 @@ OWNER_NAME = "Nicholas"
 # named here is the same person who later taps join. "123:Name" also works for
 # anyone without a username.
 DEFAULT_PLAYERS = "@nicholaswan,@Dodgerblueee"
+# Optional. Plays for free but is not added to every booking. Anyone left out of
+# here and DEFAULT_PLAYERS is billed their share of every court they play.
+# UNBILLED_PLAYERS = "@gabrielwann"
 # Players per court before a group admin opens more slots.
 DEFAULT_CAPACITY = "3"
 # Optional. Set this to one of the ALLOWED_CHATS ids to make every listed group

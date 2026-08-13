@@ -8,6 +8,8 @@ const PEAK_FROM_HOUR = 18;
 // Singapore public holidays. Lunar and Islamic dates move every year, so verify
 // this list against mom.gov.sg each December and override it without a deploy by
 // setting PUBLIC_HOLIDAYS in wrangler.toml to a comma-separated YYYY-MM-DD list.
+// Pricing a day in a year this list does not reach logs a warning rather than
+// treating that year as holiday-free.
 const DEFAULT_PUBLIC_HOLIDAYS = [
   '2026-01-01', // New Year's Day
   '2026-02-17', // Chinese New Year
@@ -25,9 +27,36 @@ const DEFAULT_PUBLIC_HOLIDAYS = [
   '2026-12-25', // Christmas Day
 ];
 
+// Pricing runs on every board and tab render, so a misconfigured holiday list
+// would otherwise repeat the same line on every cron tick. Once per worker
+// isolate is enough to see it in `npx wrangler tail`.
+const warned = new Set();
+function warnOnce(message) {
+  if (warned.has(message)) return;
+  warned.add(message);
+  console.log(message);
+}
+
+const HOLIDAY_KEY = /^\d{4}-\d{2}-\d{2}$/;
+
+// Holidays are matched verbatim against a zero-padded key, so "2027-1-1" or
+// "2027-02-30" would survive to runtime and then never match any day, charging
+// that holiday off-peak without a word. Reject them where they are read.
+function isHolidayKey(day) {
+  if (!HOLIDAY_KEY.test(day)) return false;
+  const [y, mo, d] = day.split('-').map(Number);
+  const date = new Date(Date.UTC(y, mo - 1, d));
+  return date.getUTCFullYear() === y && date.getUTCMonth() === mo - 1 && date.getUTCDate() === d;
+}
+
 export function publicHolidays(env) {
   const configured = String((env && env.PUBLIC_HOLIDAYS) || '')
-    .split(',').map((day) => day.trim()).filter(Boolean);
+    .split(',').map((day) => day.trim()).filter(Boolean)
+    .filter((day) => {
+      if (isHolidayKey(day)) return true;
+      warnOnce(`PUBLIC_HOLIDAYS entry "${day}" is not a YYYY-MM-DD date and was ignored.`);
+      return false;
+    });
   return configured.length ? configured : DEFAULT_PUBLIC_HOLIDAYS;
 }
 
@@ -40,7 +69,16 @@ export function isPeakDay(epochMs, tz, holidays = []) {
   const parts = localParts(epochMs, tz);
   const weekday = new Date(Date.UTC(parts.y, parts.mo - 1, parts.d)).getUTCDay();
   if (weekday === 0 || weekday === 6) return true;
-  return holidays.includes(dateKey(parts));
+  if (holidays.includes(dateKey(parts))) return true;
+  // Gazetted dates cannot be predicted, so guessing them is not an option — but
+  // a year the list has never heard of is not a year without holidays either.
+  // Every one of them is being billed at half rate until someone updates it.
+  if (!holidays.some((day) => day.startsWith(`${parts.y}-`))) {
+    warnOnce(`No public holidays listed for ${parts.y}, so its weekday holidays`
+      + ' are billed off-peak. Check mom.gov.sg, then set PUBLIC_HOLIDAYS or'
+      + ' update DEFAULT_PUBLIC_HOLIDAYS in src/pricing.js.');
+  }
+  return false;
 }
 
 function nextLocalMidnight(epochMs, tz) {

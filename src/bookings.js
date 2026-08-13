@@ -1,8 +1,8 @@
 import {
-  clearRoster, defaultCapacity, DEFAULT_CAPACITY, identity, MAX_CAPACITY,
+  clearRoster, defaultCapacity, DEFAULT_CAPACITY, identity, isChatAdmin, MAX_CAPACITY,
   rosterFor, rostersFor, seedRoster,
 } from './players.js';
-import { boardChats, dataChatId, reachableChat } from './scope.js';
+import { allowedChats, boardChats, dataChatId, reachableChat, sharingData } from './scope.js';
 import { getTimezone, updatePinnedMessage } from './settings.js';
 import { chargeBooking, updateTab } from './tab.js';
 import { formatDate, formatTime, localParts, zonedEpoch } from './time.js';
@@ -23,6 +23,8 @@ function bookingSnapshot(booking) {
     startsAt: booking.startsAt ?? booking.starts_at,
     endsAt: booking.endsAt ?? booking.ends_at,
     reminderAt: booking.reminderAt ?? booking.reminder_at,
+    // Without it the trail cannot answer what the person originally asked for.
+    sourceText: booking.sourceText ?? booking.source_text ?? null,
   };
 }
 
@@ -74,20 +76,18 @@ async function confirmToBooker(env, chatId, bookingId, booking, capacity, from, 
   const endsAt = booking.endsAt ?? booking.ends_at;
   const court = booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`;
   const roster = await rosterFor(env, bookingId);
-  const sent = await sendMessage(env, chatId,
+  // If OK is never tapped it still clears itself at the end of the day, and a
+  // receipt Telegram could not keep private is removed rather than left up.
+  await sendPrivately(env, chatId,
     `🎾 <b>${escapeHtml(court)} booked</b>\n` +
     `${formatDate(startsAt, tz)} · ${compactTimeRange(startsAt, endsAt, tz)}\n` +
     `👥 ${playerTags(roster)} · ${slotsLabel(roster, capacity)}`,
+    from.id, endOfLocalDay(startsAt, tz),
     {
-      receiverUserId: from.id,
       callbackQueryId,
       replyMarkup: { inline_keyboard: [[{ text: '👍 OK', callback_data: 'sb:ok' }]] },
     }
   );
-  // If OK is never tapped it still clears itself at the end of the day.
-  if (sent.ok && sent.result) {
-    await scheduleCleanup(env, chatId, sent.result, from.id, endOfLocalDay(startsAt, tz));
-  }
 }
 
 export async function addBooking(
@@ -96,13 +96,16 @@ export async function addBooking(
 ) {
   const now = Date.now();
   const preReminderAt = parsed.startsAt - 2 * 60 * 60 * 1000;
+  // A court booked inside its own reminder windows is not news to anyone, so
+  // both flags start spent rather than firing on the next cron tick.
   const preReminderSent = preReminderAt <= now ? 1 : 0;
+  const reminderSent = parsed.reminderAt <= now ? 1 : 0;
   const capacity = defaultCapacity(env);
   const result = await env.DB.prepare(
     `INSERT INTO bookings
-      (chat_id, court, starts_at, ends_at, reminder_at, pre_reminder_at,
+      (chat_id, court, starts_at, ends_at, reminder_at, reminder_sent, pre_reminder_at,
        pre_reminder_sent, capacity, created_by_user_id, created_by_name, source_text, created_at)
-     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
      WHERE ? = 1 OR NOT EXISTS (
        SELECT 1 FROM bookings
        WHERE chat_id = ? AND LOWER(TRIM(court)) = LOWER(TRIM(?))
@@ -110,7 +113,7 @@ export async function addBooking(
      )`
   ).bind(
     dataChatId(env, chatId), parsed.court, parsed.startsAt, parsed.endsAt, parsed.reminderAt,
-    preReminderAt, preReminderSent, capacity, from && from.id || null,
+    reminderSent, preReminderAt, preReminderSent, capacity, from && from.id || null,
     actorName(from), sourceText, now, allowConflict ? 1 : 0,
     dataChatId(env, chatId), parsed.court, parsed.endsAt, parsed.startsAt
   ).run();
@@ -156,24 +159,66 @@ export async function updateBooking(
     if (conflicts.length) throw new BookingConflictError(conflicts);
     return false;
   }
+  // The roster claims its own reminders, so a booking moved to another day has
+  // to hand them back or everyone already told hears nothing about the new one.
+  await env.DB.prepare(
+    'UPDATE booking_players SET reminder_sent = ?, pre_reminder_sent = ? WHERE booking_id = ?'
+  ).bind(parsed.reminderAt <= now ? 1 : 0, preReminderAt <= now ? 1 : 0, id).run();
   await recordAudit(env, id, chatId, 'edited', from, sourceText, before, parsed);
   await updateBoard(env, chatId);
   return true;
 }
 
-export async function cancelBooking(env, chatId, id, from = null, sourceText = null) {
+const BOOKING_GONE = 'That booking has already gone.';
+
+// Booking ids are small sequential numbers, so without this any member could
+// walk the whole group's history away. One rule for /cancel and for every button
+// that edits or deletes: whoever booked the court, or a group admin. A refusal
+// says nothing about the booking beyond who to ask. `from` is null only on the
+// automatic expiry sweep, which answers to the clock rather than to a person.
+export async function authorizeBookingChange(env, chatId, id, from, action = 'change') {
   const booking = await env.DB.prepare('SELECT * FROM bookings WHERE id = ? AND chat_id = ?')
     .bind(id, dataChatId(env, chatId)).first();
-  if (!booking) return false;
+  if (!booking) return { allowed: false, status: 'gone', message: BOOKING_GONE, booking: null };
+  if (!from) return { allowed: true, status: 'ok', message: '', booking };
+  const booked = booking.created_by_user_id
+    && Number(booking.created_by_user_id) === Number(from.id);
+  if (booked || await isChatAdmin(env, chatId, from)) {
+    return { allowed: true, status: 'ok', message: '', booking };
+  }
+  return {
+    allowed: false,
+    status: 'forbidden',
+    message: `Only ${booking.created_by_name || 'whoever booked it'} or a group admin ` +
+      `can ${action} that booking.`,
+    booking: null,
+  };
+}
+
+export async function cancelBooking(env, chatId, id, from = null, sourceText = null) {
+  const permitted = await authorizeBookingChange(env, chatId, id, from, 'cancel');
+  if (!permitted.allowed) return permitted;
+  const booking = permitted.booking;
+  // A court that has been played has to reach the tab, so only removeExpiredBookings
+  // may take it away. Cancelling one by hand would erase the bill with it.
+  if (from && booking.ends_at <= Date.now()) {
+    return {
+      allowed: false,
+      status: 'played',
+      message: 'That court has already been played, so it stays on the tab.',
+      booking: null,
+    };
+  }
   const result = await env.DB.prepare('DELETE FROM bookings WHERE id = ? AND chat_id = ?')
     .bind(id, dataChatId(env, chatId)).run();
-  if (result.meta.changes) {
-    // A cancelled booking is never played, so it never reaches the tab.
-    await clearRoster(env, id);
-    await recordAudit(env, id, chatId, 'deleted', from, sourceText, booking, null);
-    await updateBoard(env, chatId);
+  if (!result.meta.changes) {
+    return { allowed: false, status: 'gone', message: BOOKING_GONE, booking: null };
   }
-  return Boolean(result.meta.changes);
+  // A cancelled booking is never played, so it never reaches the tab.
+  await clearRoster(env, id);
+  await recordAudit(env, id, chatId, 'deleted', from, sourceText, booking, null);
+  await updateBoard(env, chatId);
+  return { allowed: true, status: 'cancelled', message: '', booking };
 }
 
 // "9pm", or "9:30pm" when there are minutes to show.
@@ -402,11 +447,11 @@ export async function showRemovePlayer(env, chatId, messageId, bookingId) {
 export async function notifyRemovedPlayer(env, chatId, player, booking) {
   if (!player.user_id) return;
   const tz = await getTimezone(env, chatId);
-  await sendMessage(env, reachableChat(env, player, chatId),
+  await sendPrivately(env, reachableChat(env, player, chatId),
     `🚪 You were taken off <b>${escapeHtml(courtName(booking))}</b> on ` +
     `${formatDate(booking.starts_at, tz)} · ${formatTime(booking.starts_at, tz)}.\n` +
     'Tap the 🙋 button on the pinned board if that was a mistake.',
-    { receiverUserId: player.user_id });
+    player.user_id, endOfLocalDay(booking.starts_at, tz));
 }
 
 export async function showDeleteConfirmation(env, chatId, messageId, bookingId) {
@@ -437,10 +482,6 @@ function reminderHtml(booking, roster, headline, tz) {
     (roster.length ? `\n👥 ${playerTags(roster)}` : '');
 }
 
-// Telegram falls back to an ordinary group message when it cannot deliver an
-// ephemeral one, which for a roster would mean one public post per player. If
-// that happens, the copy is deleted and the whole roster is told once, publicly,
-// rather than the same reminder being shouted N times.
 // A reminder is only useful on the day it is about, so it is queued for removal
 // at the end of that local day rather than left in the chat.
 function endOfLocalDay(epochMs, tz) {
@@ -464,8 +505,12 @@ async function scheduleCleanup(env, chatId, sent, receiverUserId, deleteAfter) {
   ).run();
 }
 
-async function sendPrivateReminder(env, chatId, html, userId, deleteAfter) {
-  const sent = await sendMessage(env, chatId, html, { receiverUserId: userId });
+// Telegram falls back to an ordinary group message when it cannot deliver an
+// ephemeral one. Anything addressed to one person — a receipt with the roster on
+// it, a reminder, a removal notice — would then sit in the group instead, so the
+// public copy is deleted and the caller decides what to do about the failure.
+async function sendPrivately(env, chatId, html, userId, deleteAfter, options = {}) {
+  const sent = await sendMessage(env, chatId, html, { ...options, receiverUserId: userId });
   if (!sent.ok) return 'failed';
   if (sent.result && sent.result.ephemeral_message_id) {
     await scheduleCleanup(env, chatId, sent.result, userId, deleteAfter);
@@ -488,10 +533,29 @@ async function remindPublicly(env, booking, roster, headline, tz) {
   return sent.ok;
 }
 
+// Maintenance has no incoming update to tell it which chat it is running for, so
+// each sweep is scoped the way handleUpdate is. Sharing mode files rows under
+// DATA_CHAT_ID, which need not be one of the allowed chats itself. With
+// ALLOWED_CHATS unset the sweep stays unscoped, as it has always been.
+function maintenanceChats(env) {
+  const allowed = allowedChats(env);
+  if (!allowed.length) return null;
+  const shared = sharingData(env);
+  return shared ? [...new Set([shared, ...allowed])] : allowed;
+}
+
+function chatScope(env, column) {
+  const chats = maintenanceChats(env);
+  if (!chats) return { sql: '', args: [] };
+  return { sql: ` AND ${column} IN (${chats.map(() => '?').join(', ')})`, args: chats };
+}
+
 async function purgeFinishedMessages(env, now) {
+  const scope = chatScope(env, 'chat_id');
   const { results } = await env.DB.prepare(
-    'SELECT * FROM sent_messages WHERE delete_after <= ? ORDER BY delete_after LIMIT 100'
-  ).bind(now).all();
+    `SELECT * FROM sent_messages WHERE delete_after <= ?${scope.sql}
+     ORDER BY delete_after LIMIT 100`
+  ).bind(now, ...scope.args).all();
   for (const row of results) {
     try {
       if (row.is_ephemeral) {
@@ -511,14 +575,18 @@ async function purgeFinishedMessages(env, now) {
 // One claim per player, so someone who joins after the first reminder has gone
 // out still gets their own, and a failed send is retried only for that person.
 async function sendClaimedReminders(env, now, column, headline) {
+  const scope = chatScope(env, 'b.chat_id');
+  // Rosters are seeded with their flags unspent, so the booking-level flag is
+  // what suppresses a reminder for a court booked inside its own window.
   const { results } = await env.DB.prepare(
     `SELECT p.id AS player_row_id, p.user_id AS player_user_id, p.chat_id AS player_chat_id,
             b.*
      FROM booking_players AS p
      JOIN bookings AS b ON b.id = p.booking_id
-     WHERE p.${column}_sent = 0 AND b.${column}_at <= ? AND b.starts_at > ?
+     WHERE p.${column}_sent = 0 AND b.${column}_sent = 0
+       AND b.${column}_at <= ? AND b.starts_at > ?${scope.sql}
      ORDER BY b.${column}_at, p.id LIMIT 200`
-  ).bind(now, now).all();
+  ).bind(now, now, ...scope.args).all();
 
   const rosters = new Map();
   for (const row of results) {
@@ -534,7 +602,7 @@ async function sendClaimedReminders(env, now, column, headline) {
       const roster = rosters.get(row.id);
       const chatId = reachableChat(env, { chat_id: row.player_chat_id }, row.chat_id);
       const html = reminderHtml(row, roster, headline, tz);
-      const outcome = await sendPrivateReminder(
+      const outcome = await sendPrivately(
         env, chatId, html, row.player_user_id, endOfLocalDay(row.starts_at, tz)
       );
 
@@ -563,12 +631,13 @@ async function sendClaimedReminders(env, now, column, headline) {
 // Bookings made before rosters existed have nobody to remind individually, so
 // they keep the original booking-level reminder to whoever booked them.
 async function remindRosterlessBookings(env, now, column, headline) {
+  const scope = chatScope(env, 'b.chat_id');
   const { results } = await env.DB.prepare(
     `SELECT * FROM bookings AS b
-     WHERE b.${column}_sent = 0 AND b.${column}_at <= ? AND b.starts_at > ?
+     WHERE b.${column}_sent = 0 AND b.${column}_at <= ? AND b.starts_at > ?${scope.sql}
        AND NOT EXISTS (SELECT 1 FROM booking_players WHERE booking_id = b.id)
      ORDER BY b.${column}_at LIMIT 100`
-  ).bind(now, now).all();
+  ).bind(now, now, ...scope.args).all();
 
   for (const booking of results) {
     try {
@@ -582,7 +651,7 @@ async function remindRosterlessBookings(env, now, column, headline) {
         name: booking.created_by_name || 'Squash player',
       }];
       const html = reminderHtml(booking, roster, headline, tz);
-      const outcome = await sendPrivateReminder(
+      const outcome = await sendPrivately(
         env, booking.chat_id, html, booking.created_by_user_id,
         endOfLocalDay(booking.starts_at, tz)
       );
@@ -612,9 +681,10 @@ function sendPreReminders(env, now) {
 }
 
 async function removeExpiredBookings(env, now) {
+  const scope = chatScope(env, 'chat_id');
   const { results: expired } = await env.DB.prepare(
-    'SELECT * FROM bookings WHERE ends_at <= ? ORDER BY chat_id, id'
-  ).bind(now).all();
+    `SELECT * FROM bookings WHERE ends_at <= ?${scope.sql} ORDER BY chat_id, id`
+  ).bind(now, ...scope.args).all();
   const chatIds = [...new Set(expired.map((booking) => booking.chat_id))];
   for (const chatId of chatIds) {
     // The money comes first and in its own scope. A board that cannot be pinned

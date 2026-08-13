@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { joinPickerView } from '../src/bookings.js';
 import {
   defaultCapacity, defaultPlayers, householdSlugs, identity, isChatAdmin,
-  ownerIdentity, seedRoster,
+  ownerIdentity, rememberPlayer, seedRoster,
 } from '../src/players.js';
 
 const env = {
@@ -19,6 +19,57 @@ function capturingDb(inserts) {
           return {
             async run() {
               if (sql.includes('INSERT OR IGNORE INTO booking_players')) inserts.push(args);
+              return { meta: { changes: 1 } };
+            },
+          };
+        },
+      };
+    },
+  };
+}
+
+// A booking_players stand-in that enforces UNIQUE (booking_id, slug), so a
+// re-key that collides fails here the way D1 would.
+function rosterDb(rows) {
+  function check() {
+    const seen = new Set();
+    for (const row of rows) {
+      const key = `${row.booking_id}:${row.slug}`;
+      if (seen.has(key)) throw new Error('UNIQUE constraint failed: booking_players.slug');
+      seen.add(key);
+    }
+  }
+  return {
+    prepare(sql) {
+      return {
+        bind(...args) {
+          return {
+            async run() {
+              if (sql.includes('SET user_id = ?')) {
+                const [userId, slug] = args;
+                for (const row of rows) {
+                  if (row.slug === slug && row.user_id == null) row.user_id = userId;
+                }
+              } else if (sql.includes('DELETE FROM booking_players')) {
+                const [userId, slug] = args;
+                const taken = rows.filter((row) => row.slug === slug)
+                  .map((row) => row.booking_id);
+                for (const row of [...rows]) {
+                  if (row.user_id === userId && row.slug !== slug
+                      && taken.includes(row.booking_id)) {
+                    rows.splice(rows.indexOf(row), 1);
+                  }
+                }
+              } else if (sql.includes('SET slug = ?')) {
+                const [slug, name, userId] = args;
+                for (const row of rows) {
+                  if (row.user_id === userId && row.slug !== slug) {
+                    row.slug = slug;
+                    row.name = name;
+                  }
+                }
+              }
+              check();
               return { meta: { changes: 1 } };
             },
           };
@@ -82,6 +133,35 @@ describe('player identity', () => {
   });
 });
 
+describe('remembering a player', () => {
+  it('moves someone who picks up a username onto it, rather than splitting them', async () => {
+    const rows = [
+      { booking_id: 1, slug: 'u42', user_id: 42, name: 'Alice' },
+      { booking_id: 2, slug: 'u42', user_id: 42, name: 'Alice' },
+      { booking_id: 1, slug: '@bob', user_id: 11, name: '@bob' },
+    ];
+    await rememberPlayer({ DB: rosterDb(rows) }, { id: 42, username: 'Alice' });
+    expect(rows.filter((row) => row.user_id === 42)).toEqual([
+      { booking_id: 1, slug: '@alice', user_id: 42, name: '@Alice' },
+      { booking_id: 2, slug: '@alice', user_id: 42, name: '@Alice' },
+    ]);
+    expect(rows.find((row) => row.user_id === 11).slug).toBe('@bob');
+  });
+
+  it('merges the two spellings when both are already on the same booking', async () => {
+    const rows = [
+      { booking_id: 1, slug: 'u42', user_id: 42, name: 'Alice' },
+      { booking_id: 1, slug: '@alice', user_id: null, name: '@alice' },
+      { booking_id: 2, slug: 'u42', user_id: 42, name: 'Alice' },
+    ];
+    await rememberPlayer({ DB: rosterDb(rows) }, { id: 42, username: 'alice' });
+    // One human, one seat: two rows on booking 1 would be billed twice.
+    expect(rows.map((row) => `${row.booking_id}:${row.slug}`))
+      .toEqual(['1:@alice', '2:@alice']);
+    expect(rows.every((row) => row.user_id === 42)).toBe(true);
+  });
+});
+
 describe('rosters', () => {
   it('defaults to three players per court', () => {
     expect(defaultCapacity({})).toBe(3);
@@ -94,14 +174,24 @@ describe('rosters', () => {
     await seedRoster({ ...env, DB: capturingDb(inserts) }, -123, 3,
       { id: 9, username: 'alice' }, 3);
     expect(inserts.map((args) => args[4]))
-      .toEqual(['@nicholaswan', '@dodgerblueee', '@alice']);
+      .toEqual(['@alice', '@nicholaswan', '@dodgerblueee']);
   });
 
   it('never seeds more players than the court holds', async () => {
     const inserts = [];
     await seedRoster({ ...env, DB: capturingDb(inserts) }, -123, 3,
       { id: 9, username: 'alice' }, 2);
-    expect(inserts.map((args) => args[4])).toEqual(['@nicholaswan', '@dodgerblueee']);
+    expect(inserts.map((args) => args[4])).toEqual(['@alice', '@nicholaswan']);
+  });
+
+  it('seats whoever booked, even on a court smaller than the household', async () => {
+    const inserts = [];
+    await seedRoster({
+      ...env, DEFAULT_PLAYERS: '@alpha,@bravo,@charlie', DB: capturingDb(inserts),
+    }, -123, 3, { id: 9, username: 'alice' }, 3);
+    // The booker cannot be the one left off their own booking.
+    expect(inserts.map((args) => args[4])).toContain('@alice');
+    expect(inserts).toHaveLength(3);
   });
 
   it('does not seat the organiser twice when they book', async () => {
@@ -117,7 +207,7 @@ describe('rosters', () => {
       { OWNER: '@nicholaswan', DEFAULT_PLAYERS: '', DB: capturingDb(inserts) },
       -123, 3, { id: 9, username: 'alice' }, 3
     );
-    expect(inserts.map((args) => args[4])).toEqual(['@nicholaswan', '@alice']);
+    expect(inserts.map((args) => args[4])).toEqual(['@alice', '@nicholaswan']);
   });
 
   it('records the chat a player joined from, so reminders reach them', async () => {

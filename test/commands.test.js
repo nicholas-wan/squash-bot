@@ -290,6 +290,111 @@ describe('Telegram commands', () => {
     }
   });
 
+  // Booking ids are small sequential numbers, so an ungated /cancel would let
+  // any member walk the whole group's history away one id at a time.
+  function bookingDb(booking) {
+    const ran = [];
+    const db = {
+      ran,
+      prepare(sql) {
+        return { bind() { return {
+          async first() {
+            if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+            if (sql.includes('SELECT * FROM bookings WHERE id')) return booking;
+            return null;
+          },
+          async all() { return { results: [] }; },
+          async run() { ran.push(sql); return { meta: { changes: 1 } }; },
+        }; } };
+      },
+    };
+    return db;
+  }
+
+  function captureAsMember() {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      const result = String(url).endsWith('/getChatMember')
+        ? { status: 'member' } : { message_id: 1 };
+      return new Response(JSON.stringify({ ok: true, result }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    return requests;
+  }
+
+  const nicksBooking = {
+    id: 3, chat_id: -123456789, court: '4', created_by_user_id: 7, created_by_name: '@nick',
+    starts_at: Date.UTC(2026, 7, 19, 13, 0), ends_at: Date.UTC(2026, 7, 19, 14, 0),
+  };
+
+  it('refuses /cancel from a member who did not book the court', async () => {
+    const requests = captureAsMember();
+    const db = bookingDb(nicksBooking);
+    await handleUpdate({
+      BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db,
+    }, {
+      message: {
+        message_id: 5,
+        chat: { id: -123456789 },
+        from: { id: 11, username: 'alice' },
+        text: '/cancel 3',
+      },
+    });
+    const send = requests.find((request) => request.url.endsWith('/sendMessage'));
+    expect(send.body.text).toBe('Only @nick or a group admin can cancel that booking.');
+    expect(send.body.receiver_user_id).toBe(11);
+    expect(db.ran.some((sql) => sql.startsWith('DELETE FROM bookings'))).toBe(false);
+  });
+
+  it('refuses the edit and delete buttons to a member who did not book the court', async () => {
+    for (const data of ['sb:edit:3:d', 'sb:delete:3']) {
+      const requests = captureAsMember();
+      const db = bookingDb(nicksBooking);
+      await handleUpdate({
+        BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db,
+      }, {
+        callback_query: {
+          id: 'callback-1', data,
+          from: { id: 11, username: 'alice' },
+          message: { message_id: 55, chat: { id: -123456789 } },
+        },
+      });
+      const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+      expect(answer.body.text).toContain('Only @nick or a group admin');
+      expect(answer.body.show_alert).toBe(true);
+      expect(requests.some((request) => request.url.endsWith('/editMessageReplyMarkup')))
+        .toBe(false);
+      expect(db.ran.some((sql) => sql.includes('INSERT INTO booking_drafts'))).toBe(false);
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('never echoes an internal error into the chat', async () => {
+    const logged = [];
+    vi.spyOn(console, 'log').mockImplementation((line) => logged.push(line));
+    const requests = captureAsMember();
+    const db = {
+      prepare() { throw new Error('D1_ERROR: no such column: bookings.secret'); },
+    };
+    await handleUpdate({
+      BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db,
+    }, {
+      message: {
+        message_id: 5,
+        chat: { id: -123456789 },
+        from: { id: 7, first_name: 'Nick' },
+        text: '/courts',
+      },
+    });
+    const send = requests.find((request) => request.url.endsWith('/sendMessage'));
+    expect(send.body.text).toBe('⚠️ Something went wrong. Please try again.');
+    // The detail belongs in the log, not in the group.
+    expect(logged.join('\n')).toContain('D1_ERROR');
+    vi.restoreAllMocks();
+  });
+
   it('registers every command as ephemeral', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
