@@ -139,8 +139,8 @@ async function handleBoardCallback(env, callback) {
     await answerCallback(env, callback.id);
     return true;
   }
-  if (data === 'sb:close') {
-    await closeJoinPicker(env, callback);
+  if (data === 'sb:close' || data === 'sb:ok') {
+    await dismissMessage(env, callback);
     await answerCallback(env, callback.id);
     return true;
   }
@@ -237,7 +237,7 @@ async function refreshJoinPicker(env, callback) {
   );
 }
 
-async function closeJoinPicker(env, callback) {
+async function dismissMessage(env, callback) {
   const ephemeralId = callback.message && callback.message.ephemeral_message_id;
   if (ephemeralId) {
     await deleteEphemeralMessage(env, callback.message.chat.id, callback.from.id, ephemeralId);

@@ -81,7 +81,8 @@ describe('money tab', () => {
     const html = tabHtml(env, balances);
     expect(html).toContain('Owed to Nicholas');
     expect(html).toContain('• @alice — <b>$8.00</b>');
-    expect(html).toContain('Total outstanding <b>$12.00</b>');
+    expect(html).toContain('• @bob — <b>$4.00</b>');
+    expect(html).not.toContain('Total');
     expect(tabMarkup(balances).inline_keyboard[0][0].callback_data).toBe('tb:pay');
   });
 

@@ -30,7 +30,7 @@ describe('shared data across groups', () => {
     expect(reachableChat(shared, { chat_id: -55 }, GROUP_A)).toBe(GROUP_A);
   });
 
-  it('writes a booking made in one group under the shared id and tells both', async () => {
+  it('writes a booking made in one group under the shared id and updates both boards', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
       requests.push({ url: String(url), body: JSON.parse(init.body) });
@@ -49,7 +49,14 @@ describe('shared data across groups', () => {
                 if (sql.includes('board_message_id')) return { board_message_id: 55 };
                 return null;
               },
-              async all() { return { results: [] }; },
+              async all() {
+                if (sql.includes('FROM booking_players')) return { results: [] };
+                return { results: sql.includes('ends_at >') ? [{
+                  id: 3, chat_id: GROUP_A, court: '4', capacity: 3,
+                  starts_at: Date.UTC(2026, 7, 19, 13, 0),
+                  ends_at: Date.UTC(2026, 7, 19, 14, 0),
+                }] : [] };
+              },
               async run() {
                 if (sql.startsWith('INSERT INTO bookings')) {
                   inserted.push(args);
@@ -69,10 +76,16 @@ describe('shared data across groups', () => {
 
     // Booked from group B, but stored under group A's id so both groups see it.
     expect(inserted[0][0]).toBe(GROUP_A);
-    const announcements = requests.filter(
+    // Both pinned boards are rewritten; the receipt goes only to the booker,
+    // only in the group they booked from.
+    const boards = requests.filter((request) => request.url.endsWith('/editMessageText'));
+    expect(boards.map((request) => request.body.chat_id)).toEqual([GROUP_A, GROUP_B]);
+    const receipts = requests.filter(
       (request) => request.url.endsWith('/sendMessage')
         && String(request.body.text).includes('booked')
     );
-    expect(announcements.map((request) => request.body.chat_id)).toEqual([GROUP_A, GROUP_B]);
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0].body.chat_id).toBe(GROUP_B);
+    expect(receipts[0].body.receiver_user_id).toBe(9);
   });
 });
