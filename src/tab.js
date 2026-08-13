@@ -84,8 +84,6 @@ export function tabHtml(env, balances) {
   for (const entry of owing) {
     lines.push(`• ${escapeHtml(entry.name)} — <b>${formatMoney(entry.balance)}</b>`);
   }
-  const total = owing.reduce((sum, entry) => sum + entry.balance, 0);
-  if (owing.length > 1) lines.push('', `Total outstanding <b>${formatMoney(total)}</b>`);
   if (credit.length) {
     lines.push('', 'In credit');
     for (const entry of credit) {

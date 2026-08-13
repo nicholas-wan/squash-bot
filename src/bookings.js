@@ -65,31 +65,34 @@ export async function findBookingConflicts(
   return (await env.DB.prepare(query).bind(...args).all()).results;
 }
 
-// The only routine public post. Edits, deletions, and reminders stay private so
-// a bigger group does not get a running commentary in its notifications.
-async function announceNewBooking(env, chatId, bookingId, booking, capacity) {
+// Nothing about a booking is posted to the group. The person who booked gets a
+// private receipt they can dismiss, and the pinned board carries the news.
+async function confirmToBooker(env, chatId, bookingId, booking, capacity, from, callbackQueryId) {
+  if (!from || !from.id) return;
   const tz = await getTimezone(env, chatId);
   const startsAt = booking.startsAt ?? booking.starts_at;
   const endsAt = booking.endsAt ?? booking.ends_at;
   const court = booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`;
   const roster = await rosterFor(env, bookingId);
-  const html = `🎾 <b>${escapeHtml(court)} booked</b>\n` +
+  const sent = await sendMessage(env, chatId,
+    `🎾 <b>${escapeHtml(court)} booked</b>\n` +
     `${formatDate(startsAt, tz)} · ${compactTimeRange(startsAt, endsAt, tz)}\n` +
-    `👥 ${playerTags(roster)} · ${slotsLabel(roster, capacity)}`;
-  // Every group sharing these bookings hears about it, so anyone can join. The
-  // announcement is queued for removal at the end of the day it is about, so
-  // old ones do not pile up in the chat.
-  const deleteAfter = endOfLocalDay(startsAt, tz);
-  for (const chat of boardChats(env, chatId)) {
-    const sent = await sendMessage(env, chat, html, { replyMarkup: { inline_keyboard: [[
-      { text: '🙋 Join', callback_data: `sb:join:${bookingId}` },
-    ]] } });
-    if (sent.ok && sent.result) await scheduleCleanup(env, chat, sent.result, null, deleteAfter);
+    `👥 ${playerTags(roster)} · ${slotsLabel(roster, capacity)}`,
+    {
+      receiverUserId: from.id,
+      callbackQueryId,
+      replyMarkup: { inline_keyboard: [[{ text: '👍 OK', callback_data: 'sb:ok' }]] },
+    }
+  );
+  // If OK is never tapped it still clears itself at the end of the day.
+  if (sent.ok && sent.result) {
+    await scheduleCleanup(env, chatId, sent.result, from.id, endOfLocalDay(startsAt, tz));
   }
 }
 
 export async function addBooking(
-  env, chatId, parsed, from, sourceText = null, { allowConflict = false } = {}
+  env, chatId, parsed, from, sourceText = null,
+  { allowConflict = false, callbackQueryId = null } = {}
 ) {
   const now = Date.now();
   const preReminderAt = parsed.startsAt - 2 * 60 * 60 * 1000;
@@ -118,7 +121,7 @@ export async function addBooking(
   await recordAudit(env, bookingId, chatId, 'added', from, sourceText, null, parsed);
   await seedRoster(env, chatId, bookingId, from, capacity);
   await updateBoard(env, chatId);
-  await announceNewBooking(env, chatId, bookingId, parsed, capacity);
+  await confirmToBooker(env, chatId, bookingId, parsed, capacity, from, callbackQueryId);
   return bookingId;
 }
 

@@ -54,20 +54,20 @@ describe('public booking announcements', () => {
     return requests;
   }
 
-  it('announces a new booking once, with the roster and a join button', async () => {
+  it('confirms a new booking to the booker alone, never to the group', async () => {
     const requests = captureTelegram();
     const roster = [{ id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick' }];
     await addBooking({ BOT_TOKEN: 'test', DB: bookingDb([storedBooking], roster) }, -123, {
       court: '4', startsAt, endsAt, reminderAt: startsAt - 3600000,
     }, { id: 7, first_name: 'Nick' });
-    const announcements = requests.filter((request) => request.url.endsWith('/sendMessage'));
-    expect(announcements).toHaveLength(1);
-    expect(announcements[0].body.text).toContain('Court 4 booked');
-    expect(announcements[0].body.text)
-      .toContain('👥 <a href="tg://user?id=7">Nick</a> · 2 slots');
-    expect(announcements[0].body).not.toHaveProperty('receiver_user_id');
-    expect(announcements[0].body.reply_markup.inline_keyboard[0][0].callback_data)
-      .toBe('sb:join:3');
+    const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
+    expect(sent).toHaveLength(1);
+    expect(sent[0].body.text).toContain('Court 4 booked');
+    expect(sent[0].body.text).toContain('👥 <a href="tg://user?id=7">Nick</a> · 2 slots');
+    // Visible only to whoever booked it, and dismissable.
+    expect(sent[0].body.receiver_user_id).toBe(7);
+    expect(sent[0].body.reply_markup.inline_keyboard[0][0])
+      .toEqual({ text: '👍 OK', callback_data: 'sb:ok' });
   });
 
   it('removes a booking without posting to the group', async () => {

@@ -388,7 +388,9 @@ export async function handleBookingCallback(env, callback) {
       } else {
         saved = await addBooking(
           env, chatId, booking, callback.from, payload.sourceText || null,
-          { allowConflict: action === 'o' }
+          // Telegram needs the tap to deliver a private message to someone it
+          // has no other recent contact with.
+          { allowConflict: action === 'o', callbackQueryId: callback.id }
         );
       }
     } catch (error) {

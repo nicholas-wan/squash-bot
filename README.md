@@ -77,8 +77,8 @@ tab only after a booking has been played, so a cancelled court or a player who
 left in time is never billed. The organiser's household plays free: they pay the
 court, and they absorb the rounding remainder.
 
-A second pinned message tracks who owes the organiser, and disappears once
-everything is settled. Group admins mark a balance paid from that message, which
+A second pinned message lists who owes the organiser and how much, and
+disappears once everything is settled. Group admins mark a balance paid from that message, which
 writes a payment into the append-only ledger rather than erasing anything.
 
 Overlapping bookings on the same court are blocked atomically unless the
@@ -106,13 +106,15 @@ remain.
 
 When a pinned board exists, `/help` includes a button linking directly to it.
 
-Commands and SquashBot's help, forms, private confirmations, reminders, and
-errors are ephemeral: only the recipient and the bot can see them. A new booking
-is the one thing announced to the group, so people know there is something to
-join; edits and removals only update the pinned board. Older Telegram clients may
-send commands normally; SquashBot deletes those immediately when it has Delete
-Messages permission. Telegram does not guarantee ephemeral delivery when the
-recipient is offline.
+Nothing SquashBot sends is addressed to the group. Commands, help, forms,
+confirmations, reminders, and errors are all ephemeral: only the recipient and
+the bot can see them. Booking by message deletes the message, the form is
+removed once saved, and the booker gets a private receipt with an **OK** button
+that clears it. The pinned board and the pinned tab are the only shared
+messages, so a new booking is discovered there rather than announced. Older
+Telegram clients may send commands normally; SquashBot deletes those
+immediately when it has Delete Messages permission. Telegram does not guarantee
+ephemeral delivery when the recipient is offline.
 
 ## Deploy
 
