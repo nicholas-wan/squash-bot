@@ -134,6 +134,61 @@ describe('Telegram commands', () => {
     const labels = send.body.reply_markup.inline_keyboard.flat().map((button) => button.text);
     expect(labels).toContain('✅ Add booking');
     expect(sqlSeen.some((sql) => sql.includes('INSERT INTO bookings'))).toBe(false);
+    // The booking text itself is cleared out of the group.
+    const removed = requests.find((request) => request.url.endsWith('/deleteMessage'));
+    expect(removed.body.message_id).toBe(5);
+  });
+
+  it('leaves nothing behind in the chat once a booking is saved', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const draft = {
+      id: 41, chat_id: -123456789, user_id: 7, user_name: '@nick',
+      wizard_message_id: 12, wizard_ephemeral: 1,
+      payload: JSON.stringify({
+        operation: 'add', bookingId: null, sourceText: '20 Aug 2026 Court 4 9pm',
+        date: { y: 2026, mo: 8, d: 20 }, court: '4', start: { h: 21, mi: 0 }, end: null,
+        dateChoices: [], courtChoices: [], timeChoices: [], issues: [], conflicts: [],
+      }),
+    };
+    const db = {
+      prepare(sql) {
+        return { bind() { return {
+          async first() {
+            if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+            if (sql.includes('FROM booking_drafts')) return draft;
+            return null;
+          },
+          async all() { return { results: [] }; },
+          async run() { return { meta: { changes: 1, last_row_id: 3 } }; },
+        }; } };
+      },
+    };
+    await handleUpdate({
+      BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db,
+    }, {
+      callback_query: {
+        id: 'callback-1', data: 'bw:41:y',
+        from: { id: 7, username: 'nick' },
+        message: { message_id: 12, chat: { id: -123456789 } },
+      },
+    });
+    // The form is removed rather than rewritten to a confirmation message.
+    const removed = requests.find(
+      (request) => request.url.endsWith('/deleteEphemeralMessage')
+    );
+    expect(removed.body.ephemeral_message_id).toBe(12);
+    const texts = requests
+      .filter((request) => request.url.endsWith('/editEphemeralMessageText'))
+      .map((request) => request.body.text);
+    expect(texts).toHaveLength(0);
+    const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+    expect(answer.body.text).toBe('✅ Booking added');
   });
 
   it('logs the id of any chat it ignores so a new group can be identified', async () => {

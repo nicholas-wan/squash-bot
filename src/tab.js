@@ -58,9 +58,20 @@ export async function tabBalances(env, chatId) {
   return results;
 }
 
+// Telegram caps callback_data at 64 bytes. A slug is a username or a numeric
+// id, so this only ever excludes an absurdly long free-text name.
+export function settleKey(slug) {
+  const key = String(slug);
+  return new TextEncoder().encode(`tb:paid:${key}`).length <= 64 ? key : null;
+}
+
+export function settleable(balances) {
+  return balances.filter((entry) => entry.balance > 0 && settleKey(entry.slug));
+}
+
 export function tabMarkup(balances) {
-  if (!balances.some((entry) => entry.balance > 0 && entry.user_id)) return NO_KEYBOARD;
-  return { inline_keyboard: [[{ text: '✅ Mark someone settled', callback_data: 'tb:pay' }]] };
+  if (!settleable(balances).length) return NO_KEYBOARD;
+  return { inline_keyboard: [[{ text: '⚙️ Manage tab', callback_data: 'tb:pay' }]] };
 }
 
 export function tabHtml(env, balances) {
@@ -99,24 +110,25 @@ export async function updateTab(env, chatId) {
 
 export async function settleMarkup(env, chatId) {
   const balances = await tabBalances(env, chatId);
-  const rows = balances
-    .filter((entry) => entry.balance > 0 && entry.user_id)
-    .map((entry) => [{
-      text: `✅ ${entry.name} · ${formatMoney(entry.balance)}`,
-      callback_data: `tb:pay:${entry.user_id}`,
-    }]);
+  const rows = settleable(balances).map((entry) => [{
+    text: `✅ ${entry.name} · ${formatMoney(entry.balance)}`,
+    callback_data: `tb:pay:${settleKey(entry.slug)}`,
+  }]);
   rows.push([{ text: '← Done', callback_data: 'tb:back' }]);
   return { inline_keyboard: rows };
 }
 
-export async function confirmSettleMarkup(env, chatId, userId) {
-  const balances = await tabBalances(env, chatId);
-  const entry = balances.find((row) => row.user_id === Number(userId) && row.balance > 0);
+function findOwing(balances, slug) {
+  return balances.find((row) => row.slug === String(slug) && row.balance > 0) || null;
+}
+
+export async function confirmSettleMarkup(env, chatId, slug) {
+  const entry = findOwing(await tabBalances(env, chatId), slug);
   if (!entry) return null;
   return { entry, markup: { inline_keyboard: [
     [{
-      text: `✅ Confirm ${entry.name} paid ${formatMoney(entry.balance)}`,
-      callback_data: `tb:paid:${entry.user_id}`,
+      text: `✅ Clear ${entry.name} · ${formatMoney(entry.balance)}`,
+      callback_data: `tb:paid:${settleKey(entry.slug)}`,
     }],
     [{ text: '← Back', callback_data: 'tb:pay' }],
   ] } };
@@ -125,10 +137,9 @@ export async function confirmSettleMarkup(env, chatId, userId) {
 // The confirm button sits on a shared pinned message, so two admins can tap it
 // at the same time. The payment is only written if the balance is still exactly
 // what was read, which makes a second tap a no-op instead of a double credit.
-export async function settleUser(env, chatId, userId, actor) {
+export async function settleUser(env, chatId, slug, actor) {
   const dataChat = dataChatId(env, chatId);
-  const balances = await tabBalances(env, chatId);
-  const entry = balances.find((row) => row.user_id === Number(userId) && row.balance > 0);
+  const entry = findOwing(await tabBalances(env, chatId), slug);
   if (!entry) return null;
   const who = identity(actor);
   const result = await env.DB.prepare(
@@ -141,7 +152,7 @@ export async function settleUser(env, chatId, userId, actor) {
      ) = ?`
   ).bind(
     dataChat, entry.slug, entry.user_id, entry.name, -entry.balance,
-    `Marked settled by ${who.name}`, Date.now(),
+    `Cleared by ${who.name}`, Date.now(),
     dataChat, entry.slug, entry.balance
   ).run();
   if (!result.meta.changes) return null;

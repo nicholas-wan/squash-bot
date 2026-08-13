@@ -409,19 +409,16 @@ export async function handleBookingCallback(env, callback) {
       await answerCallback(env, callback.id, 'That booking no longer exists.', true);
       return true;
     }
+    // The form has done its job: the tap confirmation says it worked and the
+    // pinned board carries the result, so the form itself goes away.
     const editing = payload.operation === 'edit';
-    const confirmation = editing
-      ? '✅ Booking updated. The pinned court board is up to date.'
-      : '✅ Booking added. The pinned court board is up to date.';
     if (row.wizard_ephemeral) {
-      await editEphemeralMessage(
-        env, chatId, row.user_id, row.wizard_message_id,
-        confirmation, { inline_keyboard: [] }
-      );
+      await deleteEphemeralMessage(env, chatId, row.user_id, row.wizard_message_id);
     } else {
-      await editMessage(env, chatId, row.wizard_message_id, confirmation, { inline_keyboard: [] });
+      await deleteMessage(env, chatId, row.wizard_message_id);
     }
-    await answerCallback(env, callback.id, editing ? 'Booking updated' : 'Booking added');
+    await answerCallback(env, callback.id,
+      editing ? '✅ Booking updated' : '✅ Booking added');
     return true;
   }
   return false;
