@@ -180,3 +180,25 @@ else to lose, and the next file can still be run.
 otherwise fails naming the one that is missing. It is worth running because that
 same atomicity can leave a hand-patched database short: a file whose first
 `ALTER` duplicates rolls back the later ones too, and they are never retried.
+
+## Known gaps
+
+Found by review, none of them load-bearing enough to hold a release:
+
+- A username change re-keys a player's roster rows but not their `ledger`
+  history, so someone who played before setting a username can appear on the tab
+  as two entries. Both are real and both settle; the totals are right.
+- `getTimezone` reads a `tz` of `Asia/Singapore` as "never set" so
+  `DEFAULT_TIMEZONE` stays reachable. Nothing writes `tz` today, but a future
+  per-chat override set to Singapore would be ignored.
+- The intent gate accepts a standalone `c` before a number, so `Room C 2 at 8pm`
+  opens a booking form — and booking by message deletes the original.
+  `c4 tmr 8-9` is the opposite case and is still rejected, because a bare hour
+  range does not count as a clock time.
+- A receipt or a removal notice that Telegram will not deliver privately is
+  deleted rather than posted, so it can end up sent to nobody.
+- `DATA_CHAT_ID` is documented as one of `ALLOWED_CHATS`; the code no longer
+  requires it, but the public reminder fallback still posts to it, which needs
+  the bot to be in that chat.
+- A chat dropped from `ALLOWED_CHATS` keeps its rows: they stop being charged and
+  its old messages stop being purged.
