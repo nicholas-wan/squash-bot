@@ -282,6 +282,12 @@ export function draftComplete(draft) {
   return Boolean(draft.date && draft.court && draft.start);
 }
 
+// Courts run 7am to 10pm, so the last slot starts at 9pm. Everything outside
+// those hours is rejected rather than silently booked.
+export const OPEN_HOUR = 7;
+export const LAST_START_HOUR = 21;
+export const CLOSE_HOUR = 22;
+
 export function bookingFromDraft(draft, nowMs = Date.now(), tz = 'Asia/Singapore') {
   if (!draftComplete(draft)) throw new BookingParseError('The booking still needs a date, court, and start time.');
   const { y, mo, d } = draft.date;
@@ -291,13 +297,26 @@ export function bookingFromDraft(draft, nowMs = Date.now(), tz = 'Asia/Singapore
   }
   if (startsAt <= nowMs) throw new BookingParseError('That booking time has already passed. Change the date or time.');
 
+  const startMinutes = draft.start.h * 60 + draft.start.mi;
+  if (startMinutes < OPEN_HOUR * 60) {
+    throw new BookingParseError('Courts open at 7am. Choose a later start time.');
+  }
+  if (startMinutes > LAST_START_HOUR * 60) {
+    throw new BookingParseError('The last slot starts at 9pm. Choose an earlier start time.');
+  }
+
   let endsAt = startsAt + 60 * 60 * 1000;
   if (draft.end) {
-    endsAt = zonedEpoch(y, mo, d, draft.end.h, draft.end.mi, tz);
-    if (endsAt <= startsAt) endsAt += 24 * 60 * 60 * 1000;
-    if (endsAt - startsAt > 6 * 60 * 60 * 1000) {
-      throw new BookingParseError('A court booking cannot be longer than 6 hours.');
+    const endMinutes = draft.end.h * 60 + draft.end.mi;
+    if (endMinutes <= startMinutes) {
+      throw new BookingParseError('The finish time has to be after the start time.');
     }
+    if (endMinutes > CLOSE_HOUR * 60) {
+      throw new BookingParseError('Courts close at 10pm. Choose an earlier finish time.');
+    }
+    endsAt = zonedEpoch(y, mo, d, draft.end.h, draft.end.mi, tz);
+  } else if (startMinutes + 60 > CLOSE_HOUR * 60) {
+    endsAt = zonedEpoch(y, mo, d, CLOSE_HOUR, 0, tz);
   }
   const midnight = zonedEpoch(y, mo, d, 0, 0, tz);
   const eightAm = zonedEpoch(y, mo, d, 8, 0, tz);

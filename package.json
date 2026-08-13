@@ -7,6 +7,9 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "db:init": "wrangler d1 execute squashbot --remote --file=schema.sql",
+    "db:migrate:002": "wrangler d1 execute squashbot --remote --file=migrations/002-players-and-tab.sql",
+    "db:migrate:003": "wrangler d1 execute squashbot --remote --file=migrations/003-per-player-reminders.sql",
+    "db:migrate:004": "wrangler d1 execute squashbot --remote --file=migrations/004-reminder-cleanup.sql",
     "test": "vitest run"
   },
   "devDependencies": {

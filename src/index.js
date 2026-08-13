@@ -1,29 +1,56 @@
 import {
-  cancelBooking, restoreBoardButtons, runMaintenance, showBoardManager,
-  showCancelConfirmation, showDeleteConfirmation, updateBoard,
+  cancelBooking, notifyRemovedPlayer, restoreBoardButtons, runMaintenance,
+  showBoardManager, showCancelConfirmation, showDeleteConfirmation,
+  joinPickerView, showRemovePlayer, updateBoard,
 } from './bookings.js';
 import {
-  answerCallback, deleteMessage, escapeHtml, sendMessage, setBotProfilePhoto, telegram,
+  defaultCapacity, isChatAdmin, MAX_CAPACITY, raiseCapacity, rememberPlayer,
+  joinBooking, leaveBooking, removeBookingPlayer,
+} from './players.js';
+import { formatMoney } from './pricing.js';
+import {
+  confirmSettleMarkup, settleMarkup, settleUser, tabBalances, updateTab,
+} from './tab.js';
+import {
+  answerCallback, deleteEphemeralMessage, deleteMessage, editEphemeralMessage,
+  editReplyMarkup, escapeHtml, sendMessage,
+  setBotProfilePhoto, telegram,
 } from './telegram.js';
 import {
   beginBooking, beginEditBooking, handleBookingCallback, handleBookingReply,
   pruneBookingDrafts,
 } from './wizard.js';
 
-function chatAllowed(env, chatId) {
+function chatAllowed(env, chat) {
   const ids = String(env.ALLOWED_CHATS || '').split(',').map((x) => x.trim()).filter(Boolean);
-  return ids.length > 0 && ids.includes(String(chatId));
+  const chatId = chat && chat.id;
+  if (ids.length > 0 && ids.includes(String(chatId))) return true;
+  // Printed by `npx wrangler tail` so a new group's id can be read off the first
+  // message someone sends there. No message text is logged.
+  console.log(
+    `Ignored update from chat ${chatId}${chat && chat.title ? ` "${chat.title}"` : ''}. ` +
+    'Add that id to ALLOWED_CHATS to enable SquashBot there.'
+  );
+  return false;
 }
 
-function helpHtml() {
+function helpHtml(env) {
   return '🎾 <b>SquashBot</b>\n\n' +
     'Send a booking in natural language:\n' +
     '<code>13 Aug Court 4 9pm</code>\n' +
     '<code>court four tomorrow at 9pm</code>\n' +
-    '<code>Friday 9pm-10:30pm, Court 2</code>\n\n' +
+    '<code>Friday 8pm-9:30pm, Court 2</code>\n\n' +
+    'Courts run <b>7am to 10pm</b>, so 9pm is the last slot.\n' +
     'No end time means one hour. If anything is missing or ambiguous, ' +
-    'SquashBot asks with buttons and saves only after confirmation.\n' +
+    'SquashBot asks with buttons and saves only after confirmation.\n\n' +
+    `Every court holds <b>${defaultCapacity(env)} players</b> by default — tap a ` +
+    '🙋 button on the pinned board to join or leave. Group admins can open extra ' +
+    'slots from <b>Manage bookings</b>.\n' +
+    'Courts cost <b>$6/hour</b> from 6pm, on weekends, and on Singapore public ' +
+    'holidays, and <b>$3/hour</b> before 6pm on other days. Your share appears on ' +
+    'the pinned tab after you have played.\n\n' +
     '/courts — refresh the pinned board\n' +
+    '/tab — refresh the pinned money tab\n' +
     '/cancel ID — remove a booking\n' +
     '/book — open a blank booking form';
 }
@@ -98,15 +125,181 @@ async function handleBoardCallback(env, callback) {
       removed ? 'Booking cancelled' : 'That booking has already gone.', !removed);
     return true;
   }
+  if (data === 'sb:join') {
+    const view = await joinPickerView(env, chatId, callback.from);
+    if (!view) {
+      await answerCallback(env, callback.id, 'There is nothing to join yet.', true);
+      return true;
+    }
+    await sendMessage(env, chatId, view.html, {
+      replyMarkup: view.replyMarkup,
+      receiverUserId: callback.from.id,
+      callbackQueryId: callback.id,
+    });
+    await answerCallback(env, callback.id);
+    return true;
+  }
+  if (data === 'sb:close') {
+    await closeJoinPicker(env, callback);
+    await answerCallback(env, callback.id);
+    return true;
+  }
+  const full = data.match(/^sb:full:(\d+)$/);
+  if (full) {
+    await answerCallback(env, callback.id,
+      'That court is full. A group admin can open another slot.', true);
+    return true;
+  }
+  const join = data.match(/^sb:join:(\d+)$/);
+  const leave = data.match(/^sb:leave:(\d+)$/);
+  if (join || leave) {
+    const bookingId = Number((join || leave)[1]);
+    const result = join
+      ? await joinBooking(env, chatId, bookingId, callback.from)
+      : await leaveBooking(env, chatId, bookingId, callback.from);
+    const replies = {
+      joined: ['You are in. The pinned board shows your name.', false],
+      left: ['You are out. Your slot is free again.', false],
+      already: ['You are already on that court.', true],
+      absent: ['You were not on that court.', true],
+      full: ['That court is full. A group admin can open another slot.', true],
+      started: ['That court has already started, so the roster is locked.', true],
+      gone: ['That booking has already gone.', true],
+    };
+    if (result.status === 'joined' || result.status === 'left') {
+      await updateBoard(env, chatId);
+      await refreshJoinPicker(env, callback);
+    }
+    await answerCallback(env, callback.id, ...replies[result.status]);
+    return true;
+  }
+  const kicked = data.match(/^sb:kick:(\d+):(\d+)$/);
+  if (kicked) {
+    if (!(await isChatAdmin(env, chatId, callback.from))) {
+      await answerCallback(env, callback.id, 'Only group admins can remove players.', true);
+      return true;
+    }
+    const removed = await removeBookingPlayer(
+      env, chatId, Number(kicked[1]), Number(kicked[2])
+    );
+    if (removed) {
+      await updateBoard(env, chatId);
+      await notifyRemovedPlayer(env, chatId, removed.player, removed.booking);
+      await showCancelConfirmation(env, chatId, messageId, Number(kicked[1]));
+    }
+    await answerCallback(env, callback.id,
+      removed ? `${removed.player.name} is off this booking.`
+        : 'That player has already gone.', !removed);
+    return true;
+  }
+  const kick = data.match(/^sb:kick:(\d+)$/);
+  if (kick) {
+    if (!(await isChatAdmin(env, chatId, callback.from))) {
+      await answerCallback(env, callback.id, 'Only group admins can remove players.', true);
+      return true;
+    }
+    const shown = await showRemovePlayer(env, chatId, messageId, Number(kick[1]));
+    await answerCallback(env, callback.id,
+      shown ? 'Choose who to remove' : 'Nobody is on that booking.', !shown);
+    return true;
+  }
+  const capacity = data.match(/^sb:cap:(\d+)$/);
+  if (capacity) {
+    if (!(await isChatAdmin(env, chatId, callback.from))) {
+      await answerCallback(env, callback.id, 'Only group admins can open extra slots.', true);
+      return true;
+    }
+    const raised = await raiseCapacity(env, chatId, Number(capacity[1]));
+    if (raised) {
+      await updateBoard(env, chatId);
+      await showCancelConfirmation(env, chatId, messageId, Number(capacity[1]));
+    }
+    await answerCallback(env, callback.id,
+      raised ? `This court now holds ${raised} players.`
+        : `That booking has gone, or it is already at the ${MAX_CAPACITY} player limit.`,
+      !raised);
+    return true;
+  }
+  return false;
+}
+
+// The court list is a private message to one person, so it is edited in place
+// through the ephemeral API. Taps that arrive from anywhere else are left alone.
+async function refreshJoinPicker(env, callback) {
+  const ephemeralId = callback.message && callback.message.ephemeral_message_id;
+  if (!ephemeralId) return;
+  const chatId = callback.message.chat.id;
+  const view = await joinPickerView(env, chatId, callback.from);
+  await editEphemeralMessage(
+    env, chatId, callback.from.id, ephemeralId,
+    view ? view.html : '🎾 <i>Nothing left to join.</i>',
+    view ? view.replyMarkup : { inline_keyboard: [] }
+  );
+}
+
+async function closeJoinPicker(env, callback) {
+  const ephemeralId = callback.message && callback.message.ephemeral_message_id;
+  if (ephemeralId) {
+    await deleteEphemeralMessage(env, callback.message.chat.id, callback.from.id, ephemeralId);
+    return;
+  }
+  if (callback.message && callback.message.message_id) {
+    await deleteMessage(env, callback.message.chat.id, callback.message.message_id);
+  }
+}
+
+async function handleTabCallback(env, callback) {
+  const data = String(callback.data || '');
+  if (!data.startsWith('tb:') || !callback.message) return false;
+  const chatId = callback.message.chat.id;
+  const messageId = callback.message.message_id;
+
+  if (!(await isChatAdmin(env, chatId, callback.from))) {
+    await answerCallback(env, callback.id, 'Only group admins can settle the tab.', true);
+    return true;
+  }
+  if (data === 'tb:back') {
+    await updateTab(env, chatId);
+    await answerCallback(env, callback.id);
+    return true;
+  }
+  if (data === 'tb:pay') {
+    await editReplyMarkup(env, chatId, messageId, await settleMarkup(env, chatId));
+    await answerCallback(env, callback.id, 'Choose who has paid');
+    return true;
+  }
+  const pick = data.match(/^tb:pay:(\d+)$/);
+  if (pick) {
+    const confirmation = await confirmSettleMarkup(env, chatId, Number(pick[1]));
+    if (!confirmation) {
+      await updateTab(env, chatId);
+      await answerCallback(env, callback.id, 'That balance is already settled.', true);
+      return true;
+    }
+    await editReplyMarkup(env, chatId, messageId, confirmation.markup);
+    await answerCallback(env, callback.id);
+    return true;
+  }
+  const paid = data.match(/^tb:paid:(\d+)$/);
+  if (paid) {
+    const settled = await settleUser(env, chatId, Number(paid[1]), callback.from);
+    await answerCallback(env, callback.id,
+      settled ? `${settled.name} settled ${formatMoney(settled.balance)}.`
+        : 'That balance is already settled.', !settled);
+    return true;
+  }
   return false;
 }
 
 export async function handleUpdate(env, update) {
   const callback = update.callback_query;
   if (callback && callback.message) {
-    if (!chatAllowed(env, callback.message.chat && callback.message.chat.id)) return;
+    if (!chatAllowed(env, callback.message.chat)) return;
     try {
-      if (!(await handleBoardCallback(env, callback))) await handleBookingCallback(env, callback);
+      await rememberPlayer(env, callback.from);
+      if (await handleBoardCallback(env, callback)) return;
+      if (await handleTabCallback(env, callback)) return;
+      await handleBookingCallback(env, callback);
     } catch (error) {
       console.log(`Callback failed: ${error.stack || error}`);
     }
@@ -114,10 +307,11 @@ export async function handleUpdate(env, update) {
   }
 
   const msg = update.message;
-  if (!msg || !msg.text || !chatAllowed(env, msg.chat && msg.chat.id)) return;
+  if (!msg || !msg.text || !chatAllowed(env, msg.chat)) return;
   const text = msg.text.trim();
 
   try {
+    await rememberPlayer(env, msg.from);
     if (await handleBookingReply(env, msg)) return;
     if (!text.startsWith('/')) {
       await beginBooking(env, msg, text);
@@ -128,7 +322,7 @@ export async function handleUpdate(env, update) {
     if (!match) return;
     const command = match[1].toLowerCase();
     const args = (match[2] || '').trim();
-    const knownCommands = new Set(['start', 'help', 'book', 'courts', 'cancel']);
+    const knownCommands = new Set(['start', 'help', 'book', 'courts', 'cancel', 'tab']);
     if (knownCommands.has(command) && msg.message_id) {
       // Older clients may still send a normal group message. Native ephemeral
       // commands have no public copy, so there is nothing to delete.
@@ -137,7 +331,7 @@ export async function handleUpdate(env, update) {
 
     if (command === 'start' || command === 'help') {
       const replyMarkup = await helpBoardMarkup(env, msg.chat.id);
-      await sendMessage(env, msg.chat.id, helpHtml(), {
+      await sendMessage(env, msg.chat.id, helpHtml(env), {
         receiverUserId: msg.from.id,
         replyToEphemeral: msg.ephemeral_message_id || null,
         replyMarkup,
@@ -150,6 +344,17 @@ export async function handleUpdate(env, update) {
     }
     if (command === 'courts') {
       await updateBoard(env, msg.chat.id);
+      return;
+    }
+    if (command === 'tab') {
+      const pinned = await updateTab(env, msg.chat.id);
+      if (!pinned) {
+        await sendMessage(env, msg.chat.id,
+          '💰 Nothing outstanding. Shares appear on the tab after a court has been played.', {
+            receiverUserId: msg.from.id,
+            replyToEphemeral: msg.ephemeral_message_id || null,
+          });
+      }
       return;
     }
     if (command === 'cancel') {
@@ -221,6 +426,7 @@ export default {
       const commands = await telegram(env, 'setMyCommands', { commands: [
         { command: 'book', description: 'Add a court booking', is_ephemeral: true },
         { command: 'courts', description: 'Show or refresh the pinned court board', is_ephemeral: true },
+        { command: 'tab', description: 'Show or refresh the pinned money tab', is_ephemeral: true },
         { command: 'cancel', description: 'Cancel a booking by ID', is_ephemeral: true },
         { command: 'help', description: 'Show examples', is_ephemeral: true },
       ] });
@@ -240,8 +446,11 @@ export default {
       if (request.method !== 'POST') return new Response('method not allowed', { status: 405 });
       if (!adminAuthorized(request, env)) return new Response('forbidden', { status: 403 });
       const chatIds = String(env.ALLOWED_CHATS || '').split(',').map((id) => id.trim()).filter(Boolean);
-      await Promise.all(chatIds.map((chatId) => updateBoard(env, Number(chatId))));
-      return new Response(`Refreshed ${chatIds.length} pinned board(s).`);
+      await Promise.all(chatIds.map(async (chatId) => {
+        await updateBoard(env, Number(chatId));
+        await updateTab(env, Number(chatId));
+      }));
+      return new Response(`Refreshed the board and tab in ${chatIds.length} chat(s).`);
     }
 
     if (url.pathname === '/profile-photo') {
