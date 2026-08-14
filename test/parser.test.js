@@ -193,8 +193,8 @@ describe('booking intent', () => {
 
 describe('pinned-board countdown', () => {
   it('names the weekday on every countdown', () => {
-    expect(formatCountdown(Date.UTC(2026, 7, 12, 13, 0), TZ, NOW)).toBe('today · Wed');
-    expect(formatCountdown(Date.UTC(2026, 7, 13, 13, 0), TZ, NOW)).toBe('tomorrow · Thu');
+    expect(formatCountdown(Date.UTC(2026, 7, 12, 13, 0), TZ, NOW)).toBe('today · Wed 12 Aug');
+    expect(formatCountdown(Date.UTC(2026, 7, 13, 13, 0), TZ, NOW)).toBe('tomorrow · Thu 13 Aug');
     expect(formatCountdown(Date.UTC(2026, 7, 17, 13, 0), TZ, NOW)).toBe('in 5 days · Mon 17 Aug');
     expect(formatCountdown(Date.UTC(2026, 7, 19, 13, 0), TZ, NOW)).toBe('in 7 days · Wed 19 Aug');
   });

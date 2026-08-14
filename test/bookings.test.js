@@ -221,7 +221,7 @@ describe('public booking announcements', () => {
     expect(deleteLabel).toContain('9:00 pm');
   });
 
-  it('renders each pinned booking with its roster and free slots', async () => {
+  it('renders each pinned booking on two short lines that will not wrap', async () => {
     const roster = [
       { id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick' },
       {
@@ -232,15 +232,29 @@ describe('public booking announcements', () => {
     const html = await boardHtml(
       { DB: bookingDb([storedBooking], roster) }, -123, Date.UTC(2026, 7, 12, 12, 0)
     );
-    expect(html).toContain(
-      'in 7 days · Wed 19 Aug · 9pm · <b>Court 4</b>'
-    );
-    // Tagged where the id is known, plain @handle where it is not yet.
-    expect(html).toContain(
-      '👥 <a href="tg://user?id=7">Nick</a>, @Dodgerblueee · 1 slot'
-    );
+    expect(html).toContain('in 7 days · Wed 19 Aug\n9pm · <b>Court 4</b> · 1 slot');
+    // The roster repeats the same handles on every row, so it moved behind Join.
+    expect(html).not.toContain('👥');
+    expect(html).not.toContain('@Dodgerblueee');
     expect(html).not.toContain('$');
-    expect(html.split('\n')).toHaveLength(4);
+    // Nothing a phone would wrap: the tags are markup, not visible characters.
+    const widest = Math.max(...html.replace(/<[^>]+>/g, '').split('\n')
+      .map((line) => line.length));
+    expect(widest).toBeLessThanOrEqual(30);
+  });
+
+  it('keeps a full court off the public board', async () => {
+    const full = ['u7', '@dodgerblueee', '@alice'].map((slug, index) => ({
+      id: index + 1, booking_id: 3, user_id: null, slug, name: slug,
+    }));
+    const html = await boardHtml(
+      { DB: bookingDb([storedBooking], full) }, -123, Date.UTC(2026, 7, 12, 12, 0)
+    );
+    // The court is nobody else's business once there is no room on it.
+    expect(html).not.toContain('Court 4');
+    expect(html).not.toContain('Wed 19 Aug');
+    // But the board stays pinned, or the Add and Join buttons go with it.
+    expect(html).toContain('Every court is taken');
   });
 
   it('rejects an overlapping court booking in the insert itself', async () => {

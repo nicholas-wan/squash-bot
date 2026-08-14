@@ -236,15 +236,10 @@ export function formatCountdown(epochMs, tz, now = Date.now()) {
     Date.UTC(target.y, target.mo - 1, target.d)
     - Date.UTC(current.y, current.mo - 1, current.d)
   ) / 86400000);
-  const weekday = new Intl.DateTimeFormat('en-SG', {
-    timeZone: tz, weekday: 'short',
-  }).format(new Date(epochMs));
-  if (days <= 0) return `today · ${weekday}`;
-  if (days === 1) return `tomorrow · ${weekday}`;
-  const date = new Intl.DateTimeFormat('en-SG', {
-    timeZone: tz, day: 'numeric', month: 'short',
-  }).format(new Date(epochMs));
-  return `in ${days} days · ${weekday} ${date}`;
+  const date = shortDate(epochMs, tz);
+  if (days <= 0) return `today · ${date}`;
+  if (days === 1) return `tomorrow · ${date}`;
+  return `in ${days} days · ${date}`;
 }
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
@@ -270,10 +265,12 @@ function courtName(booking) {
   return booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`;
 }
 
+// The comma Intl puts after the weekday is dropped: these read alongside “·”
+// separators, and on a phone every character counts against wrapping.
 function shortDate(epochMs, tz) {
   return new Intl.DateTimeFormat('en-SG', {
     timeZone: tz, weekday: 'short', day: 'numeric', month: 'short',
-  }).format(new Date(epochMs));
+  }).format(new Date(epochMs)).replace(',', '');
 }
 
 // A player whose numeric id is known gets a real tag. Anyone still seeded from
@@ -294,18 +291,31 @@ function slotsLabel(roster, capacity) {
   return `${free} slot${free === 1 ? '' : 's'}`;
 }
 
-function rosterLine(roster, capacity) {
-  return `👥 ${playerTags(roster)} · ${slotsLabel(roster, capacity)}`;
+// A keyboard belongs to the message, so every reader sees the same labels — but
+// a tap carries who made it, so one button can put you on a court or take you
+// off it depending on which of the two you are. That is why these say the court
+// and not "Join": the label cannot know, and the toast afterwards does.
+const MAX_BOARD_BUTTONS = 6;
+
+function openBookings(bookings, rosters) {
+  return bookings.filter((booking) => (rosters.get(booking.id) || []).length
+    < (booking.capacity || DEFAULT_CAPACITY));
 }
 
-// One compact row. Picking a specific court happens behind the join button, so
-// the board does not grow a row per booking.
-function defaultBoardButtons(bookings = []) {
+function boardButtons(bookings, open, tz) {
+  const rows = open.slice(0, MAX_BOARD_BUTTONS).map((booking) => [{
+    text: `🎾 ${shortDate(booking.starts_at, tz)} · ` +
+      `${shortClock(booking.starts_at, tz)} · ${courtName(booking)}`,
+    callback_data: `sb:tap:${booking.id}`,
+  }]);
   const row = [];
+  // Still needed for the courts these buttons cannot cover: a full one you are
+  // on, and anything past the cap.
   if (bookings.length) row.push({ text: '🙋 Join', callback_data: 'sb:join' });
   row.push({ text: '➕ Add', callback_data: 'sb:add' });
   if (bookings.length) row.push({ text: '⚙️ Manage', callback_data: 'sb:manage' });
-  return { inline_keyboard: [row] };
+  rows.push(row);
+  return { inline_keyboard: rows };
 }
 
 // The court list is built per person and sent only to them, so it can offer
@@ -319,8 +329,17 @@ export async function joinPickerView(env, chatId, from, now = Date.now()) {
   const rosters = await rostersFor(env, chatId, bookings.map((booking) => booking.id));
   const mySlug = identity(from).slug;
 
+  // Filtering before the cap, so a run of other people's full courts cannot
+  // push the ones you could actually join off the end of the list.
+  const mine = bookings.filter((booking) => {
+    const roster = rosters.get(booking.id) || [];
+    return roster.some((player) => player.slug === mySlug)
+      || roster.length < (booking.capacity || DEFAULT_CAPACITY);
+  });
+  if (!mine.length) return null;
+
   const rows = [];
-  for (const booking of bookings.slice(0, MAX_JOIN_BUTTONS)) {
+  for (const booking of mine.slice(0, MAX_JOIN_BUTTONS)) {
     const roster = rosters.get(booking.id) || [];
     const capacity = booking.capacity || DEFAULT_CAPACITY;
     const label = `${shortDate(booking.starts_at, tz)} · ` +
@@ -328,11 +347,11 @@ export async function joinPickerView(env, chatId, from, now = Date.now()) {
       `${courtName(booking)} · ${slotsLabel(roster, capacity)}`;
     if (roster.some((player) => player.slug === mySlug)) {
       rows.push([{ text: `🚪 Leave · ${label}`, callback_data: `sb:leave:${booking.id}` }]);
-    } else if (roster.length >= capacity) {
-      rows.push([{ text: `🔒 Full · ${label}`, callback_data: `sb:full:${booking.id}` }]);
-    } else {
+    } else if (roster.length < capacity) {
       rows.push([{ text: `🙋 Join · ${label}`, callback_data: `sb:join:${booking.id}` }]);
     }
+    // A court with no room left belongs to the people on it. Anyone else is not
+    // shown it at all, here or on the board.
   }
   rows.push([{ text: '✕ Close', callback_data: 'sb:close' }]);
   return {
@@ -347,18 +366,36 @@ async function renderBoard(env, chatId, now) {
   if (!bookings.length) return { html: null, replyMarkup: null };
   const rosters = await rostersFor(env, chatId, bookings.map((booking) => booking.id));
 
-  const lines = ['🎾 <b>Upcoming squash courts</b>', ''];
-  for (const booking of bookings) {
+  // Two short lines and a gap per booking. A phone wraps anything much past
+  // thirty characters, and a wrapped “Court 4” or “1 slot” is what made the
+  // board read as a wall. The roster is dropped because DEFAULT_PLAYERS puts
+  // the same handles on every row; who is playing lives behind 🙋 Join, which
+  // can answer it per person as the shared board never could.
+  // A court with no room left is nobody else's business, and the board is one
+  // shared message that cannot show a different list per person — so a full
+  // court drops off it entirely and stays in 🙋 Join for the people on it.
+  const open = openBookings(bookings, rosters);
+
+  const lines = ['🎾 <b>Upcoming squash courts</b>'];
+  for (const booking of open) {
+    const roster = rosters.get(booking.id) || [];
+    lines.push('');
+    lines.push(formatCountdown(booking.starts_at, tz, now));
     lines.push(
-      `${formatCountdown(booking.starts_at, tz, now)} · ` +
       `${compactTimeRange(booking.starts_at, booking.ends_at, tz)} · ` +
-      `<b>${escapeHtml(courtName(booking))}</b>`
+      `<b>${escapeHtml(courtName(booking))}</b> · ` +
+      `${slotsLabel(roster, booking.capacity || DEFAULT_CAPACITY)}`
     );
-    lines.push(rosterLine(rosters.get(booking.id) || [], booking.capacity || DEFAULT_CAPACITY));
+  }
+  // Everything booked out still keeps the board pinned: unpinning it would take
+  // the ➕ Add and 🙋 Join buttons with it and leave nothing to book from.
+  if (!open.length) lines.push('', '<i>Every court is taken. Tap 🙋 Join to see yours.</i>');
+  if (open.length > MAX_BOARD_BUTTONS) {
+    lines.push('', `<i>The last ${open.length - MAX_BOARD_BUTTONS} are under 🙋 Join.</i>`);
   }
   return {
     html: lines.join('\n'),
-    replyMarkup: defaultBoardButtons(bookings),
+    replyMarkup: boardButtons(bookings, open, tz),
   };
 }
 
@@ -454,6 +491,25 @@ export async function notifyRemovedPlayer(env, chatId, player, booking) {
     player.user_id, endOfLocalDay(booking.starts_at, tz));
 }
 
+// The board no longer names who is on a court, so the people already on it are
+// told directly when somebody takes a slot. Each is messaged privately; the
+// joiner is skipped, and so is anyone whose numeric id is not known yet.
+export async function notifyRosterOfJoin(env, chatId, booking, from) {
+  const tz = await getTimezone(env, chatId);
+  const roster = await rosterFor(env, booking.id);
+  const joined = identity(from);
+  const html = `🙋 <b>${escapeHtml(joined.name)}</b> joined ` +
+    `${escapeHtml(courtName(booking))}\n` +
+    `${shortDate(booking.starts_at, tz)} · ` +
+    `${compactTimeRange(booking.starts_at, booking.ends_at, tz)} · ` +
+    `${slotsLabel(roster, booking.capacity || DEFAULT_CAPACITY)}`;
+  for (const player of roster) {
+    if (!player.user_id || player.slug === joined.slug) continue;
+    await sendPrivately(env, reachableChat(env, player, chatId), html,
+      player.user_id, endOfLocalDay(booking.starts_at, tz));
+  }
+}
+
 export async function showDeleteConfirmation(env, chatId, messageId, bookingId) {
   const booking = await env.DB.prepare(
     'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
@@ -472,7 +528,11 @@ export async function showDeleteConfirmation(env, chatId, messageId, bookingId) 
 
 export async function restoreBoardButtons(env, chatId, messageId) {
   const bookings = await activeBookings(env, chatId);
-  return editReplyMarkup(env, chatId, messageId, defaultBoardButtons(bookings));
+  const tz = await getTimezone(env, chatId);
+  const rosters = await rostersFor(env, chatId, bookings.map((booking) => booking.id));
+  return editReplyMarkup(
+    env, chatId, messageId, boardButtons(bookings, openBookings(bookings, rosters), tz)
+  );
 }
 
 function reminderHtml(booking, roster, headline, tz) {

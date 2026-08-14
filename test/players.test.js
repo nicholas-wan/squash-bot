@@ -260,15 +260,23 @@ describe('the private court list', () => {
     expect(view.replyMarkup.inline_keyboard[0][0].callback_data).toBe('sb:join:3');
   });
 
-  it('marks a full court instead of offering to join it', async () => {
+  it('hides a full court from everyone who is not on it', async () => {
     const full = ['@a', '@b', '@c'].map((slug) => ({
+      booking_id: 3, slug, name: slug, user_id: null,
+    }));
+    // A booked-out court is the business of the people playing it, nobody else.
+    expect(await joinPickerView({ DB: db(full) }, -123, { id: 11, username: 'bob' }, now))
+      .toBe(null);
+  });
+
+  it('still offers Leave on a full court to somebody on it', async () => {
+    const full = ['@a', '@b', '@bob'].map((slug) => ({
       booking_id: 3, slug, name: slug, user_id: null,
     }));
     const view = await joinPickerView({ DB: db(full) }, -123, { id: 11, username: 'bob' }, now);
     const button = view.replyMarkup.inline_keyboard[0][0];
-    expect(button.text).toContain('🔒 Full');
-    expect(button.text).toContain('full');
-    expect(button.callback_data).toBe('sb:full:3');
+    expect(button.text).toContain('🚪 Leave');
+    expect(button.callback_data).toBe('sb:leave:3');
   });
 
   it('hides a court that has already started', async () => {

@@ -22,13 +22,28 @@ edit, and delete keeps an audit snapshot with the actor and the original text.
 ## The board
 
 ```text
-in 5 days · Mon 17 Aug · 9pm · Court 4
-👥 @nicholaswan, @Dodgerblueee · 1 slot
+in 5 days · Mon 17 Aug
+9pm · Court 4 · 1 slot
 ```
 
-**🙋 Join** opens a private court list: Join for courts you are not on, Leave for
-the ones you are. Both close the moment a court starts, so nobody can play the
-hour and then drop off the roster to dodge their share. **⚙️ Manage** edits the
+Two short lines and a gap, because a phone wraps much past thirty characters and
+a wrapped court number reads as a wall. The roster is not on the board: with
+`DEFAULT_PLAYERS` seating the same people every time it was the same handles on
+every row, and one shared pinned message cannot answer "am I on this?" per
+person anyway. A court with no slots left comes off the board entirely — it is
+only the business of the people playing it, who still see it under 🙋 Join.
+
+Each open court gets its own button. A keyboard belongs to the message, so
+everyone sees the same labels, but a tap carries who made it — so one button
+puts you on that court or takes you off it depending on which of the two you
+are, and says which in a toast only you see. The label cannot know in advance,
+which is why it names the court rather than the action.
+
+**🙋 Join** still opens a private court list, for what a shared button cannot
+reach: a full court you are on, and anything past the sixth. Taking a slot tells
+everyone already on that court, privately. Joining and leaving both close the
+moment a court starts, so nobody can play the hour and then drop off the roster
+to dodge their share. **⚙️ Manage** edits the
 date, court, or time, deletes a booking, and lets group admins open extra slots
 (up to twelve) or take a player off; those two admin actions stay open until the
 court ends, which is how a no-show is kept off the tab.

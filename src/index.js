@@ -1,12 +1,13 @@
 import {
-  authorizeBookingChange, cancelBooking, notifyRemovedPlayer, restoreBoardButtons,
-  runMaintenance, showBoardManager, showCancelConfirmation, showDeleteConfirmation,
-  joinPickerView, showRemovePlayer, updateBoard,
+  authorizeBookingChange, cancelBooking, notifyRemovedPlayer, notifyRosterOfJoin,
+  restoreBoardButtons, runMaintenance, showBoardManager, showCancelConfirmation,
+  showDeleteConfirmation, joinPickerView, showRemovePlayer, updateBoard,
 } from './bookings.js';
 import {
   defaultCapacity, isChatAdmin, MAX_CAPACITY, raiseCapacity, rememberPlayer,
-  joinBooking, leaveBooking, removeBookingPlayer,
+  joinBooking, leaveBooking, removeBookingPlayer, toggleBooking,
 } from './players.js';
+import { looksLikeBooking } from './parser.js';
 import { formatMoney } from './pricing.js';
 import {
   confirmSettleMarkup, settleMarkup, settleUser, tabBalances, updateTab,
@@ -167,13 +168,15 @@ async function handleBoardCallback(env, callback) {
   }
   const join = data.match(/^sb:join:(\d+)$/);
   const leave = data.match(/^sb:leave:(\d+)$/);
-  if (join || leave) {
-    const bookingId = Number((join || leave)[1]);
-    const result = join
-      ? await joinBooking(env, chatId, bookingId, callback.from)
-      : await leaveBooking(env, chatId, bookingId, callback.from);
+  const tap = data.match(/^sb:tap:(\d+)$/);
+  if (join || leave || tap) {
+    const bookingId = Number((join || leave || tap)[1]);
+    let result;
+    if (tap) result = await toggleBooking(env, chatId, bookingId, callback.from);
+    else if (join) result = await joinBooking(env, chatId, bookingId, callback.from);
+    else result = await leaveBooking(env, chatId, bookingId, callback.from);
     const replies = {
-      joined: ['You are in. The pinned board shows your name.', false],
+      joined: ['You are in. Everyone already on the court has been told.', false],
       left: ['You are out. Your slot is free again.', false],
       already: ['You are already on that court.', true],
       absent: ['You were not on that court.', true],
@@ -184,6 +187,9 @@ async function handleBoardCallback(env, callback) {
     if (result.status === 'joined' || result.status === 'left') {
       await updateBoard(env, chatId);
       await refreshJoinPicker(env, callback);
+    }
+    if (result.status === 'joined') {
+      await notifyRosterOfJoin(env, chatId, result.booking, callback.from);
     }
     await answerCallback(env, callback.id, ...replies[result.status]);
     return true;
@@ -306,6 +312,18 @@ async function handleTabCallback(env, callback) {
   return false;
 }
 
+// Clearing the message needs the Delete Messages admin right. Failing quietly
+// would leave the booking in the group while the bot behaves as though it had
+// been cleared, so whoever sent it is told to fix the permission.
+async function clearBookingMessage(env, msg) {
+  const deleted = await deleteMessage(env, msg.chat.id, msg.message_id);
+  if (deleted.ok) return;
+  await sendMessage(env, msg.chat.id,
+    '⚠️ Your booking message is still in the group — I need the ' +
+    '<b>Delete Messages</b> admin right to clear it.',
+    { receiverUserId: msg.from.id });
+}
+
 export async function handleUpdate(env, update) {
   const callback = update.callback_query;
   if (callback && callback.message) {
@@ -330,9 +348,14 @@ export async function handleUpdate(env, update) {
     if (await handleBookingReply(env, msg)) return;
     if (!text.startsWith('/')) {
       // The booking form repeats the text back, and the pinned board is the
-      // record, so the original message is cleared out of the group.
-      if (await beginBooking(env, msg, text) && msg.message_id) {
-        await deleteMessage(env, msg.chat.id, msg.message_id);
+      // record, so the original message is cleared out of the group. The intent
+      // is read up front and the delete runs in a finally, because a form that
+      // fails to open would otherwise leave the booking sitting in the chat.
+      const isBooking = looksLikeBooking(text);
+      try {
+        await beginBooking(env, msg, text);
+      } finally {
+        if (isBooking && msg.message_id) await clearBookingMessage(env, msg);
       }
       return;
     }

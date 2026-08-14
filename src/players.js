@@ -206,6 +206,19 @@ export async function joinBooking(env, chatId, bookingId, from) {
   return { status: existing ? 'already' : 'full', booking };
 }
 
+// One shared button per court, doing opposite things to the two kinds of person
+// who can tap it. Which one you are is read at the moment of the tap.
+export async function toggleBooking(env, chatId, bookingId, from) {
+  const booking = await openBooking(env, chatId, bookingId);
+  if (!booking) return { status: 'gone', left: false };
+  const roster = await rosterFor(env, bookingId);
+  const onIt = roster.some((player) => player.slug === identity(from).slug);
+  const result = onIt
+    ? await leaveBooking(env, chatId, bookingId, from)
+    : await joinBooking(env, chatId, bookingId, from);
+  return { ...result, left: onIt };
+}
+
 export async function leaveBooking(env, chatId, bookingId, from) {
   const booking = await openBooking(env, chatId, bookingId);
   if (!booking) return { status: 'gone' };
