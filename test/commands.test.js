@@ -45,6 +45,34 @@ describe('Telegram commands', () => {
     expect(removed.body.message_id).toBe(5);
   });
 
+  it('clears an ephemeral command too, after the reply that quotes it', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    await handleUpdate({
+      BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: emptyDb(),
+    }, {
+      message: {
+        message_id: 5,
+        ephemeral_message_id: 88,
+        chat: { id: -123456789 },
+        from: { id: 7, first_name: 'Nick' },
+        text: '/courts@squash_book_bot',
+      },
+    });
+    // Telegram leaves an ephemeral command in the chat until the app closes,
+    // so it is cleared through the ephemeral API rather than deleteMessage.
+    const cleared = requests.find((request) => request.url.endsWith('/deleteEphemeralMessage'));
+    expect(cleared.body.ephemeral_message_id).toBe(88);
+    expect(cleared.body.receiver_user_id).toBe(7);
+    // Never as a plain delete: there is no public copy to remove.
+    expect(requests.some((request) => request.url.endsWith('/deleteMessage'))).toBe(false);
+  });
+
   it('opens the booking manager privately, never on the pinned message', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {

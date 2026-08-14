@@ -396,14 +396,16 @@ export async function handleUpdate(env, update) {
     const command = match[1].toLowerCase();
     const args = (match[2] || '').trim();
     const knownCommands = new Set(['start', 'help', 'book', 'courts', 'cancel', 'tab']);
-    // A native ephemeral command has no public copy, so there is nothing to
-    // delete and a failure there would be meaningless. Anything else is a real
-    // group message and is cleared like a booking, loudly if it cannot be.
-    if (knownCommands.has(command) && msg.message_id && !msg.ephemeral_message_id) {
+    const known = knownCommands.has(command);
+    // An ephemeral command is private already, but it sits in the chat until the
+    // app is closed, so it is cleared too — through the ephemeral API, and only
+    // once the handler has replied, since the reply quotes it.
+    if (known && msg.message_id && !msg.ephemeral_message_id) {
       await clearSentMessage(env, msg, 'command');
     }
 
-    if (command === 'start' || command === 'help') {
+    try {
+      if (command === 'start' || command === 'help') {
       const replyMarkup = await helpBoardMarkup(env, msg.chat.id);
       await sendMessage(env, msg.chat.id, helpHtml(env), {
         receiverUserId: msg.from.id,
@@ -455,7 +457,14 @@ export async function handleUpdate(env, update) {
           replyToEphemeral: msg.ephemeral_message_id || null,
         }
       );
-      return;
+        return;
+      }
+    } finally {
+      if (known && msg.ephemeral_message_id) {
+        await deleteEphemeralMessage(
+          env, msg.chat.id, msg.from.id, msg.ephemeral_message_id
+        );
+      }
     }
   } catch (error) {
     // The detail belongs in the log, not in the chat: an internal message can
