@@ -581,10 +581,10 @@ describe('Telegram commands', () => {
     const commandRequest = requests.find((request) => request.url.endsWith('/setMyCommands'));
     expect(commandRequest.body.commands.map((command) => command.command))
       .toEqual(['book', 'courts', 'tab', 'cancel', 'help']);
-    // An ephemeral command has no public copy the bot may delete, so it would
-    // sit in the sender's chat for good. Registered plainly, it is deleted.
+    // Never a group message, not even for the moment before a delete. The cost
+    // is that it cannot be cleared from the sender's own chat afterwards.
     for (const command of commandRequest.body.commands) {
-      expect(command.is_ephemeral).toBeUndefined();
+      expect(command.is_ephemeral).toBe(true);
     }
   });
 

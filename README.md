@@ -88,15 +88,16 @@ pinned tab, and the reminder fallback below. Everything else it sends — forms,
 receipts, reminders, errors, and every reply to a command — is ephemeral: only
 the recipient and the bot see them.
 
-What you send is a different matter. Commands are registered without
-`is_ephemeral`, so a command and a booking typed as ordinary text are both real
-group messages for the moment before the bot deletes them, and Telegram may
-notify the group in that moment. The alternative is worse: an ephemeral command
-arrives with no public copy and no id the bot is allowed to delete —
-`deleteEphemeralMessage` reaches only messages the bot itself sent — so it stays
-in the sender's chat for good. Deleting needs the **Delete Messages** admin
-right; without it the bot says so privately rather than failing quietly. The
-booker gets a private receipt with an **OK** button, so a new booking is
+What you send is a different matter. Commands are registered with
+`is_ephemeral`, so a command is never a group message at all — not even for the
+moment before a delete. It cannot then be cleared either: a bot may only delete
+its own ephemeral messages, so an incoming command stays in the sender's own
+chat, seen by nobody else. Booking as ordinary text has the opposite shape: it
+is a real group message, delivered and notified before the bot is told it
+exists, and can only be deleted afterwards — which needs the **Delete Messages**
+admin right, and without it the bot says so privately rather than failing
+quietly. Use `/book` for a booking that is never public at any point. The booker
+gets a private receipt with an **OK** button either way, so a new booking is
 discovered on the board rather than announced.
 
 Each player is reminded two hours before their court and again at 8am on the
