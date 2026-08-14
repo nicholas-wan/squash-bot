@@ -596,8 +596,11 @@ async function sendPrivately(env, chatId, html, userId, deleteAfter, options = {
 }
 
 async function remindPublicly(env, booking, roster, headline, tz) {
-  // The roster line already tags everyone, so this needs nothing extra.
-  const sent = await sendMessage(env, booking.chat_id, reminderHtml(booking, roster, headline, tz));
+  // The roster line already tags everyone, so this needs nothing extra — and it
+  // goes out silently, because the one message the group cannot avoid seeing
+  // should not also buzz every phone in it.
+  const sent = await sendMessage(env, booking.chat_id,
+    reminderHtml(booking, roster, headline, tz), { silent: true });
   if (sent.ok && sent.result) {
     await scheduleCleanup(
       env, booking.chat_id, sent.result, null, endOfLocalDay(booking.starts_at, tz)
