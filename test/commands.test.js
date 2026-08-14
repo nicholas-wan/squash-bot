@@ -338,10 +338,9 @@ describe('Telegram commands', () => {
     const board = requests.find((request) => request.url.endsWith('/editMessageText'));
     expect(board.body.message_id).toBe(55);
     // The board keeps one compact row; picking a court happens behind Join.
-    // A per-court toggle row, then the actions that are not about one court.
-    expect(board.body.reply_markup.inline_keyboard).toHaveLength(2);
-    expect(board.body.reply_markup.inline_keyboard[0][0].callback_data).toBe('sb:tap:3');
-    expect(board.body.reply_markup.inline_keyboard[1].map((button) => button.callback_data))
+    // One row, whatever the board holds. Choosing a court happens behind Join.
+    expect(board.body.reply_markup.inline_keyboard).toHaveLength(1);
+    expect(board.body.reply_markup.inline_keyboard[0].map((button) => button.callback_data))
       .toEqual(['sb:join', 'sb:add', 'sb:manage']);
   });
 

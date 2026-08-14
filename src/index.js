@@ -340,11 +340,11 @@ async function handleTabCallback(env, callback) {
 // Clearing the message needs the Delete Messages admin right. Failing quietly
 // would leave the booking in the group while the bot behaves as though it had
 // been cleared, so whoever sent it is told to fix the permission.
-async function clearBookingMessage(env, msg) {
+async function clearSentMessage(env, msg, kind = 'booking message') {
   const deleted = await deleteMessage(env, msg.chat.id, msg.message_id);
   if (deleted.ok) return;
   await sendMessage(env, msg.chat.id,
-    '⚠️ Your booking message is still in the group — I need the ' +
+    `⚠️ Your ${kind} is still in the group — I need the ` +
     '<b>Delete Messages</b> admin right to clear it.',
     { receiverUserId: msg.from.id });
 }
@@ -385,7 +385,7 @@ export async function handleUpdate(env, update) {
       } finally {
         if (isBooking && msg.message_id) {
           clearedText = text;
-          await clearBookingMessage(env, msg);
+          await clearSentMessage(env, msg);
         }
       }
       return;
@@ -396,10 +396,11 @@ export async function handleUpdate(env, update) {
     const command = match[1].toLowerCase();
     const args = (match[2] || '').trim();
     const knownCommands = new Set(['start', 'help', 'book', 'courts', 'cancel', 'tab']);
-    if (knownCommands.has(command) && msg.message_id) {
-      // Older clients may still send a normal group message. Native ephemeral
-      // commands have no public copy, so there is nothing to delete.
-      await deleteMessage(env, msg.chat.id, msg.message_id);
+    // A native ephemeral command has no public copy, so there is nothing to
+    // delete and a failure there would be meaningless. Anything else is a real
+    // group message and is cleared like a booking, loudly if it cannot be.
+    if (knownCommands.has(command) && msg.message_id && !msg.ephemeral_message_id) {
+      await clearSentMessage(env, msg, 'command');
     }
 
     if (command === 'start' || command === 'help') {
