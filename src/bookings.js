@@ -292,12 +292,9 @@ function slotsLabel(roster, capacity) {
   return `${free} slot${free === 1 ? '' : 's'}`;
 }
 
-// A keyboard belongs to the message, so every reader sees the same labels — but
-// a tap carries who made it, so one button can put you on a court or take you
-// off it depending on which of the two you are. That is why these say the court
-// and not "Join": the label cannot know, and the toast afterwards does.
-const MAX_BOARD_BUTTONS = 6;
-
+// One row, whatever the board holds. Which court you want is asked behind 🙋
+// Join, where the list is private and can offer Join or Leave per court — a row
+// per booking made the pinned message noisy and still could not say which.
 // A court that has begun is closed to joining, so it gets no button: one that
 // could only ever answer “the roster is locked” would still cost a slot in the
 // keyboard and still be counted as reachable.
@@ -306,20 +303,12 @@ function openBookings(bookings, rosters, now) {
     && (rosters.get(booking.id) || []).length < (booking.capacity || DEFAULT_CAPACITY));
 }
 
-function boardButtons(bookings, open, tz) {
-  const rows = open.slice(0, MAX_BOARD_BUTTONS).map((booking) => [{
-    text: `🎾 ${shortDate(booking.starts_at, tz)} · ` +
-      `${shortClock(booking.starts_at, tz)} · ${courtName(booking)}`,
-    callback_data: `sb:tap:${booking.id}`,
-  }]);
+function boardButtons(bookings) {
   const row = [];
-  // Still needed for the courts these buttons cannot cover: a full one you are
-  // on, and anything past the cap.
   if (bookings.length) row.push({ text: '🙋 Join', callback_data: 'sb:join' });
   row.push({ text: '➕ Add', callback_data: 'sb:add' });
   if (bookings.length) row.push({ text: '⚙️ Manage', callback_data: 'sb:manage' });
-  rows.push(row);
-  return { inline_keyboard: rows };
+  return { inline_keyboard: [row] };
 }
 
 // The court list is built per person and sent only to them, so it can offer
@@ -397,12 +386,9 @@ async function renderBoard(env, chatId, now) {
   // Everything booked out still keeps the board pinned: unpinning it would take
   // the ➕ Add and 🙋 Join buttons with it and leave nothing to book from.
   if (!open.length) lines.push('', '<i>Every court is taken. Tap 🙋 Join to see yours.</i>');
-  if (open.length > MAX_BOARD_BUTTONS) {
-    lines.push('', `<i>The last ${open.length - MAX_BOARD_BUTTONS} are under 🙋 Join.</i>`);
-  }
   return {
     html: lines.join('\n'),
-    replyMarkup: boardButtons(bookings, open, tz),
+    replyMarkup: boardButtons(bookings),
   };
 }
 
@@ -559,11 +545,7 @@ export async function deletePanelView(env, chatId, bookingId) {
 
 export async function restoreBoardButtons(env, chatId, messageId, now = Date.now()) {
   const bookings = await activeBookings(env, chatId, now);
-  const tz = await getTimezone(env, chatId);
-  const rosters = await rostersFor(env, chatId, bookings.map((booking) => booking.id));
-  return editReplyMarkup(
-    env, chatId, messageId, boardButtons(bookings, openBookings(bookings, rosters, now), tz)
-  );
+  return editReplyMarkup(env, chatId, messageId, boardButtons(bookings));
 }
 
 function reminderHtml(booking, roster, headline, tz) {
