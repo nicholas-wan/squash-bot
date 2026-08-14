@@ -396,16 +396,16 @@ export async function handleUpdate(env, update) {
     const command = match[1].toLowerCase();
     const args = (match[2] || '').trim();
     const knownCommands = new Set(['start', 'help', 'book', 'courts', 'cancel', 'tab']);
-    const known = knownCommands.has(command);
-    // An ephemeral command is private already, but it sits in the chat until the
-    // app is closed, so it is cleared too — through the ephemeral API, and only
-    // once the handler has replied, since the reply quotes it.
-    if (known && msg.message_id && !msg.ephemeral_message_id) {
+    // Only a public copy can be cleared. A command Telegram delivered
+    // ephemerally is already private to whoever sent it, and the bot cannot
+    // remove it: deleteEphemeralMessage takes the id of a user who *received* a
+    // message from the bot, so it only reaches the bot's own ephemeral
+    // messages. Aimed at an incoming command it answers MESSAGE_NOT_FOUND.
+    if (knownCommands.has(command) && msg.message_id && !msg.ephemeral_message_id) {
       await clearSentMessage(env, msg, 'command');
     }
 
-    try {
-      if (command === 'start' || command === 'help') {
+    if (command === 'start' || command === 'help') {
       const replyMarkup = await helpBoardMarkup(env, msg.chat.id);
       await sendMessage(env, msg.chat.id, helpHtml(env), {
         receiverUserId: msg.from.id,
@@ -457,14 +457,7 @@ export async function handleUpdate(env, update) {
           replyToEphemeral: msg.ephemeral_message_id || null,
         }
       );
-        return;
-      }
-    } finally {
-      if (known && msg.ephemeral_message_id) {
-        await deleteEphemeralMessage(
-          env, msg.chat.id, msg.from.id, msg.ephemeral_message_id
-        );
-      }
+      return;
     }
   } catch (error) {
     // The detail belongs in the log, not in the chat: an internal message can
