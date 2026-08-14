@@ -579,8 +579,13 @@ describe('Telegram commands', () => {
     });
     expect(response.status).toBe(200);
     const commandRequest = requests.find((request) => request.url.endsWith('/setMyCommands'));
-    expect(commandRequest.body.commands).toHaveLength(5);
-    expect(commandRequest.body.commands.every((command) => command.is_ephemeral)).toBe(true);
+    expect(commandRequest.body.commands.map((command) => command.command))
+      .toEqual(['book', 'courts', 'tab', 'cancel', 'help']);
+    // An ephemeral command has no public copy the bot may delete, so it would
+    // sit in the sender's chat for good. Registered plainly, it is deleted.
+    for (const command of commandRequest.body.commands) {
+      expect(command.is_ephemeral).toBeUndefined();
+    }
   });
 
   it('updates the bot profile photo through the protected admin route', async () => {

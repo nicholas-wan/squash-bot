@@ -84,11 +84,20 @@ list in force never reaches charges it off-peak and logs a warning that
 ## Privacy
 
 Three things SquashBot sends are addressed to the group: the pinned board, the
-pinned tab, and the reminder fallback below. Commands, forms, receipts,
-reminders, and errors are ephemeral: only the recipient and the bot see them.
-Booking by message deletes the message, and the booker gets a private receipt
-with an **OK** button, so a new booking is discovered on the board rather than
-announced.
+pinned tab, and the reminder fallback below. Everything else it sends — forms,
+receipts, reminders, errors, and every reply to a command — is ephemeral: only
+the recipient and the bot see them.
+
+What you send is a different matter. Commands are registered without
+`is_ephemeral`, so a command and a booking typed as ordinary text are both real
+group messages for the moment before the bot deletes them, and Telegram may
+notify the group in that moment. The alternative is worse: an ephemeral command
+arrives with no public copy and no id the bot is allowed to delete —
+`deleteEphemeralMessage` reaches only messages the bot itself sent — so it stays
+in the sender's chat for good. Deleting needs the **Delete Messages** admin
+right; without it the bot says so privately rather than failing quietly. The
+booker gets a private receipt with an **OK** button, so a new booking is
+discovered on the board rather than announced.
 
 Each player is reminded two hours before their court and again at 8am on the
 day. Reminders and receipts clear themselves at the end of the day they are
