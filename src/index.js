@@ -508,19 +508,18 @@ export default {
         url: `${url.origin}/webhook`, secret_token: env.WEBHOOK_SECRET,
         allowed_updates: ['message', 'callback_query'],
       });
-      // Deliberately not is_ephemeral. An ephemeral command is delivered with
-      // no public copy and no message_id the bot may delete — deleteEphemeral-
-      // Message only reaches messages the bot itself sent — so it stayed in the
-      // sender's chat for good. Registered plainly, a command arrives as an
-      // ordinary group message and is deleted the moment it is handled. It is
-      // briefly visible to the group; the replies stay private either way,
-      // because that comes from receiver_user_id on the send, not from here.
+      // is_ephemeral, so a command is never a group message even for the moment
+      // before it would be deleted. The cost is that it cannot be cleared at
+      // all: deleteEphemeralMessage reaches only messages the bot itself sent,
+      // and answers MESSAGE_NOT_FOUND for an incoming command, which therefore
+      // stays in the sender's own chat. Nobody else ever sees it, and that is
+      // the trade this bot makes — it exists to keep booking out of the group.
       const commands = await telegram(env, 'setMyCommands', { commands: [
-        { command: 'book', description: 'Add a court booking' },
-        { command: 'courts', description: 'Show or refresh the pinned court board' },
-        { command: 'tab', description: 'Show or refresh the pinned money tab' },
-        { command: 'cancel', description: 'Cancel a booking by ID' },
-        { command: 'help', description: 'Show examples' },
+        { command: 'book', description: 'Add a court booking', is_ephemeral: true },
+        { command: 'courts', description: 'Show or refresh the pinned court board', is_ephemeral: true },
+        { command: 'tab', description: 'Show or refresh the pinned money tab', is_ephemeral: true },
+        { command: 'cancel', description: 'Cancel a booking by ID', is_ephemeral: true },
+        { command: 'help', description: 'Show examples', is_ephemeral: true },
       ] });
       const profile = await telegram(env, 'setMyName', { name: 'SquashBot' });
       const allowedChatIds = String(env.ALLOWED_CHATS || '').split(',').map((id) => id.trim()).filter(Boolean);
