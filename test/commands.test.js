@@ -45,7 +45,7 @@ describe('Telegram commands', () => {
     expect(removed.body.message_id).toBe(5);
   });
 
-  it('clears an ephemeral command too, after the reply that quotes it', async () => {
+  it('leaves an ephemeral command alone, having nothing it can delete', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
       requests.push({ url: String(url), body: JSON.parse(init.body) });
@@ -66,10 +66,10 @@ describe('Telegram commands', () => {
     });
     // Telegram leaves an ephemeral command in the chat until the app closes,
     // so it is cleared through the ephemeral API rather than deleteMessage.
-    const cleared = requests.find((request) => request.url.endsWith('/deleteEphemeralMessage'));
-    expect(cleared.body.ephemeral_message_id).toBe(88);
-    expect(cleared.body.receiver_user_id).toBe(7);
-    // Never as a plain delete: there is no public copy to remove.
+    // Telegram answers MESSAGE_NOT_FOUND for a message the bot did not write,
+    // so attempting either delete only costs a request and logs a failure.
+    expect(requests.some((request) => request.url.endsWith('/deleteEphemeralMessage')))
+      .toBe(false);
     expect(requests.some((request) => request.url.endsWith('/deleteMessage'))).toBe(false);
   });
 
