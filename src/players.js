@@ -213,10 +213,9 @@ export async function toggleBooking(env, chatId, bookingId, from) {
   if (!booking) return { status: 'gone', left: false };
   const roster = await rosterFor(env, bookingId);
   const onIt = roster.some((player) => player.slug === identity(from).slug);
-  const result = onIt
-    ? await leaveBooking(env, chatId, bookingId, from)
-    : await joinBooking(env, chatId, bookingId, from);
-  return { ...result, left: onIt };
+  return onIt
+    ? leaveBooking(env, chatId, bookingId, from)
+    : joinBooking(env, chatId, bookingId, from);
 }
 
 export async function leaveBooking(env, chatId, bookingId, from) {

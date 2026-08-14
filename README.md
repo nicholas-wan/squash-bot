@@ -33,20 +33,23 @@ every row, and one shared pinned message cannot answer "am I on this?" per
 person anyway. A court with no slots left comes off the board entirely — it is
 only the business of the people playing it, who still see it under 🙋 Join.
 
-Each open court gets its own button. A keyboard belongs to the message, so
+Each court still open gets its own button. A keyboard belongs to the message, so
 everyone sees the same labels, but a tap carries who made it — so one button
 puts you on that court or takes you off it depending on which of the two you
 are, and says which in a toast only you see. The label cannot know in advance,
-which is why it names the court rather than the action.
+which is why it names the court rather than the action. A court that has already
+started gets no button, since joining it is closed either way.
 
-**🙋 Join** still opens a private court list, for what a shared button cannot
-reach: a full court you are on, and anything past the sixth. Taking a slot tells
-everyone already on that court, privately. Joining and leaving both close the
-moment a court starts, so nobody can play the hour and then drop off the roster
-to dodge their share. **⚙️ Manage** edits the
-date, court, or time, deletes a booking, and lets group admins open extra slots
-(up to twelve) or take a player off; those two admin actions stay open until the
-court ends, which is how a no-show is kept off the tab.
+**🙋 Join** and **⚙️ Manage** both open a private list, which is the only place
+a full court can appear: one pinned message shows everyone the same thing, so
+anything drawn on it is public. Join covers the six courts the board's own
+buttons cannot reach, up to twelve. Manage edits the date, court, or time,
+deletes a booking, and lets group admins open extra slots (up to twelve) or take
+a player off; a full court is listed there only for somebody on it, whoever
+booked it, or an admin. Those two admin actions stay open until the court ends,
+which is how a no-show is kept off the tab, while joining and leaving close the
+moment it starts, so nobody can play the hour and then drop off the roster to
+dodge their share. Taking a slot tells everyone already on that court, privately.
 
 Every booking seats `DEFAULT_PLAYERS` plus whoever booked it. Players are keyed
 on their Telegram username, so someone named in config is the same person who
