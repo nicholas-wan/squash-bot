@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  addBooking, BookingConflictError, boardHtml, cancelBooking, runMaintenance,
-  showBoardManager, showCancelConfirmation, showDeleteConfirmation, updateBooking,
+  addBooking, bookingPanelView, BookingConflictError, boardHtml, cancelBooking,
+  deletePanelView, managerView, notifyRosterOfJoin, runMaintenance, updateBooking,
 } from '../src/bookings.js';
 
 const startsAt = Date.UTC(2026, 7, 19, 13, 0);
@@ -180,45 +180,48 @@ describe('public booking announcements', () => {
   });
 
   it('labels edit buttons with court, date, and time instead of an ID', async () => {
-    const requests = captureTelegram();
-    await showBoardManager(
+    const view = await managerView(
       { BOT_TOKEN: 'test', DB: bookingDb([storedBooking]) },
-      -123, 7, startsAt - 60000
+      -123, { id: 7, first_name: 'Nick' }, false, startsAt - 60000
     );
-    const manager = requests.find((request) => request.url.endsWith('/editMessageReplyMarkup'));
-    const label = manager.body.reply_markup.inline_keyboard[0][0].text;
+    const label = view.replyMarkup.inline_keyboard[0][0].text;
     expect(label).toContain('✏️ Court 4');
     expect(label).toContain('19 Aug');
     expect(label).toContain('9:00 pm');
     expect(label).not.toContain('#3');
   });
 
+  it('keeps a full court out of the manager for anyone unconnected to it', async () => {
+    const full = ['@a', '@b', '@c'].map((slug, index) => ({
+      id: index + 1, booking_id: 3, user_id: null, slug, name: slug,
+    }));
+    const env = { BOT_TOKEN: 'test', DB: bookingDb([storedBooking], full) };
+    const stranger = await managerView(env, -123, { id: 99, username: 'zoe' }, false, startsAt - 1);
+    // Manage used to redraw the shared pinned keyboard, publishing this to all.
+    expect(stranger.replyMarkup.inline_keyboard.flat()
+      .some((button) => button.text.includes('Court 4'))).toBe(false);
+    expect(stranger.html).toContain('Nothing here you can change');
+
+    const player = await managerView(env, -123, { id: 98, username: 'a' }, false, startsAt - 1);
+    expect(player.replyMarkup.inline_keyboard[0][0].callback_data).toBe('sb:pick:3');
+    const admin = await managerView(env, -123, { id: 99, username: 'zoe' }, true, startsAt - 1);
+    expect(admin.replyMarkup.inline_keyboard[0][0].callback_data).toBe('sb:pick:3');
+  });
+
   it('shows edit actions before an explicit delete confirmation', async () => {
-    const requests = captureTelegram();
-    const found = await showCancelConfirmation(
-      { BOT_TOKEN: 'test', DB: bookingDb([storedBooking]) }, -123, 99, 3
-    );
-    expect(found).toBe(true);
-    const actions = requests.find(
-      (request) => request.url.endsWith('/editMessageReplyMarkup')
-    );
-    const labels = actions.body.reply_markup.inline_keyboard.flat().map((button) => button.text);
+    const env = { BOT_TOKEN: 'test', DB: bookingDb([storedBooking]) };
+    const panel = await bookingPanelView(env, -123, 3);
+    const labels = panel.replyMarkup.inline_keyboard.flat().map((button) => button.text);
     expect(labels).toContain('📅 Change date');
     expect(labels).toContain('🔢 Change court');
     expect(labels).toContain('🕐 Change time');
     expect(labels).toContain('🗑 Delete booking');
 
-    requests.length = 0;
-    await showDeleteConfirmation(
-      { BOT_TOKEN: 'test', DB: bookingDb([storedBooking]) }, -123, 99, 3
-    );
-    const confirmation = requests.find(
-      (request) => request.url.endsWith('/editMessageReplyMarkup')
-    );
-    const deleteLabel = confirmation.body.reply_markup.inline_keyboard[0][0].text;
-    expect(deleteLabel).toContain('🗑 Confirm delete · Court 4');
-    expect(deleteLabel).toContain('19 Aug');
-    expect(deleteLabel).toContain('9:00 pm');
+    const confirmation = await deletePanelView(env, -123, 3);
+    expect(confirmation.html).toContain('Court 4');
+    expect(confirmation.html).toContain('19 Aug');
+    expect(confirmation.html).toContain('9:00 pm');
+    expect(confirmation.replyMarkup.inline_keyboard[0][0].callback_data).toBe('sb:cancel:3');
   });
 
   it('renders each pinned booking on two short lines that will not wrap', async () => {
@@ -241,6 +244,26 @@ describe('public booking announcements', () => {
     const widest = Math.max(...html.replace(/<[^>]+>/g, '').split('\n')
       .map((line) => line.length));
     expect(widest).toBeLessThanOrEqual(30);
+  });
+
+  it('tells the people already on a court when somebody joins, once each', async () => {
+    const requests = captureTelegram();
+    const roster = [
+      { id: 1, booking_id: 3, chat_id: -123, user_id: 7, slug: 'u7', name: 'Nick' },
+      // The same human mid-merge: two rows, one id. One message, not two.
+      { id: 2, booking_id: 3, chat_id: -123, user_id: 7, slug: '@nick', name: '@nick' },
+      { id: 3, booking_id: 3, chat_id: -123, user_id: null, slug: '@bo', name: '@bo' },
+      { id: 4, booking_id: 3, chat_id: -123, user_id: 11, slug: '@alice', name: '@alice' },
+    ];
+    await notifyRosterOfJoin(
+      { BOT_TOKEN: 'test', DB: bookingDb([storedBooking], roster) },
+      -123, storedBooking, { id: 11, username: 'alice' }
+    );
+    const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
+    // Nick once; @bo has no id to send to; the joiner is not told about herself.
+    expect(sent.map((request) => request.body.receiver_user_id)).toEqual([7]);
+    expect(sent[0].body.text).toContain('@alice');
+    expect(sent[0].body.text).toContain('Court 4');
   });
 
   it('keeps a full court off the public board', async () => {

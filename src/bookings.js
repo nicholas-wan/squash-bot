@@ -257,9 +257,10 @@ async function activeBookings(env, chatId, now = Date.now()) {
   ).bind(dataChatId(env, chatId), now).all()).results;
 }
 
-// Join buttons live on the pinned board so nobody has to scroll back to the
-// announcement. The list is capped to keep the keyboard readable.
-const MAX_JOIN_BUTTONS = 6;
+// The private list is the fallback for everything the board's own buttons
+// cannot reach, so it has to be the longer of the two. If it were the same
+// length it would drop exactly the courts the board sends people here for.
+const MAX_JOIN_BUTTONS = 12;
 
 function courtName(booking) {
   return booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`;
@@ -297,9 +298,12 @@ function slotsLabel(roster, capacity) {
 // and not "Join": the label cannot know, and the toast afterwards does.
 const MAX_BOARD_BUTTONS = 6;
 
-function openBookings(bookings, rosters) {
-  return bookings.filter((booking) => (rosters.get(booking.id) || []).length
-    < (booking.capacity || DEFAULT_CAPACITY));
+// A court that has begun is closed to joining, so it gets no button: one that
+// could only ever answer “the roster is locked” would still cost a slot in the
+// keyboard and still be counted as reachable.
+function openBookings(bookings, rosters, now) {
+  return bookings.filter((booking) => booking.starts_at > now
+    && (rosters.get(booking.id) || []).length < (booking.capacity || DEFAULT_CAPACITY));
 }
 
 function boardButtons(bookings, open, tz) {
@@ -354,8 +358,11 @@ export async function joinPickerView(env, chatId, from, now = Date.now()) {
     // shown it at all, here or on the board.
   }
   rows.push([{ text: '✕ Close', callback_data: 'sb:close' }]);
+  const dropped = mine.length - Math.min(mine.length, MAX_JOIN_BUTTONS);
   return {
-    html: '🎾 <b>Courts you can join</b>\n\nOnly you can see this list.',
+    html: '🎾 <b>Courts you can join</b>\n\nOnly you can see this list.'
+      // Never claim to be the complete list when it is not.
+      + (dropped ? `\n${dropped} further court${dropped === 1 ? '' : 's'} not shown.` : ''),
     replyMarkup: { inline_keyboard: rows },
   };
 }
@@ -374,7 +381,7 @@ async function renderBoard(env, chatId, now) {
   // A court with no room left is nobody else's business, and the board is one
   // shared message that cannot show a different list per person — so a full
   // court drops off it entirely and stays in 🙋 Join for the people on it.
-  const open = openBookings(bookings, rosters);
+  const open = openBookings(bookings, rosters, now);
 
   const lines = ['🎾 <b>Upcoming squash courts</b>'];
   for (const booking of open) {
@@ -417,27 +424,43 @@ function bookingLabel(booking, tz) {
   return `${courtName(booking)} · ${shortDate(booking.starts_at, tz)} · ${formatTime(booking.starts_at, tz)}`;
 }
 
-function managerMarkup(bookings, tz) {
-  const rows = bookings.map((booking) => [{
+// Manage used to redraw the pinned message's keyboard, which is one shared
+// surface: a single tap by anyone republished the date, court, and time of
+// every booking — including the full ones the board deliberately hides. It is
+// a private panel now, so it can be filtered to what the person tapping is
+// entitled to see. A full court appears only to somebody on it, whoever booked
+// it, or an admin.
+const MANAGER_HEADER = '⚙️ <b>Manage bookings</b>\n\nOnly you can see this list.';
+
+export async function managerView(env, chatId, from, isAdmin, now = Date.now()) {
+  const bookings = await activeBookings(env, chatId, now);
+  const tz = await getTimezone(env, chatId);
+  const rosters = await rostersFor(env, chatId, bookings.map((booking) => booking.id));
+  const mySlug = identity(from).slug;
+  const visible = bookings.filter((booking) => {
+    const roster = rosters.get(booking.id) || [];
+    if (roster.length < (booking.capacity || DEFAULT_CAPACITY)) return true;
+    return isAdmin || booking.created_by_user_id === from.id
+      || roster.some((player) => player.slug === mySlug);
+  });
+  const rows = visible.map((booking) => [{
     text: `✏️ ${bookingLabel(booking, tz)}`,
     callback_data: `sb:pick:${booking.id}`,
   }]);
   rows.push([{ text: '➕ Add booking', callback_data: 'sb:add' }]);
-  rows.push([{ text: '← Done', callback_data: 'sb:back' }]);
-  return { inline_keyboard: rows };
+  rows.push([{ text: '✕ Close', callback_data: 'sb:close' }]);
+  return {
+    html: visible.length ? MANAGER_HEADER
+      : `${MANAGER_HEADER}\n\nNothing here you can change.`,
+    replyMarkup: { inline_keyboard: rows },
+  };
 }
 
-export async function showBoardManager(env, chatId, messageId, now = Date.now()) {
-  const bookings = await activeBookings(env, chatId, now);
-  const tz = await getTimezone(env, chatId);
-  return editReplyMarkup(env, chatId, messageId, managerMarkup(bookings, tz));
-}
-
-export async function showCancelConfirmation(env, chatId, messageId, bookingId) {
+export async function bookingPanelView(env, chatId, bookingId) {
   const booking = await env.DB.prepare(
     'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
   ).bind(bookingId, dataChatId(env, chatId), Date.now()).first();
-  if (!booking) return false;
+  if (!booking) return null;
   const tz = await getTimezone(env, chatId);
   const capacity = booking.capacity || DEFAULT_CAPACITY;
   const rows = [
@@ -460,24 +483,29 @@ export async function showCancelConfirmation(env, chatId, messageId, bookingId) 
   }
   rows.push([{ text: '🗑 Delete booking', callback_data: `sb:delete:${booking.id}` }]);
   rows.push([{ text: '← Back to bookings', callback_data: 'sb:manage' }]);
-  await editReplyMarkup(env, chatId, messageId, { inline_keyboard: rows });
-  return true;
+  return {
+    html: `⚙️ <b>${escapeHtml(bookingLabel(booking, tz))}</b>\n\nOnly you can see this.`,
+    replyMarkup: { inline_keyboard: rows },
+  };
 }
 
-export async function showRemovePlayer(env, chatId, messageId, bookingId) {
+export async function removePlayerView(env, chatId, bookingId) {
   const booking = await env.DB.prepare(
     'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
   ).bind(bookingId, dataChatId(env, chatId), Date.now()).first();
-  if (!booking) return false;
+  if (!booking) return null;
   const roster = await rosterFor(env, bookingId);
-  if (!roster.length) return false;
+  if (!roster.length) return null;
+  const tz = await getTimezone(env, chatId);
   const rows = roster.map((player) => [{
     text: `🚪 ${player.name}`,
     callback_data: `sb:kick:${bookingId}:${player.id}`,
   }]);
   rows.push([{ text: '← Back', callback_data: `sb:pick:${bookingId}` }]);
-  await editReplyMarkup(env, chatId, messageId, { inline_keyboard: rows });
-  return true;
+  return {
+    html: `🚪 <b>Take somebody off ${escapeHtml(bookingLabel(booking, tz))}</b>`,
+    replyMarkup: { inline_keyboard: rows },
+  };
 }
 
 // The person taken off is told privately. Nobody else needs the notification.
@@ -503,35 +531,38 @@ export async function notifyRosterOfJoin(env, chatId, booking, from) {
     `${shortDate(booking.starts_at, tz)} · ` +
     `${compactTimeRange(booking.starts_at, booking.ends_at, tz)} · ` +
     `${slotsLabel(roster, booking.capacity || DEFAULT_CAPACITY)}`;
+  // By id, not by slug: one person can briefly hold two roster rows while their
+  // username is still being merged, and two copies of this would be a bug.
+  const told = new Set([from && from.id]);
   for (const player of roster) {
-    if (!player.user_id || player.slug === joined.slug) continue;
+    if (!player.user_id || player.slug === joined.slug || told.has(player.user_id)) continue;
+    told.add(player.user_id);
     await sendPrivately(env, reachableChat(env, player, chatId), html,
       player.user_id, endOfLocalDay(booking.starts_at, tz));
   }
 }
 
-export async function showDeleteConfirmation(env, chatId, messageId, bookingId) {
+export async function deletePanelView(env, chatId, bookingId) {
   const booking = await env.DB.prepare(
     'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
   ).bind(bookingId, dataChatId(env, chatId), Date.now()).first();
-  if (!booking) return false;
+  if (!booking) return null;
   const tz = await getTimezone(env, chatId);
-  await editReplyMarkup(env, chatId, messageId, { inline_keyboard: [
-    [{
-      text: `🗑 Confirm delete · ${bookingLabel(booking, tz)}`,
-      callback_data: `sb:cancel:${booking.id}`,
-    }],
-    [{ text: '← Keep booking', callback_data: `sb:pick:${booking.id}` }],
-  ] });
-  return true;
+  return {
+    html: `🗑 <b>Delete ${escapeHtml(bookingLabel(booking, tz))}?</b>`,
+    replyMarkup: { inline_keyboard: [
+      [{ text: '🗑 Confirm delete', callback_data: `sb:cancel:${booking.id}` }],
+      [{ text: '← Keep booking', callback_data: `sb:pick:${booking.id}` }],
+    ] },
+  };
 }
 
-export async function restoreBoardButtons(env, chatId, messageId) {
-  const bookings = await activeBookings(env, chatId);
+export async function restoreBoardButtons(env, chatId, messageId, now = Date.now()) {
+  const bookings = await activeBookings(env, chatId, now);
   const tz = await getTimezone(env, chatId);
   const rosters = await rostersFor(env, chatId, bookings.map((booking) => booking.id));
   return editReplyMarkup(
-    env, chatId, messageId, boardButtons(bookings, openBookings(bookings, rosters), tz)
+    env, chatId, messageId, boardButtons(bookings, openBookings(bookings, rosters, now), tz)
   );
 }
 

@@ -1,7 +1,7 @@
 import {
-  authorizeBookingChange, cancelBooking, notifyRemovedPlayer, notifyRosterOfJoin,
-  restoreBoardButtons, runMaintenance, showBoardManager, showCancelConfirmation,
-  showDeleteConfirmation, joinPickerView, showRemovePlayer, updateBoard,
+  authorizeBookingChange, bookingPanelView, cancelBooking, deletePanelView, managerView,
+  notifyRemovedPlayer, notifyRosterOfJoin, removePlayerView, restoreBoardButtons,
+  runMaintenance, joinPickerView, updateBoard,
 } from './bookings.js';
 import {
   defaultCapacity, isChatAdmin, MAX_CAPACITY, raiseCapacity, rememberPlayer,
@@ -85,8 +85,9 @@ async function handleBoardCallback(env, callback) {
     return true;
   }
   if (data === 'sb:manage') {
-    await showBoardManager(env, chatId, messageId);
-    await answerCallback(env, callback.id, 'Choose a booking on the pinned message');
+    await showPanel(env, callback,
+      await managerView(env, chatId, callback.from, await isChatAdmin(env, chatId, callback.from)));
+    await answerCallback(env, callback.id);
     return true;
   }
   if (data === 'sb:back') {
@@ -96,9 +97,10 @@ async function handleBoardCallback(env, callback) {
   }
   const pick = data.match(/^sb:pick:(\d+)$/);
   if (pick) {
-    const found = await showCancelConfirmation(env, chatId, messageId, Number(pick[1]));
-    await answerCallback(env, callback.id, found ? '' : 'That booking has already gone.', !found);
-    if (!found) await updateBoard(env, chatId);
+    const view = await bookingPanelView(env, chatId, Number(pick[1]));
+    if (view) await showPanel(env, callback, view);
+    await answerCallback(env, callback.id, view ? '' : 'That booking has already gone.', !view);
+    if (!view) await updateBoard(env, chatId);
     return true;
   }
   const edit = data.match(/^sb:edit:(\d+):([dct])$/);
@@ -126,9 +128,10 @@ async function handleBoardCallback(env, callback) {
       await answerCallback(env, callback.id, permitted.message, true);
       return true;
     }
-    const found = await showDeleteConfirmation(env, chatId, messageId, Number(remove[1]));
-    await answerCallback(env, callback.id, found ? '' : 'That booking has already gone.', !found);
-    if (!found) await updateBoard(env, chatId);
+    const view = await deletePanelView(env, chatId, Number(remove[1]));
+    if (view) await showPanel(env, callback, view);
+    await answerCallback(env, callback.id, view ? '' : 'That booking has already gone.', !view);
+    if (!view) await updateBoard(env, chatId);
     return true;
   }
   const cancel = data.match(/^sb:cancel:(\d+)$/);
@@ -206,7 +209,8 @@ async function handleBoardCallback(env, callback) {
     if (removed) {
       await updateBoard(env, chatId);
       await notifyRemovedPlayer(env, chatId, removed.player, removed.booking);
-      await showCancelConfirmation(env, chatId, messageId, Number(kicked[1]));
+      const view = await bookingPanelView(env, chatId, Number(kicked[1]));
+      if (view) await showPanel(env, callback, view);
     }
     await answerCallback(env, callback.id,
       removed ? `${removed.player.name} is off this booking.`
@@ -219,9 +223,10 @@ async function handleBoardCallback(env, callback) {
       await answerCallback(env, callback.id, 'Only group admins can remove players.', true);
       return true;
     }
-    const shown = await showRemovePlayer(env, chatId, messageId, Number(kick[1]));
+    const shown = await removePlayerView(env, chatId, Number(kick[1]));
+    if (shown) await showPanel(env, callback, shown);
     await answerCallback(env, callback.id,
-      shown ? 'Choose who to remove' : 'Nobody is on that booking.', !shown);
+      shown ? '' : 'Nobody is on that booking.', !shown);
     return true;
   }
   const capacity = data.match(/^sb:cap:(\d+)$/);
@@ -233,7 +238,8 @@ async function handleBoardCallback(env, callback) {
     const raised = await raiseCapacity(env, chatId, Number(capacity[1]));
     if (raised) {
       await updateBoard(env, chatId);
-      await showCancelConfirmation(env, chatId, messageId, Number(capacity[1]));
+      const view = await bookingPanelView(env, chatId, Number(capacity[1]));
+      if (view) await showPanel(env, callback, view);
     }
     await answerCallback(env, callback.id,
       raised ? `This court now holds ${raised} players.`
@@ -242,6 +248,25 @@ async function handleBoardCallback(env, callback) {
     return true;
   }
   return false;
+}
+
+// Panels are private to one person. The first tap comes off the shared pinned
+// board and has to open a new ephemeral message; every tap after that arrives
+// from inside the panel and edits it in place. Nothing here ever writes to the
+// pinned message, which is what used to publish hidden bookings to the group.
+async function showPanel(env, callback, view) {
+  const chatId = callback.message.chat.id;
+  const ephemeralId = callback.message.ephemeral_message_id;
+  if (ephemeralId) {
+    return editEphemeralMessage(
+      env, chatId, callback.from.id, ephemeralId, view.html, view.replyMarkup
+    );
+  }
+  return sendMessage(env, chatId, view.html, {
+    receiverUserId: callback.from.id,
+    callbackQueryId: callback.id,
+    replyMarkup: view.replyMarkup,
+  });
 }
 
 // The court list is a private message to one person, so it is edited in place
@@ -342,6 +367,9 @@ export async function handleUpdate(env, update) {
   const msg = update.message;
   if (!msg || !msg.text || !chatAllowed(env, msg.chat)) return;
   const text = msg.text.trim();
+  // Set once the original has been cleared, so a failure further down can hand
+  // the wording back rather than leaving the sender with nothing to retype from.
+  let clearedText = null;
 
   try {
     await rememberPlayer(env, msg.from);
@@ -355,7 +383,10 @@ export async function handleUpdate(env, update) {
       try {
         await beginBooking(env, msg, text);
       } finally {
-        if (isBooking && msg.message_id) await clearBookingMessage(env, msg);
+        if (isBooking && msg.message_id) {
+          clearedText = text;
+          await clearBookingMessage(env, msg);
+        }
       }
       return;
     }
@@ -431,7 +462,9 @@ export async function handleUpdate(env, update) {
     // anything the person can actually act on before it throws.
     console.log(`Update failed: ${error.stack || error}`);
     await sendMessage(env, msg.chat.id,
-      '⚠️ Something went wrong. Please try again.', {
+      '⚠️ Something went wrong. Please try again.'
+      // Their message was deleted before this failed, so it only exists here.
+      + (clearedText ? `\n\n<code>${escapeHtml(clearedText)}</code>` : ''), {
         receiverUserId: msg.from.id,
         replyToEphemeral: msg.ephemeral_message_id || null,
       });
