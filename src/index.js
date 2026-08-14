@@ -508,12 +508,19 @@ export default {
         url: `${url.origin}/webhook`, secret_token: env.WEBHOOK_SECRET,
         allowed_updates: ['message', 'callback_query'],
       });
+      // Deliberately not is_ephemeral. An ephemeral command is delivered with
+      // no public copy and no message_id the bot may delete — deleteEphemeral-
+      // Message only reaches messages the bot itself sent — so it stayed in the
+      // sender's chat for good. Registered plainly, a command arrives as an
+      // ordinary group message and is deleted the moment it is handled. It is
+      // briefly visible to the group; the replies stay private either way,
+      // because that comes from receiver_user_id on the send, not from here.
       const commands = await telegram(env, 'setMyCommands', { commands: [
-        { command: 'book', description: 'Add a court booking', is_ephemeral: true },
-        { command: 'courts', description: 'Show or refresh the pinned court board', is_ephemeral: true },
-        { command: 'tab', description: 'Show or refresh the pinned money tab', is_ephemeral: true },
-        { command: 'cancel', description: 'Cancel a booking by ID', is_ephemeral: true },
-        { command: 'help', description: 'Show examples', is_ephemeral: true },
+        { command: 'book', description: 'Add a court booking' },
+        { command: 'courts', description: 'Show or refresh the pinned court board' },
+        { command: 'tab', description: 'Show or refresh the pinned money tab' },
+        { command: 'cancel', description: 'Cancel a booking by ID' },
+        { command: 'help', description: 'Show examples' },
       ] });
       const profile = await telegram(env, 'setMyName', { name: 'SquashBot' });
       const allowedChatIds = String(env.ALLOWED_CHATS || '').split(',').map((id) => id.trim()).filter(Boolean);
