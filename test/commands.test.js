@@ -139,6 +139,88 @@ describe('Telegram commands', () => {
     expect(removed.body.message_id).toBe(5);
   });
 
+  it('clears the booking message even when the form fails to open', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      // Telegram refusing the form used to leave the booking text in the group.
+      const failed = String(url).endsWith('/sendMessage')
+        && JSON.parse(init.body).text.includes('Confirm this squash booking');
+      return new Response(JSON.stringify(failed
+        ? { ok: false, description: 'Bad Request' }
+        : { ok: true, result: { ephemeral_message_id: 12 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const db = {
+      prepare(sql) {
+        return { bind() { return {
+          async first() {
+            return sql.includes('SELECT tz') ? { tz: 'Asia/Singapore' } : null;
+          },
+          async run() {
+            if (sql.includes('INSERT INTO booking_drafts')) {
+              return { meta: { changes: 1, last_row_id: 41 } };
+            }
+            return { meta: { changes: 1 } };
+          },
+        }; } };
+      },
+    };
+    await handleUpdate({
+      BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db,
+    }, {
+      message: {
+        message_id: 5,
+        chat: { id: -123456789 },
+        from: { id: 7, first_name: 'Nick' },
+        text: '20 Aug 2026 Court 4 9pm',
+      },
+    });
+    const removed = requests.find((request) => request.url.endsWith('/deleteMessage'));
+    expect(removed.body.message_id).toBe(5);
+  });
+
+  it('says so when it lacks the right to delete the booking message', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify(String(url).endsWith('/deleteMessage')
+        ? { ok: false, description: 'not enough rights' }
+        : { ok: true, result: { ephemeral_message_id: 12 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const db = {
+      prepare(sql) {
+        return { bind() { return {
+          async first() {
+            return sql.includes('SELECT tz') ? { tz: 'Asia/Singapore' } : null;
+          },
+          async run() {
+            if (sql.includes('INSERT INTO booking_drafts')) {
+              return { meta: { changes: 1, last_row_id: 41 } };
+            }
+            return { meta: { changes: 1 } };
+          },
+        }; } };
+      },
+    };
+    await handleUpdate({
+      BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db,
+    }, {
+      message: {
+        message_id: 5,
+        chat: { id: -123456789 },
+        from: { id: 7, first_name: 'Nick' },
+        text: '20 Aug 2026 Court 4 9pm',
+      },
+    });
+    const warning = requests.find((request) => request.url.endsWith('/sendMessage')
+      && request.body.text.includes('Delete Messages'));
+    expect(warning.body.receiver_user_id).toBe(7);
+  });
+
   it('leaves nothing behind in the chat once a booking is saved', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
@@ -254,9 +336,66 @@ describe('Telegram commands', () => {
     const board = requests.find((request) => request.url.endsWith('/editMessageText'));
     expect(board.body.message_id).toBe(55);
     // The board keeps one compact row; picking a court happens behind Join.
-    expect(board.body.reply_markup.inline_keyboard).toHaveLength(1);
-    expect(board.body.reply_markup.inline_keyboard[0].map((button) => button.callback_data))
+    // A per-court toggle row, then the actions that are not about one court.
+    expect(board.body.reply_markup.inline_keyboard).toHaveLength(2);
+    expect(board.body.reply_markup.inline_keyboard[0][0].callback_data).toBe('sb:tap:3');
+    expect(board.body.reply_markup.inline_keyboard[1].map((button) => button.callback_data))
       .toEqual(['sb:join', 'sb:add', 'sb:manage']);
+  });
+
+  it('toggles one shared court button by who tapped it', async () => {
+    const booking = {
+      id: 3, chat_id: -123456789, court: '4', capacity: 3,
+      starts_at: Date.UTC(2026, 7, 19, 13, 0), ends_at: Date.UTC(2026, 7, 19, 14, 0),
+    };
+    const run = async (roster) => {
+      const requests = [];
+      const ran = [];
+      vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+        requests.push({ url: String(url), body: JSON.parse(init.body) });
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 55 } }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }));
+      const db = {
+        prepare(sql) {
+          ran.push(sql);
+          return { bind() { return {
+            async first() {
+              if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+              if (sql.includes('SELECT * FROM bookings WHERE id')) return booking;
+              return null;
+            },
+            async all() {
+              if (sql.includes('FROM booking_players')) return { results: roster };
+              return { results: sql.includes('ends_at >') ? [booking] : [] };
+            },
+            async run() { return { meta: { changes: 1 } }; },
+          }; } };
+        },
+      };
+      await handleUpdate({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db }, {
+        callback_query: {
+          id: 'callback-1', data: 'sb:tap:3',
+          from: { id: 11, username: 'alice' },
+          message: { message_id: 55, chat: { id: -123456789 } },
+        },
+      });
+      const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+      return { text: answer.body.text, ran, requests };
+    };
+
+    // Same button, same callback_data — the tapper decides which way it goes.
+    const joining = await run([]);
+    expect(joining.text).toContain('You are in');
+    expect(joining.ran.some((sql) => sql.startsWith('INSERT OR IGNORE INTO booking_players')))
+      .toBe(true);
+
+    const leaving = await run([
+      { id: 1, booking_id: 3, slug: '@alice', name: '@alice', user_id: 11 },
+    ]);
+    expect(leaving.text).toContain('You are out');
+    expect(leaving.ran.some((sql) => sql.startsWith('DELETE FROM booking_players'))).toBe(true);
   });
 
   it('refuses extra slots and tab settlement to members who are not admins', async () => {
