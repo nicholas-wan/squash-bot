@@ -10,11 +10,12 @@ import {
 import { looksLikeBooking } from './parser.js';
 import { formatMoney } from './pricing.js';
 import {
-  confirmSettleMarkup, settleMarkup, settleUser, tabBalances, updateTab,
+  confirmSettleMarkup, myTabView, settleMarkup, settleUser, tabBalances,
+  theirTabView, updateTab,
 } from './tab.js';
 import {
   answerCallback, deleteEphemeralMessage, deleteMessage, editEphemeralMessage,
-  editReplyMarkup, escapeHtml, sendMessage,
+  editReplyMarkup, escapeHtml, OK_MARKUP, sendMessage,
   setBotProfilePhoto, telegram,
 } from './telegram.js';
 import {
@@ -57,16 +58,19 @@ function helpHtml(env) {
 }
 
 async function helpBoardMarkup(env, chatId) {
+  const rows = [];
   const setting = await env.DB.prepare(
     'SELECT board_message_id FROM settings WHERE chat_id = ?'
   ).bind(chatId).first();
-  if (!setting || !setting.board_message_id) return null;
   const internalChatId = String(chatId).replace(/^-100/, '');
-  if (!/^\d+$/.test(internalChatId)) return null;
-  return { inline_keyboard: [[{
-    text: '📌 View pinned court board',
-    url: `https://t.me/c/${internalChatId}/${setting.board_message_id}`,
-  }]] };
+  if (setting && setting.board_message_id && /^\d+$/.test(internalChatId)) {
+    rows.push([{
+      text: '📌 View pinned court board',
+      url: `https://t.me/c/${internalChatId}/${setting.board_message_id}`,
+    }]);
+  }
+  rows.push(...OK_MARKUP.inline_keyboard);
+  return { inline_keyboard: rows };
 }
 
 async function handleBoardCallback(env, callback) {
@@ -313,6 +317,31 @@ async function handleTabCallback(env, callback) {
   const chatId = callback.message.chat.id;
   const messageId = callback.message.message_id;
 
+  // Before the admin gate: anyone may read their own breakdown. The first tap
+  // comes off the pinned tab and opens a new private message; a Back tap from
+  // inside a panel edits it in place, which showPanel tells apart by itself.
+  if (data === 'tb:mine') {
+    const view = await myTabView(
+      env, chatId, callback.from, await isChatAdmin(env, chatId, callback.from)
+    );
+    await showPanel(env, callback, view);
+    await answerCallback(env, callback.id);
+    return true;
+  }
+  const theirs = data.match(/^tb:mine:(.+)$/);
+  if (theirs) {
+    if (!(await isChatAdmin(env, chatId, callback.from))) {
+      await answerCallback(env, callback.id,
+        'Only group admins can read another tab.', true);
+      return true;
+    }
+    const view = await theirTabView(env, chatId, theirs[1]);
+    if (view) await showPanel(env, callback, view);
+    await answerCallback(env, callback.id,
+      view ? '' : 'Nothing on that tab any more.', !view);
+    return true;
+  }
+
   if (!(await isChatAdmin(env, chatId, callback.from))) {
     await answerCallback(env, callback.id, 'Only group admins can settle the tab.', true);
     return true;
@@ -359,7 +388,7 @@ async function clearSentMessage(env, msg, kind = 'booking message') {
   await sendMessage(env, msg.chat.id,
     `⚠️ Your ${kind} is still in the group — I need the ` +
     '<b>Delete Messages</b> admin right to clear it.',
-    { receiverUserId: msg.from.id });
+    { receiverUserId: msg.from.id, replyMarkup: OK_MARKUP });
 }
 
 export async function handleUpdate(env, update) {
@@ -442,6 +471,7 @@ export async function handleUpdate(env, update) {
           '💰 Nothing outstanding. Shares appear on the tab after a court has been played.', {
             receiverUserId: msg.from.id,
             replyToEphemeral: msg.ephemeral_message_id || null,
+            replyMarkup: OK_MARKUP,
           });
       }
       return;
@@ -452,6 +482,7 @@ export async function handleUpdate(env, update) {
           'Use <code>/cancel ID</code>, for example <code>/cancel 3</code>.', {
             receiverUserId: msg.from.id,
             replyToEphemeral: msg.ephemeral_message_id || null,
+            replyMarkup: OK_MARKUP,
           });
         return;
       }
@@ -468,6 +499,7 @@ export async function handleUpdate(env, update) {
           silent: true,
           receiverUserId: msg.from.id,
           replyToEphemeral: msg.ephemeral_message_id || null,
+          replyMarkup: OK_MARKUP,
         }
       );
       return;
@@ -483,6 +515,7 @@ export async function handleUpdate(env, update) {
       + (clearedText ? `\n\n<code>${escapeHtml(clearedText)}</code>` : ''), {
         receiverUserId: msg.from.id,
         replyToEphemeral: msg.ephemeral_message_id || null,
+        replyMarkup: OK_MARKUP,
       });
   }
 }

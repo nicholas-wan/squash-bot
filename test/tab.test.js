@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
-  chargeBooking, settleMarkup, settleUser, tabHtml, tabMarkup,
+  chargeBooking, myTabView, settleMarkup, settleUser, tabHtml, tabMarkup,
+  theirTabView,
 } from '../src/tab.js';
 
 const env = {
@@ -83,7 +84,9 @@ describe('money tab', () => {
     expect(html).toContain('• @alice — <b>$8.00</b>');
     expect(html).toContain('• @bob — <b>$4.00</b>');
     expect(html).not.toContain('Total');
-    expect(tabMarkup(balances).inline_keyboard[0][0].callback_data).toBe('tb:pay');
+    const keyboard = tabMarkup(balances).inline_keyboard;
+    expect(keyboard[0][0].callback_data).toBe('tb:mine');
+    expect(keyboard[1][0].callback_data).toBe('tb:pay');
   });
 
   it('unpins itself once everyone has settled', () => {
@@ -94,7 +97,7 @@ describe('money tab', () => {
     // Someone named by username in an imported balance has no Telegram id until
     // they post. Keying the button on the id hid the whole menu.
     const balances = [{ slug: '@thadduu', user_id: null, name: '@thadduu', balance: 1400 }];
-    expect(tabMarkup(balances).inline_keyboard[0][0].callback_data).toBe('tb:pay');
+    expect(tabMarkup(balances).inline_keyboard[1][0].callback_data).toBe('tb:pay');
     const db = { prepare() { return { bind() { return {
       async all() { return { results: balances }; },
     }; } }; } };
@@ -106,9 +109,117 @@ describe('money tab', () => {
 
   it('clears the settle button rather than leaving a stale one behind', () => {
     // editMessageText keeps the previous keyboard when reply_markup is omitted,
-    // so an empty keyboard has to be sent explicitly.
+    // so the settle row has to be overwritten explicitly — My tab stays.
     expect(tabMarkup([{ slug: 'u9', user_id: 9, name: '@alice', balance: -150 }]))
-      .toEqual({ inline_keyboard: [] });
+      .toEqual({ inline_keyboard: [[{ text: '🧾 My tab', callback_data: 'tb:mine' }]] });
+  });
+
+  it('itemises one person’s charges and payments in their private breakdown', async () => {
+    const rows = [
+      {
+        slug: '@thadduu', user_id: null, name: '@thadduu', amount_cents: 200,
+        booking_id: null, reason: 'Squash · 30 Apr',
+        created_at: Date.UTC(2026, 3, 30, 4, 0),
+      },
+      // An old spelling reconnected by numeric id, not slug.
+      {
+        slug: '@oldname', user_id: 42, name: '@oldname', amount_cents: 300,
+        booking_id: 7, reason: 'Court 4 · 11 May',
+        created_at: Date.UTC(2026, 4, 11, 4, 0),
+      },
+      {
+        slug: '@thadduu', user_id: 42, name: '@thadduu', amount_cents: -200,
+        booking_id: null, reason: 'Cleared by Nicholas',
+        created_at: Date.UTC(2026, 4, 20, 4, 0),
+      },
+    ];
+    const queries = [];
+    const db = { prepare(sql) { return { bind(...args) {
+      queries.push({ sql, args });
+      return {
+        async first() { return sql.includes('SELECT tz') ? { tz: 'Asia/Singapore' } : null; },
+        async all() { return { results: rows }; },
+      };
+    } }; } };
+    const view = await myTabView({ ...env, DB: db }, -123, { id: 42, username: 'thadduu' });
+    // Slug or id, so history under an old username is still owned and shown.
+    const ledgerQuery = queries.find((query) => query.sql.includes('FROM ledger'));
+    expect(ledgerQuery.args).toEqual([-123, '@thadduu', 42]);
+    expect(view.html).toContain('Owed to Nicholas: <b>$3.00</b>');
+    expect(view.html).toContain('• Squash · 30 Apr — $2.00');
+    expect(view.html).toContain('• Court 4 · 11 May — $3.00');
+    expect(view.html).toContain('• Cleared by Nicholas · 20 May — −$2.00');
+    expect(view.html).toContain('Only you can see this.');
+  });
+
+  it('tells someone with no history that nothing is owed', async () => {
+    const db = { prepare() { return { bind() { return {
+      async first() { return null; },
+      async all() { return { results: [] }; },
+    }; } }; } };
+    const view = await myTabView({ ...env, DB: db }, -123, { id: 9, username: 'alice' });
+    expect(view.html).toContain('Nothing here');
+    // An ordinary member sees their own tab and nothing else.
+    expect(view.replyMarkup.inline_keyboard.flat().map((button) => button.text))
+      .toEqual(['👍 OK']);
+  });
+
+  it('offers an admin every open balance behind their own breakdown', async () => {
+    const balances = [
+      { slug: '@thadduu', user_id: null, name: '@thadduu', balance: 1400 },
+      { slug: '@po1arb3ar', user_id: null, name: '@Po1arb3ar', balance: 1200 },
+    ];
+    const db = { prepare(sql) { return { bind() { return {
+      async first() { return sql.includes('SELECT tz') ? { tz: 'Asia/Singapore' } : null; },
+      async all() { return { results: sql.includes('GROUP BY') ? balances : [] }; },
+    }; } }; } };
+    const view = await myTabView(
+      { ...env, DB: db }, -123, { id: 5, username: 'nicholaswan' }, true
+    );
+    const buttons = view.replyMarkup.inline_keyboard.flat();
+    expect(buttons.map((button) => button.text)).toEqual([
+      '🧾 @thadduu · $14.00', '🧾 @Po1arb3ar · $12.00', '👍 OK',
+    ]);
+    expect(buttons[0].callback_data).toBe('tb:mine:@thadduu');
+  });
+
+  it('renders one debtor’s tab for an admin, keyed by slug like the pinned tab', async () => {
+    const rows = [
+      {
+        slug: '@thadduu', user_id: null, name: '@thadduu', amount_cents: 200,
+        booking_id: null, reason: 'Squash · 30 Apr',
+        created_at: Date.UTC(2026, 3, 30, 4, 0),
+      },
+      {
+        slug: '@thadduu', user_id: null, name: '@thadduu', amount_cents: 300,
+        booking_id: null, reason: 'Squash · 13 Aug',
+        created_at: Date.UTC(2026, 7, 13, 4, 0),
+      },
+    ];
+    const queries = [];
+    const db = { prepare(sql) { return { bind(...args) {
+      queries.push({ sql, args });
+      return {
+        async first() { return sql.includes('SELECT tz') ? { tz: 'Asia/Singapore' } : null; },
+        async all() { return { results: sql.includes('FROM ledger') ? rows : [] }; },
+      };
+    } }; } };
+    const view = await theirTabView({ ...env, DB: db }, -123, '@thadduu');
+    expect(queries.find((query) => query.sql.includes('FROM ledger')).args)
+      .toEqual([-123, '@thadduu']);
+    expect(view.html).toContain('<b>@thadduu</b>');
+    expect(view.html).toContain('Owed to Nicholas: <b>$5.00</b>');
+    expect(view.html).toContain('• Squash · 30 Apr — $2.00');
+    expect(view.replyMarkup.inline_keyboard[0][0])
+      .toEqual({ text: '← Back to your tab', callback_data: 'tb:mine' });
+  });
+
+  it('has nothing to show for a slug with no ledger rows', async () => {
+    const db = { prepare() { return { bind() { return {
+      async first() { return null; },
+      async all() { return { results: [] }; },
+    }; } }; } };
+    expect(await theirTabView({ ...env, DB: db }, -123, '@ghost')).toBe(null);
   });
 
   it('credits a settlement once even if two admins confirm it', async () => {

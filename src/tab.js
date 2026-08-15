@@ -2,9 +2,13 @@ import { courtCostCents, formatMoney, publicHolidays, shareCents } from './prici
 import { householdSlugs, identity, ownerName } from './players.js';
 import { boardChats, dataChatId } from './scope.js';
 import { getTimezone, updatePinnedMessage } from './settings.js';
-import { escapeHtml } from './telegram.js';
+import { escapeHtml, OK_MARKUP } from './telegram.js';
 
-const NO_KEYBOARD = { inline_keyboard: [] };
+function shortDay(epochMs, tz) {
+  return new Intl.DateTimeFormat('en-SG', {
+    timeZone: tz, day: 'numeric', month: 'short',
+  }).format(new Date(epochMs));
+}
 
 // Charges land only after a booking has been played, so cancelled slots and
 // people who left in time are never billed. The unique index on
@@ -69,9 +73,106 @@ export function settleable(balances) {
   return balances.filter((entry) => entry.balance > 0 && settleKey(entry.slug));
 }
 
+// My tab is for everyone, so it comes first; Manage only appears when there is
+// a balance an admin could clear. The keyboard is never omitted — editing a
+// message without reply_markup keeps its previous keyboard, so a settle button
+// that should disappear must be overwritten, not left out.
 export function tabMarkup(balances) {
-  if (!settleable(balances).length) return NO_KEYBOARD;
-  return { inline_keyboard: [[{ text: '⚙️ Manage tab', callback_data: 'tb:pay' }]] };
+  const rows = [[{ text: '🧾 My tab', callback_data: 'tb:mine' }]];
+  if (settleable(balances).length) {
+    rows.push([{ text: '⚙️ Manage tab', callback_data: 'tb:pay' }]);
+  }
+  return { inline_keyboard: rows };
+}
+
+// The balance line and the story behind it, shared by every breakdown view.
+function breakdownLines(env, rows, tz) {
+  const lines = [];
+  const balance = rows.reduce((sum, row) => sum + row.amount_cents, 0);
+  if (balance > 0) {
+    lines.push(`Owed to ${escapeHtml(ownerName(env))}: <b>${formatMoney(balance)}</b>`);
+  } else {
+    lines.push(balance < 0 ? `In credit: <b>${formatMoney(-balance)}</b>` : 'All settled.');
+  }
+  lines.push('');
+  for (const row of rows) {
+    // Charges carry their date in the reason; a payment's reason only names
+    // who cleared it, so its date is read off the row instead.
+    lines.push(row.amount_cents < 0
+      ? `• ${escapeHtml(row.reason || 'Payment')} · ${shortDay(row.created_at, tz)}`
+        + ` — −${formatMoney(-row.amount_cents)}`
+      : `• ${escapeHtml(row.reason || 'Squash')} — ${formatMoney(row.amount_cents)}`);
+  }
+  lines.push('', 'Courts are $6/hour from 6pm, on weekends, and on public '
+    + 'holidays, $3/hour otherwise, split across everyone who played.');
+  return lines;
+}
+
+// Why a balance is what it is: every ledger row for one person, charges and
+// payments alike, in the order they happened. The pinned tab is shared and can
+// only name totals; this is sent privately to whoever tapped 🧾, which is the
+// one place the full story fits.
+export async function myTabView(env, chatId, from, isAdmin = false) {
+  const who = identity(from);
+  // Matched by slug or by numeric id: a username change re-keys roster rows
+  // but not ledger history, so the id is the only thread tying an old entry to
+  // the person tapping now — and showing both halves is what makes a total
+  // split across two spellings explainable.
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM ledger
+     WHERE chat_id = ? AND (slug = ? OR (user_id IS NOT NULL AND user_id = ?))
+     ORDER BY created_at, id`
+  ).bind(dataChatId(env, chatId), who.slug, who.userId || 0).all();
+
+  const lines = ['🧾 <b>Your squash tab</b>'];
+  if (!results.length) {
+    lines.push('', 'Nothing here — you have never been charged.');
+  } else {
+    lines.push(...breakdownLines(env, results, await getTimezone(env, chatId)));
+  }
+  lines.push('', 'Only you can see this.');
+
+  // Everyone taps the same shared button; what it opens is private, so it can
+  // differ. Group admins get a row per open balance — reading why somebody
+  // owes is part of keeping the household straight, the same reason Manage
+  // shows them every roster.
+  let replyMarkup = OK_MARKUP;
+  if (isAdmin) {
+    const others = (await tabBalances(env, chatId))
+      .filter((entry) => settleKey(entry.slug));
+    if (others.length) {
+      replyMarkup = { inline_keyboard: [
+        ...others.map((entry) => [{
+          text: `🧾 ${entry.name} · ${formatMoney(Math.abs(entry.balance))}`,
+          callback_data: `tb:mine:${settleKey(entry.slug)}`,
+        }]),
+        ...OK_MARKUP.inline_keyboard,
+      ] };
+    }
+  }
+  return { html: lines.join('\n'), replyMarkup };
+}
+
+// One person's breakdown for an admin's eyes, keyed by slug exactly as the
+// pinned tab is — a total split across two spellings shows as two entries
+// there, and this view explains each entry as itself.
+export async function theirTabView(env, chatId, slug) {
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM ledger WHERE chat_id = ? AND slug = ?
+     ORDER BY created_at, id`
+  ).bind(dataChatId(env, chatId), String(slug)).all();
+  if (!results.length) return null;
+  const name = results[results.length - 1].name || String(slug);
+  const lines = [`🧾 <b>${escapeHtml(name)}</b>`];
+  lines.push(...breakdownLines(env, results, await getTimezone(env, chatId)));
+  lines.push('', 'Only you can see this.');
+  return {
+    html: lines.join('\n'),
+    replyMarkup: { inline_keyboard: [
+      [{ text: '← Back to your tab', callback_data: 'tb:mine' }],
+      ...OK_MARKUP.inline_keyboard,
+    ] },
+  };
 }
 
 export function tabHtml(env, balances) {

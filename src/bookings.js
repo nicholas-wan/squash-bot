@@ -8,14 +8,10 @@ import { chargeBooking, updateTab } from './tab.js';
 import { formatDate, formatTime, localParts, zonedEpoch } from './time.js';
 import {
   deleteEphemeralMessage, deleteMessage, editReplyMarkup, escapeHtml, mentionHtml,
-  sendMessage,
+  OK_MARKUP, sendMessage,
 } from './telegram.js';
 
 export { getTimezone };
-
-// The one dismiss button every private note carries. index.js matches the
-// callback_data string exactly, so every site must share this literal.
-const OK_MARKUP = { inline_keyboard: [[{ text: '👍 OK', callback_data: 'sb:ok' }]] };
 
 function actorName(from) {
   return from ? identity(from).name : null;
@@ -504,7 +500,7 @@ export async function notifyRemovedPlayer(env, chatId, player, booking) {
     `🚪 You were taken off <b>${escapeHtml(courtName(booking))}</b> on ` +
     `${formatDate(booking.starts_at, tz)} · ${formatTime(booking.starts_at, tz)}.\n` +
     'Tap the 🙋 button on the pinned board if that was a mistake.',
-    player.user_id, endOfLocalDay(booking.starts_at, tz));
+    player.user_id, endOfLocalDay(booking.starts_at, tz), { replyMarkup: OK_MARKUP });
 }
 
 // The board no longer names who is on a court, so the whole roster hears when a
@@ -569,7 +565,7 @@ export async function notifyRosterOfChange(env, chatId, booking, from, action) {
   const outcomes = await Promise.all(sends.map(async (send) => ({
     isActor: send.isActor,
     outcome: await sendPrivately(env, chatId, send.html, send.userId, deleteAfter,
-      send.isActor ? { replyMarkup: OK_MARKUP, cleanups } : { cleanups }),
+      { replyMarkup: OK_MARKUP, cleanups }),
   })));
   if (cleanups.length) await env.DB.batch(cleanups);
   // Whether "everyone else has been told" would be true, so the caller's toast
@@ -744,7 +740,8 @@ async function sendClaimedReminders(env, now, column, headline) {
       const chatId = reachableChat(env, { chat_id: row.player_chat_id }, row.chat_id);
       const html = reminderHtml(row, roster, headline, tz);
       const outcome = await sendPrivately(
-        env, chatId, html, row.player_user_id, endOfLocalDay(row.starts_at, tz)
+        env, chatId, html, row.player_user_id, endOfLocalDay(row.starts_at, tz),
+        { replyMarkup: OK_MARKUP }
       );
 
       if (outcome === 'private') continue;
@@ -794,7 +791,7 @@ async function remindRosterlessBookings(env, now, column, headline) {
       const html = reminderHtml(booking, roster, headline, tz);
       const outcome = await sendPrivately(
         env, booking.chat_id, html, booking.created_by_user_id,
-        endOfLocalDay(booking.starts_at, tz)
+        endOfLocalDay(booking.starts_at, tz), { replyMarkup: OK_MARKUP }
       );
       if (outcome === 'not-ephemeral') {
         await remindPublicly(env, booking, roster, headline, tz);

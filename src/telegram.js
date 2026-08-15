@@ -1,3 +1,9 @@
+// The one dismiss button. Every private note carries it, so nobody has to wait
+// for the end-of-day sweep to be rid of a message they have read. The callback
+// handler in index.js matches the callback_data string exactly, which is why
+// every site shares this literal.
+export const OK_MARKUP = { inline_keyboard: [[{ text: '👍 OK', callback_data: 'sb:ok' }]] };
+
 export async function telegram(env, method, body) {
   if (!env.BOT_TOKEN) return { ok: false, description: 'BOT_TOKEN is missing' };
   try {
