@@ -381,6 +381,10 @@ describe('Telegram commands', () => {
     const run = async (roster) => {
       const requests = [];
       const ran = [];
+      // A live copy, so the DELETE and INSERT below change what later reads
+      // see — the notification path reads the roster again after the change,
+      // and a frozen mock would hide an ordering regression there.
+      let players = roster.map((player) => ({ ...player }));
       vi.stubGlobal('fetch', vi.fn(async (url, init) => {
         requests.push({ url: String(url), body: JSON.parse(init.body) });
         return new Response(JSON.stringify({ ok: true, result: { message_id: 55 } }), {
@@ -390,17 +394,36 @@ describe('Telegram commands', () => {
       const db = {
         prepare(sql) {
           ran.push(sql);
-          return { bind() { return {
+          return { bind(...args) { return {
             async first() {
               if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
               if (sql.includes('SELECT * FROM bookings WHERE id')) return booking;
               return null;
             },
             async all() {
-              if (sql.includes('FROM booking_players')) return { results: roster };
+              if (sql.includes('FROM booking_players')) return { results: players };
               return { results: sql.includes('ends_at >') ? [booking] : [] };
             },
-            async run() { return { meta: { changes: 1 } }; },
+            async run() {
+              if (sql.startsWith('DELETE FROM booking_players')) {
+                const before = players.length;
+                // rememberPlayer merges duplicate spellings (slug != ?);
+                // leaveBooking removes the tapper's own row (slug = ?).
+                players = sql.includes('slug != ?')
+                  ? players.filter((player) => !(player.user_id === args[0]
+                      && player.slug !== args[1]))
+                  : players.filter((player) => player.slug !== args[1]);
+                return { meta: { changes: before - players.length } };
+              }
+              if (sql.startsWith('INSERT OR IGNORE INTO booking_players')) {
+                players.push({
+                  id: 99, booking_id: args[0], user_id: args[2],
+                  slug: args[3], name: args[4],
+                });
+                return { meta: { changes: 1 } };
+              }
+              return { meta: { changes: 1 } };
+            },
           }; } };
         },
       };
@@ -426,6 +449,14 @@ describe('Telegram commands', () => {
     ]);
     expect(leaving.text).toContain('You are out');
     expect(leaving.ran.some((sql) => sql.startsWith('DELETE FROM booking_players'))).toBe(true);
+    // Leaving is told the same way joining is, and the leaver hears it too —
+    // the mock really deletes her row, so this proves the confirmation does
+    // not depend on finding her in the post-delete roster.
+    const told = leaving.requests
+      .filter((request) => request.url.endsWith('/sendMessage'))
+      .filter((request) => request.body.receiver_user_id === 11);
+    expect(told).toHaveLength(1);
+    expect(told[0].body.text).toContain('You are off');
   });
 
   it('refuses extra slots and tab settlement to members who are not admins', async () => {
