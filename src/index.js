@@ -187,12 +187,16 @@ async function handleBoardCallback(env, callback) {
       started: ['That court has already started, so the roster is locked.', true],
       gone: ['That booking has already gone.', true],
     };
+    // Telling the court comes first. updateBoard throws when the pinned message
+    // cannot be edited or re-pinned, and the catch around this handler would
+    // then swallow the notification along with it — the people already on the
+    // court would never hear, for a reason that has nothing to do with them.
+    if (result.status === 'joined') {
+      await notifyRosterOfJoin(env, chatId, result.booking, callback.from);
+    }
     if (result.status === 'joined' || result.status === 'left') {
       await updateBoard(env, chatId);
       await refreshJoinPicker(env, callback);
-    }
-    if (result.status === 'joined') {
-      await notifyRosterOfJoin(env, chatId, result.booking, callback.from);
     }
     await answerCallback(env, callback.id, ...replies[result.status]);
     return true;
