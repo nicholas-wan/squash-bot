@@ -462,15 +462,21 @@ export async function bookingPanelView(env, chatId, bookingId) {
       text: `👥 Admin: room for ${capacity + 1}`, callback_data: `sb:cap:${booking.id}`,
     }]);
   }
-  if ((await rosterFor(env, booking.id)).length) {
+  const roster = await rosterFor(env, booking.id);
+  if (roster.length) {
     rows.push([{
       text: '🚪 Admin: remove a player', callback_data: `sb:kick:${booking.id}`,
     }]);
   }
   rows.push([{ text: '🗑 Delete booking', callback_data: `sb:delete:${booking.id}` }]);
   rows.push([{ text: '← Back to bookings', callback_data: 'sb:manage' }]);
+  // The board cannot name the roster without repeating the same handles on
+  // every row, but this panel is private and about one court, so it is the
+  // place to answer who is playing.
   return {
-    html: `⚙️ <b>${escapeHtml(bookingLabel(booking, tz))}</b>\n\nOnly you can see this.`,
+    html: `⚙️ <b>${escapeHtml(bookingLabel(booking, tz))}</b>\n`
+      + `👥 ${playerTags(roster)} · ${slotsLabel(roster, capacity)}\n\n`
+      + 'Only you can see this.',
     replyMarkup: { inline_keyboard: rows },
   };
 }

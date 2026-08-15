@@ -208,6 +208,19 @@ describe('public booking announcements', () => {
     expect(admin.replyMarkup.inline_keyboard[0][0].callback_data).toBe('sb:pick:3');
   });
 
+  it('names who is playing on the court panel', async () => {
+    const roster = [
+      { id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick' },
+      { id: 2, booking_id: 3, user_id: null, slug: '@bo', name: '@Bo' },
+    ];
+    const panel = await bookingPanelView(
+      { BOT_TOKEN: 'test', DB: bookingDb([storedBooking], roster) }, -123, 3
+    );
+    // The board cannot carry this; a private panel about one court can.
+    expect(panel.html).toContain('<a href="tg://user?id=7">Nick</a>, @Bo');
+    expect(panel.html).toContain('1 slot');
+  });
+
   it('shows edit actions before an explicit delete confirmation', async () => {
     const env = { BOT_TOKEN: 'test', DB: bookingDb([storedBooking]) };
     const panel = await bookingPanelView(env, -123, 3);
