@@ -295,14 +295,6 @@ function slotsLabel(roster, capacity) {
 // One row, whatever the board holds. Which court you want is asked behind 🙋
 // Join, where the list is private and can offer Join or Leave per court — a row
 // per booking made the pinned message noisy and still could not say which.
-// A court that has begun is closed to joining, so it gets no button: one that
-// could only ever answer “the roster is locked” would still cost a slot in the
-// keyboard and still be counted as reachable.
-function openBookings(bookings, rosters, now) {
-  return bookings.filter((booking) => booking.starts_at > now
-    && (rosters.get(booking.id) || []).length < (booking.capacity || DEFAULT_CAPACITY));
-}
-
 function boardButtons(bookings) {
   const row = [];
   if (bookings.length) row.push({ text: '🙋 Join', callback_data: 'sb:join' });
@@ -322,17 +314,11 @@ export async function joinPickerView(env, chatId, from, now = Date.now()) {
   const rosters = await rostersFor(env, chatId, bookings.map((booking) => booking.id));
   const mySlug = identity(from).slug;
 
-  // Filtering before the cap, so a run of other people's full courts cannot
-  // push the ones you could actually join off the end of the list.
-  const mine = bookings.filter((booking) => {
-    const roster = rosters.get(booking.id) || [];
-    return roster.some((player) => player.slug === mySlug)
-      || roster.length < (booking.capacity || DEFAULT_CAPACITY);
-  });
-  if (!mine.length) return null;
-
   const rows = [];
-  for (const booking of mine.slice(0, MAX_JOIN_BUTTONS)) {
+  // Every court the board lists appears here too, full ones marked rather than
+  // hidden: a court you can see pinned and then cannot find in this list reads
+  // as a bug, and the board no longer keeps full courts back.
+  for (const booking of bookings.slice(0, MAX_JOIN_BUTTONS)) {
     const roster = rosters.get(booking.id) || [];
     const capacity = booking.capacity || DEFAULT_CAPACITY;
     const label = `${shortDate(booking.starts_at, tz)} · ` +
@@ -342,12 +328,12 @@ export async function joinPickerView(env, chatId, from, now = Date.now()) {
       rows.push([{ text: `🚪 Leave · ${label}`, callback_data: `sb:leave:${booking.id}` }]);
     } else if (roster.length < capacity) {
       rows.push([{ text: `🙋 Join · ${label}`, callback_data: `sb:join:${booking.id}` }]);
+    } else {
+      rows.push([{ text: `🔒 Full · ${label}`, callback_data: `sb:full:${booking.id}` }]);
     }
-    // A court with no room left belongs to the people on it. Anyone else is not
-    // shown it at all, here or on the board.
   }
   rows.push([{ text: '✕ Close', callback_data: 'sb:close' }]);
-  const dropped = mine.length - Math.min(mine.length, MAX_JOIN_BUTTONS);
+  const dropped = bookings.length - Math.min(bookings.length, MAX_JOIN_BUTTONS);
   return {
     html: '🎾 <b>Courts you can join</b>\n\nOnly you can see this list.'
       // Never claim to be the complete list when it is not.
@@ -367,13 +353,11 @@ async function renderBoard(env, chatId, now) {
   // board read as a wall. The roster is dropped because DEFAULT_PLAYERS puts
   // the same handles on every row; who is playing lives behind 🙋 Join, which
   // can answer it per person as the shared board never could.
-  // A court with no room left is nobody else's business, and the board is one
-  // shared message that cannot show a different list per person — so a full
-  // court drops off it entirely and stays in 🙋 Join for the people on it.
-  const open = openBookings(bookings, rosters, now);
-
+  // Every court is listed, full ones included: the board is the answer to "what
+  // is booked", and a court missing from it reads as a court nobody took. The
+  // slot count carries the difference.
   const lines = ['🎾 <b>Upcoming squash courts</b>'];
-  for (const booking of open) {
+  for (const booking of bookings) {
     const roster = rosters.get(booking.id) || [];
     lines.push('');
     lines.push(formatCountdown(booking.starts_at, tz, now));
@@ -383,9 +367,6 @@ async function renderBoard(env, chatId, now) {
       `${slotsLabel(roster, booking.capacity || DEFAULT_CAPACITY)}`
     );
   }
-  // Everything booked out still keeps the board pinned: unpinning it would take
-  // the ➕ Add and 🙋 Join buttons with it and leave nothing to book from.
-  if (!open.length) lines.push('', '<i>Every court is taken. Tap 🙋 Join to see yours.</i>');
   return {
     html: lines.join('\n'),
     replyMarkup: boardButtons(bookings),
@@ -410,34 +391,25 @@ function bookingLabel(booking, tz) {
   return `${courtName(booking)} · ${shortDate(booking.starts_at, tz)} · ${formatTime(booking.starts_at, tz)}`;
 }
 
-// Manage used to redraw the pinned message's keyboard, which is one shared
-// surface: a single tap by anyone republished the date, court, and time of
-// every booking — including the full ones the board deliberately hides. It is
-// a private panel now, so it can be filtered to what the person tapping is
-// entitled to see. A full court appears only to somebody on it, whoever booked
-// it, or an admin.
+// Manage used to redraw the pinned message's keyboard, one shared surface that
+// any tap republished to the group. It is a private panel now. It lists every
+// active court, matching the board — hiding full ones here would protect
+// nothing the board does not already show, and would leave a booked-out court
+// with no way to edit or delete it.
 const MANAGER_HEADER = '⚙️ <b>Manage bookings</b>\n\nOnly you can see this list.';
 
-export async function managerView(env, chatId, from, isAdmin, now = Date.now()) {
+export async function managerView(env, chatId, now = Date.now()) {
   const bookings = await activeBookings(env, chatId, now);
   const tz = await getTimezone(env, chatId);
-  const rosters = await rostersFor(env, chatId, bookings.map((booking) => booking.id));
-  const mySlug = identity(from).slug;
-  const visible = bookings.filter((booking) => {
-    const roster = rosters.get(booking.id) || [];
-    if (roster.length < (booking.capacity || DEFAULT_CAPACITY)) return true;
-    return isAdmin || booking.created_by_user_id === from.id
-      || roster.some((player) => player.slug === mySlug);
-  });
-  const rows = visible.map((booking) => [{
+  const rows = bookings.map((booking) => [{
     text: `✏️ ${bookingLabel(booking, tz)}`,
     callback_data: `sb:pick:${booking.id}`,
   }]);
   rows.push([{ text: '➕ Add booking', callback_data: 'sb:add' }]);
   rows.push([{ text: '✕ Close', callback_data: 'sb:close' }]);
   return {
-    html: visible.length ? MANAGER_HEADER
-      : `${MANAGER_HEADER}\n\nNothing here you can change.`,
+    html: bookings.length ? MANAGER_HEADER
+      : `${MANAGER_HEADER}\n\nNothing booked yet.`,
     replyMarkup: { inline_keyboard: rows },
   };
 }
