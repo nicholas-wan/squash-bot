@@ -345,14 +345,16 @@ export async function joinPickerView(env, chatId, from, isAdmin = false, now = D
   const dropped = bookings.length - Math.min(bookings.length, MAX_JOIN_BUTTONS);
   // Never claim to be the complete list when it is not.
   if (dropped) lines.push(`${dropped} further court${dropped === 1 ? '' : 's'} not shown.`);
-  if (isAdmin) {
-    for (const booking of bookings.slice(0, MAX_JOIN_BUTTONS)) {
-      const roster = rosters.get(booking.id) || [];
-      lines.push('');
-      lines.push(`${shortDate(booking.starts_at, tz)} · ` +
-        `${shortClock(booking.starts_at, tz)} · <b>${escapeHtml(courtName(booking))}</b>`);
-      lines.push(`👥 ${playerTags(roster)}`);
-    }
+  // You can see who you are playing with, on the courts you are on. An admin
+  // sees every court, because keeping the household straight is their job. The
+  // board names nobody, so this is the only place either of them can read it.
+  for (const booking of bookings.slice(0, MAX_JOIN_BUTTONS)) {
+    const roster = rosters.get(booking.id) || [];
+    if (!isAdmin && !roster.some((player) => player.slug === mySlug)) continue;
+    lines.push('');
+    lines.push(`${shortDate(booking.starts_at, tz)} · ` +
+      `${shortClock(booking.starts_at, tz)} · <b>${escapeHtml(courtName(booking))}</b>`);
+    lines.push(`👥 ${playerTags(roster)}`);
   }
   return {
     html: lines.join('\n'),

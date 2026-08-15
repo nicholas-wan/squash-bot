@@ -41,9 +41,11 @@ what you can do lives behind that one button instead, in a list that is private
 and can therefore differ per person.
 
 That list holds up to twelve courts: Join for the ones you are not on, Leave for
-the ones you are, `🔒 Full` for the rest, and **➕ Add booking**. Group admins
-also get **⚙️ Manage bookings**, and the roster of every court named underneath
-— the overview a shared board cannot carry. Manage names who is playing and how
+the ones you are, `🔒 Full` for the rest, and **➕ Add booking**. Each court you
+are on is named underneath with who you are playing alongside — the board names
+nobody, so this is where you read it, and only for your own courts. Group admins
+get **⚙️ Manage bookings** and every roster, since keeping the household
+straight is their job. Manage names who is playing and how
 many slots are left, edits the date, court, or time, deletes a booking, and lets
 admins open extra slots or take a player off. Every active court is listed, the
 same as the board. Those two admin actions stay open until the court ends,
