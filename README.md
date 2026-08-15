@@ -35,18 +35,18 @@ same handles on every row, and one shared pinned message cannot answer "am I on
 this?" per person anyway. Who is playing is named on the court's own panel
 behind ⚙️ Manage, which is private.
 
-The board carries one row of buttons however many courts it holds. Which court
-you want is asked behind 🙋 Join rather than on the pinned message, because a
-keyboard belongs to the message and so reads the same to everyone: a row per
-booking is noise, and it still could not say whether you are on that court.
+The board carries a single **🙋 Join** button. A keyboard belongs to the message,
+so anything drawn on the pinned board reads the same to everyone — which is why
+what you can do lives behind that one button instead, in a list that is private
+and can therefore differ per person.
 
-**🙋 Join** and **⚙️ Manage** both open a private list, so each can say
-something the shared board cannot. Join lists up to twelve courts: Join for the
-ones you are not on, Leave for the ones you are, `🔒 Full` for the rest. Manage
-names who is playing and how many slots are left, edits the date, court, or
-time, deletes a booking, and lets admins open extra slots or take a player off.
-Both list every active court, the same as the board. Those two admin actions
-stay open until the court ends,
+That list holds up to twelve courts: Join for the ones you are not on, Leave for
+the ones you are, `🔒 Full` for the rest, and **➕ Add booking**. Group admins
+also get **⚙️ Manage bookings**, and the roster of every court named underneath
+— the overview a shared board cannot carry. Manage names who is playing and how
+many slots are left, edits the date, court, or time, deletes a booking, and lets
+admins open extra slots or take a player off. Every active court is listed, the
+same as the board. Those two admin actions stay open until the court ends,
 which is how a no-show is kept off the tab, while joining and leaving close the
 moment it starts, so nobody can play the hour and then drop off the roster to
 dodge their share. Taking a slot tells everyone already on that court, privately.

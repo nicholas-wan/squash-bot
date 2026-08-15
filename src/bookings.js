@@ -295,18 +295,18 @@ function slotsLabel(roster, capacity) {
 // One row, whatever the board holds. Which court you want is asked behind 🙋
 // Join, where the list is private and can offer Join or Leave per court — a row
 // per booking made the pinned message noisy and still could not say which.
+// One button. Everything else — adding, managing, and the fuller picture an
+// admin needs — lives behind it, in a panel that is private and so can differ
+// per person, which a keyboard on a shared pinned message never can.
 function boardButtons(bookings) {
-  const row = [];
-  if (bookings.length) row.push({ text: '🙋 Join', callback_data: 'sb:join' });
-  row.push({ text: '➕ Add', callback_data: 'sb:add' });
-  if (bookings.length) row.push({ text: '⚙️ Manage', callback_data: 'sb:manage' });
-  return { inline_keyboard: [row] };
+  if (!bookings.length) return { inline_keyboard: [] };
+  return { inline_keyboard: [[{ text: '🙋 Join', callback_data: 'sb:join' }]] };
 }
 
 // The court list is built per person and sent only to them, so it can offer
 // Join for courts they are not on and Leave for the ones they are. A shared
 // keyboard on the pinned board could never tell the two apart.
-export async function joinPickerView(env, chatId, from, now = Date.now()) {
+export async function joinPickerView(env, chatId, from, isAdmin = false, now = Date.now()) {
   const bookings = (await activeBookings(env, chatId, now))
     .filter((booking) => booking.starts_at > now);
   if (!bookings.length) return null;
@@ -332,12 +332,30 @@ export async function joinPickerView(env, chatId, from, now = Date.now()) {
       rows.push([{ text: `🔒 Full · ${label}`, callback_data: `sb:full:${booking.id}` }]);
     }
   }
+  // The board carries a single Join button, so this panel is the only way in.
+  // Being private, it can hold what only an admin should act on — and name the
+  // rosters, which the shared board deliberately does not.
+  if (isAdmin) {
+    rows.push([{ text: '⚙️ Manage bookings', callback_data: 'sb:manage' }]);
+  }
+  rows.push([{ text: '➕ Add booking', callback_data: 'sb:add' }]);
   rows.push([{ text: '✕ Close', callback_data: 'sb:close' }]);
+
+  const lines = ['🎾 <b>Courts you can join</b>', '', 'Only you can see this list.'];
   const dropped = bookings.length - Math.min(bookings.length, MAX_JOIN_BUTTONS);
+  // Never claim to be the complete list when it is not.
+  if (dropped) lines.push(`${dropped} further court${dropped === 1 ? '' : 's'} not shown.`);
+  if (isAdmin) {
+    for (const booking of bookings.slice(0, MAX_JOIN_BUTTONS)) {
+      const roster = rosters.get(booking.id) || [];
+      lines.push('');
+      lines.push(`${shortDate(booking.starts_at, tz)} · ` +
+        `${shortClock(booking.starts_at, tz)} · <b>${escapeHtml(courtName(booking))}</b>`);
+      lines.push(`👥 ${playerTags(roster)}`);
+    }
+  }
   return {
-    html: '🎾 <b>Courts you can join</b>\n\nOnly you can see this list.'
-      // Never claim to be the complete list when it is not.
-      + (dropped ? `\n${dropped} further court${dropped === 1 ? '' : 's'} not shown.` : ''),
+    html: lines.join('\n'),
     replyMarkup: { inline_keyboard: rows },
   };
 }
