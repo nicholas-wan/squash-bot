@@ -496,33 +496,44 @@ export async function removePlayerView(env, chatId, bookingId) {
 export async function notifyRemovedPlayer(env, chatId, player, booking) {
   if (!player.user_id) return;
   const tz = await getTimezone(env, chatId);
-  await sendPrivately(env, reachableChat(env, player, chatId),
+  // The chat the admin acted in, for the same reason a join notice goes there.
+  await sendPrivately(env, chatId,
     `🚪 You were taken off <b>${escapeHtml(courtName(booking))}</b> on ` +
     `${formatDate(booking.starts_at, tz)} · ${formatTime(booking.starts_at, tz)}.\n` +
     'Tap the 🙋 button on the pinned board if that was a mistake.',
     player.user_id, endOfLocalDay(booking.starts_at, tz));
 }
 
-// The board no longer names who is on a court, so the people already on it are
-// told directly when somebody takes a slot. Each is messaged privately; the
-// joiner is skipped, and so is anyone whose numeric id is not known yet.
+// The board no longer names who is on a court, so the whole roster hears when
+// somebody takes a slot: the others that it happened, and the joiner as a
+// confirmation they can read after the toast has gone.
+//
+// Everything goes to the chat the tap came from, not the chat each roster row
+// was created in. An ephemeral message is only visible in the chat it is posted
+// to, and with DATA_CHAT_ID a roster spans groups, so honouring a row's own
+// chat_id delivered notices into whichever group that member was first seen in
+// — correct by the letter, invisible to somebody reading the other one.
 export async function notifyRosterOfJoin(env, chatId, booking, from) {
   const tz = await getTimezone(env, chatId);
   const roster = await rosterFor(env, booking.id);
   const joined = identity(from);
-  const html = `🙋 <b>${escapeHtml(joined.name)}</b> joined ` +
-    `${escapeHtml(courtName(booking))}\n` +
-    `${shortDate(booking.starts_at, tz)} · ` +
-    `${compactTimeRange(booking.starts_at, booking.ends_at, tz)} · ` +
-    `${slotsLabel(roster, booking.capacity || DEFAULT_CAPACITY)}`;
+  const where = `${escapeHtml(courtName(booking))}\n`
+    + `${shortDate(booking.starts_at, tz)} · `
+    + `${compactTimeRange(booking.starts_at, booking.ends_at, tz)} · `
+    + `${slotsLabel(roster, booking.capacity || DEFAULT_CAPACITY)}\n`
+    + `👥 ${playerTags(roster)}`;
+  const toOthers = `🙋 <b>${escapeHtml(joined.name)}</b> joined ${where}`;
+  const toJoiner = `✅ <b>You are on</b> ${where}`;
   // By id, not by slug: one person can briefly hold two roster rows while their
   // username is still being merged, and two copies of this would be a bug.
-  const told = new Set([from && from.id]);
+  const told = new Set();
   for (const player of roster) {
-    if (!player.user_id || player.slug === joined.slug || told.has(player.user_id)) continue;
+    if (!player.user_id || told.has(player.user_id)) continue;
     told.add(player.user_id);
-    await sendPrivately(env, reachableChat(env, player, chatId), html,
-      player.user_id, endOfLocalDay(booking.starts_at, tz));
+    const isJoiner = player.user_id === (from && from.id) || player.slug === joined.slug;
+    await sendPrivately(env, chatId, isJoiner ? toJoiner : toOthers,
+      player.user_id, endOfLocalDay(booking.starts_at, tz),
+      isJoiner ? { replyMarkup: { inline_keyboard: [[{ text: '👍 OK', callback_data: 'sb:ok' }]] } } : {});
   }
 }
 

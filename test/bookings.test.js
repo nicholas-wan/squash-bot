@@ -254,24 +254,32 @@ describe('public booking announcements', () => {
     expect(widest).toBeLessThanOrEqual(30);
   });
 
-  it('tells the people already on a court when somebody joins, once each', async () => {
+  it('tells the whole roster when somebody joins, once each', async () => {
     const requests = captureTelegram();
     const roster = [
-      { id: 1, booking_id: 3, chat_id: -123, user_id: 7, slug: 'u7', name: 'Nick' },
+      { id: 1, booking_id: 3, chat_id: -999, user_id: 7, slug: 'u7', name: 'Nick' },
       // The same human mid-merge: two rows, one id. One message, not two.
-      { id: 2, booking_id: 3, chat_id: -123, user_id: 7, slug: '@nick', name: '@nick' },
-      { id: 3, booking_id: 3, chat_id: -123, user_id: null, slug: '@bo', name: '@bo' },
-      { id: 4, booking_id: 3, chat_id: -123, user_id: 11, slug: '@alice', name: '@alice' },
+      { id: 2, booking_id: 3, chat_id: -999, user_id: 7, slug: '@nick', name: '@nick' },
+      { id: 3, booking_id: 3, chat_id: -999, user_id: null, slug: '@bo', name: '@bo' },
+      { id: 4, booking_id: 3, chat_id: -999, user_id: 11, slug: '@alice', name: '@alice' },
     ];
     await notifyRosterOfJoin(
-      { BOT_TOKEN: 'test', DB: bookingDb([storedBooking], roster) },
+      {
+        BOT_TOKEN: 'test', DB: bookingDb([storedBooking], roster),
+        ALLOWED_CHATS: '-123,-999', DATA_CHAT_ID: '-999',
+      },
       -123, storedBooking, { id: 11, username: 'alice' }
     );
     const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
-    // Nick once; @bo has no id to send to; the joiner is not told about herself.
-    expect(sent.map((request) => request.body.receiver_user_id)).toEqual([7]);
+    // Nick once; @bo has no id to send to; the joiner gets her own confirmation.
+    expect(sent.map((request) => request.body.receiver_user_id)).toEqual([7, 11]);
+    // Every one of them into the chat the tap came from. An ephemeral message
+    // is only visible there, and these rows were created in the other group.
+    expect(sent.every((request) => request.body.chat_id === -123)).toBe(true);
     expect(sent[0].body.text).toContain('@alice');
     expect(sent[0].body.text).toContain('Court 4');
+    expect(sent[1].body.text).toContain('You are on');
+    expect(sent[1].body.reply_markup.inline_keyboard[0][0].text).toBe('👍 OK');
   });
 
   it('lists a full court on the board, marked full', async () => {
