@@ -51,7 +51,14 @@ admins open extra slots or take a player off. Every active court is listed, the
 same as the board. Those two admin actions stay open until the court ends,
 which is how a no-show is kept off the tab, while joining and leaving close the
 moment it starts, so nobody can play the hour and then drop off the roster to
-dodge their share. Taking a slot tells everyone already on that court, privately.
+dodge their share. Taking a slot tells the court privately: the joiner gets a
+confirmation, everyone else gets word of it, both naming the roster. These and
+the removal notice go to the chat the tap came from, not the one each roster row
+was created in — an ephemeral message is only visible where it is posted, and
+under `DATA_CHAT_ID` a roster spans groups, so a notice sent by the row would
+land in whichever group that member was first seen in. The cost is that somebody
+who is only in the other group hears nothing. Reminders still follow the row,
+having no tap to take their bearings from.
 
 Every booking seats `DEFAULT_PLAYERS` plus whoever booked it. Players are keyed
 on their Telegram username, so someone named in config is the same person who
