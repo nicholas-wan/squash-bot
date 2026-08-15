@@ -260,7 +260,33 @@ describe('the private court list', () => {
     expect(view.replyMarkup.inline_keyboard[0][0].callback_data).toBe('sb:join:3');
   });
 
-  it('gives an admin the rosters and the manage button, and nobody else', async () => {
+  it('shows you who you are playing with, on the courts you are on', async () => {
+    const roster = [
+      { booking_id: 3, slug: '@alice', name: '@alice', user_id: 9 },
+      { booking_id: 3, slug: '@bo', name: '@Bo', user_id: null },
+    ];
+    const onIt = await joinPickerView(
+      { DB: db(roster) }, -123, { id: 9, username: 'alice' }, false, now
+    );
+    // Tagged where the id is known, plain @handle where it is not yet.
+    expect(onIt.html).toContain('👥 <a href="tg://user?id=9">@alice</a>, @Bo');
+    expect(onIt.html).toContain('Court 4');
+  });
+
+  it('does not name a roster to somebody who is not on that court', async () => {
+    const roster = [
+      { booking_id: 3, slug: '@alice', name: '@alice', user_id: 9 },
+      { booking_id: 3, slug: '@bo', name: '@Bo', user_id: null },
+    ];
+    const stranger = await joinPickerView(
+      { DB: db(roster) }, -123, { id: 11, username: 'bob' }, false, now
+    );
+    expect(stranger.html).not.toContain('@Bo');
+    // The court itself is still offered; only who is on it is withheld.
+    expect(stranger.replyMarkup.inline_keyboard[0][0].callback_data).toBe('sb:join:3');
+  });
+
+  it('gives an admin every roster and the manage button', async () => {
     const roster = [
       { booking_id: 3, slug: '@alice', name: '@alice', user_id: 9 },
       { booking_id: 3, slug: '@bo', name: '@Bo', user_id: null },
@@ -269,13 +295,11 @@ describe('the private court list', () => {
     const member = await joinPickerView({ DB: db(roster) }, -123, who, false, now);
     const admin = await joinPickerView({ DB: db(roster) }, -123, who, true, now);
 
-    const labels = (view) => view.replyMarkup.inline_keyboard.flat().map((b) => b.callback_data);
-    expect(labels(member)).not.toContain('sb:manage');
-    expect(labels(admin)).toContain('sb:manage');
-    // The board names nobody; this panel is private, so an admin sees who is on.
-    expect(member.html).not.toContain('@Bo');
+    const actions = (view) => view.replyMarkup.inline_keyboard.flat().map((b) => b.callback_data);
+    expect(actions(member)).not.toContain('sb:manage');
+    expect(actions(admin)).toContain('sb:manage');
+    // Not on that court, but keeping the household straight is their job.
     expect(admin.html).toContain('@Bo');
-    expect(admin.html).toContain('Court 4');
   });
 
   it('marks a full court rather than hiding it', async () => {
