@@ -1,6 +1,6 @@
 import {
   authorizeBookingChange, bookingPanelView, cancelBooking, deletePanelView, managerView,
-  notifyRemovedPlayer, notifyRosterOfJoin, removePlayerView, restoreBoardButtons,
+  notifyRemovedPlayer, notifyRosterOfChange, removePlayerView, restoreBoardButtons,
   runMaintenance, joinPickerView, updateBoard,
 } from './bookings.js';
 import {
@@ -180,8 +180,6 @@ async function handleBoardCallback(env, callback) {
     else if (join) result = await joinBooking(env, chatId, bookingId, callback.from);
     else result = await leaveBooking(env, chatId, bookingId, callback.from);
     const replies = {
-      joined: ['You are in. Everyone already on the court has been told.', false],
-      left: ['You are out. Your slot is free again.', false],
       already: ['You are already on that court.', true],
       absent: ['You were not on that court.', true],
       full: ['That court is full. A group admin can open another slot.', true],
@@ -190,14 +188,22 @@ async function handleBoardCallback(env, callback) {
     };
     // Telling the court comes first. updateBoard throws when the pinned message
     // cannot be edited or re-pinned, and the catch around this handler would
-    // then swallow the notification along with it — the people already on the
-    // court would never hear, for a reason that has nothing to do with them.
-    if (result.status === 'joined') {
-      await notifyRosterOfJoin(env, chatId, result.booking, callback.from);
-    }
+    // then swallow the notification along with it — the people on the court
+    // would never hear, for a reason that has nothing to do with them.
     if (result.status === 'joined' || result.status === 'left') {
+      const { othersTold } = await notifyRosterOfChange(
+        env, chatId, result.booking, callback.from, result.status
+      );
       await updateBoard(env, chatId);
       await refreshJoinPicker(env, callback);
+      // "Has been told" is only said when it is true: a roster row seeded from
+      // config with no id to send to, or a send Telegram refused, means
+      // somebody on the court has not heard.
+      const confirmed = result.status === 'left'
+        ? 'You are out. Your slot is free again.' : 'You are in.';
+      await answerCallback(env, callback.id, othersTold
+        ? `${confirmed} Everyone else on the court has been told.` : confirmed);
+      return true;
     }
     await answerCallback(env, callback.id, ...replies[result.status]);
     return true;

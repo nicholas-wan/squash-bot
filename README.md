@@ -51,8 +51,10 @@ admins open extra slots or take a player off. Every active court is listed, the
 same as the board. Those two admin actions stay open until the court ends,
 which is how a no-show is kept off the tab, while joining and leaving close the
 moment it starts, so nobody can play the hour and then drop off the roster to
-dodge their share. Taking a slot tells the court privately: the joiner gets a
-confirmation, everyone else gets word of it, both naming the roster. These and
+dodge their share. Taking a slot or giving one up tells the court privately: whoever
+tapped gets a confirmation, everyone else on the court gets word of it, both
+naming the roster as it stands after the tap — so a freed slot is news rather
+than something noticed later on the board. These and
 the removal notice go to the chat the tap came from, not the one each roster row
 was created in — an ephemeral message is only visible where it is posted, and
 under `DATA_CHAT_ID` a roster spans groups, so a notice sent by the row would
@@ -239,3 +241,9 @@ Found by review, none of them load-bearing enough to hold a release:
   the bot to be in that chat.
 - A chat dropped from `ALLOWED_CHATS` keeps its rows: they stop being charged and
   its old messages stop being purged.
+- Leaving deletes roster rows by current username, so a row seeded from a handle
+  its owner has since changed — carrying no numeric id to merge on — survives
+  their Leave. The confirmation says they are off while the ghost row still
+  holds a slot; an admin can take it off from ⚙️ Manage.
+- An admin taking a player off tells only that player. The rest of the court
+  hears about voluntary joins and leaves, but not about the slot a kick frees.

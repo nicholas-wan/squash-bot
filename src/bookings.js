@@ -13,6 +13,10 @@ import {
 
 export { getTimezone };
 
+// The one dismiss button every private note carries. index.js matches the
+// callback_data string exactly, so every site must share this literal.
+const OK_MARKUP = { inline_keyboard: [[{ text: '👍 OK', callback_data: 'sb:ok' }]] };
+
 function actorName(from) {
   return from ? identity(from).name : null;
 }
@@ -83,10 +87,7 @@ async function confirmToBooker(env, chatId, bookingId, booking, capacity, from, 
     `${formatDate(startsAt, tz)} · ${compactTimeRange(startsAt, endsAt, tz)}\n` +
     `👥 ${playerTags(roster)} · ${slotsLabel(roster, capacity)}`,
     from.id, endOfLocalDay(startsAt, tz),
-    {
-      callbackQueryId,
-      replyMarkup: { inline_keyboard: [[{ text: '👍 OK', callback_data: 'sb:ok' }]] },
-    }
+    { callbackQueryId, replyMarkup: OK_MARKUP }
   );
 }
 
@@ -492,7 +493,9 @@ export async function removePlayerView(env, chatId, bookingId) {
   };
 }
 
-// The person taken off is told privately. Nobody else needs the notification.
+// The person taken off is told privately. Deliberately narrower than the
+// join/leave notices: the rest of the court is not told a kick freed a slot —
+// an asymmetry recorded under Known gaps in the README, not an oversight.
 export async function notifyRemovedPlayer(env, chatId, player, booking) {
   if (!player.user_id) return;
   const tz = await getTimezone(env, chatId);
@@ -504,37 +507,78 @@ export async function notifyRemovedPlayer(env, chatId, player, booking) {
     player.user_id, endOfLocalDay(booking.starts_at, tz));
 }
 
-// The board no longer names who is on a court, so the whole roster hears when
-// somebody takes a slot: the others that it happened, and the joiner as a
-// confirmation they can read after the toast has gone.
+// The board no longer names who is on a court, so the whole roster hears when a
+// slot changes hands: the others that it happened, and whoever tapped as a
+// confirmation they can read after the toast has gone. Leaving is told the same
+// way as joining — a freed slot is news to the people still on the court, and
+// silence would read as the tap not having worked.
 //
 // Everything goes to the chat the tap came from, not the chat each roster row
 // was created in. An ephemeral message is only visible in the chat it is posted
 // to, and with DATA_CHAT_ID a roster spans groups, so honouring a row's own
 // chat_id delivered notices into whichever group that member was first seen in
 // — correct by the letter, invisible to somebody reading the other one.
-export async function notifyRosterOfJoin(env, chatId, booking, from) {
+export async function notifyRosterOfChange(env, chatId, booking, from, action) {
+  // Loud, not lenient: an unrecognised action falling through to one of the
+  // two messages would announce something that did not happen.
+  if (action !== 'joined' && action !== 'left') {
+    throw new Error(`notifyRosterOfChange: unknown action "${action}"`);
+  }
+  const left = action === 'left';
   const tz = await getTimezone(env, chatId);
+  // Read after the change, so the slot count and the roster line describe the
+  // court as it stands rather than as it was a moment ago.
   const roster = await rosterFor(env, booking.id);
-  const joined = identity(from);
+  const actor = identity(from);
   const where = `${escapeHtml(courtName(booking))}\n`
     + `${shortDate(booking.starts_at, tz)} · `
     + `${compactTimeRange(booking.starts_at, booking.ends_at, tz)} · `
     + `${slotsLabel(roster, booking.capacity || DEFAULT_CAPACITY)}\n`
     + `👥 ${playerTags(roster)}`;
-  const toOthers = `🙋 <b>${escapeHtml(joined.name)}</b> joined ${where}`;
-  const toJoiner = `✅ <b>You are on</b> ${where}`;
-  // By id, not by slug: one person can briefly hold two roster rows while their
-  // username is still being merged, and two copies of this would be a bug.
+  const toOthers = left
+    ? `🚪 <b>${escapeHtml(actor.name)}</b> left ${where}`
+    : `🙋 <b>${escapeHtml(actor.name)}</b> joined ${where}`;
+  const toActor = left ? `🚪 <b>You are off</b> ${where}` : `✅ <b>You are on</b> ${where}`;
+  // The actor's copy is planned first whichever way the slot went — a leaver's
+  // row is already deleted, so the roster could never produce it, and one path
+  // for both actions beats two that must agree. Dedup is by id, not slug: one
+  // person can briefly hold two roster rows while their username is still
+  // being merged, and two copies of this would be a bug.
   const told = new Set();
-  for (const player of roster) {
-    if (!player.user_id || told.has(player.user_id)) continue;
-    told.add(player.user_id);
-    const isJoiner = player.user_id === (from && from.id) || player.slug === joined.slug;
-    await sendPrivately(env, chatId, isJoiner ? toJoiner : toOthers,
-      player.user_id, endOfLocalDay(booking.starts_at, tz),
-      isJoiner ? { replyMarkup: { inline_keyboard: [[{ text: '👍 OK', callback_data: 'sb:ok' }]] } } : {});
+  const sends = [];
+  if (actor.userId) {
+    told.add(actor.userId);
+    sends.push({ isActor: true, userId: actor.userId, html: toActor });
   }
+  // A row with no id under another slug is someone seeded from config who has
+  // never posted: unreachable, which the caller's toast should not paper over.
+  let unreachable = false;
+  for (const player of roster) {
+    if (player.user_id && !told.has(player.user_id)) {
+      told.add(player.user_id);
+      sends.push({ isActor: false, userId: player.user_id, html: toOthers });
+    } else if (!player.user_id && player.slug !== actor.slug) {
+      unreachable = true;
+    }
+  }
+  // The sends are independent people, so they go out together rather than one
+  // round trip at a time, and their cleanup rows land in a single batch — a
+  // full court is a dozen messages, and each was two subrequests on its own.
+  const deleteAfter = endOfLocalDay(booking.starts_at, tz);
+  const cleanups = [];
+  const outcomes = await Promise.all(sends.map(async (send) => ({
+    isActor: send.isActor,
+    outcome: await sendPrivately(env, chatId, send.html, send.userId, deleteAfter,
+      send.isActor ? { replyMarkup: OK_MARKUP, cleanups } : { cleanups }),
+  })));
+  if (cleanups.length) await env.DB.batch(cleanups);
+  // Whether "everyone else has been told" would be true, so the caller's toast
+  // can repeat it only when it is.
+  return {
+    othersTold: !unreachable && outcomes
+      .filter((send) => !send.isActor)
+      .every((send) => send.outcome === 'private'),
+  };
 }
 
 export async function deletePanelView(env, chatId, bookingId) {
@@ -574,28 +618,40 @@ function endOfLocalDay(epochMs, tz) {
   );
 }
 
-async function scheduleCleanup(env, chatId, sent, receiverUserId, deleteAfter) {
+function cleanupStatement(env, chatId, sent, receiverUserId, deleteAfter) {
   const messageId = sent.ephemeral_message_id || sent.message_id;
-  if (!messageId) return;
-  await env.DB.prepare(
+  if (!messageId) return null;
+  return env.DB.prepare(
     `INSERT INTO sent_messages
       (chat_id, receiver_user_id, message_id, is_ephemeral, delete_after, created_at)
      VALUES (?, ?, ?, ?, ?, ?)`
   ).bind(
     chatId, receiverUserId || null, messageId,
     sent.ephemeral_message_id ? 1 : 0, deleteAfter, Date.now()
-  ).run();
+  );
+}
+
+async function scheduleCleanup(env, chatId, sent, receiverUserId, deleteAfter) {
+  const statement = cleanupStatement(env, chatId, sent, receiverUserId, deleteAfter);
+  if (statement) await statement.run();
 }
 
 // Telegram falls back to an ordinary group message when it cannot deliver an
 // ephemeral one. Anything addressed to one person — a receipt with the roster on
 // it, a reminder, a removal notice — would then sit in the group instead, so the
 // public copy is deleted and the caller decides what to do about the failure.
+//
+// A caller sending a burst can pass `cleanups`, an array the sent_messages row
+// is pushed into instead of written, to be committed in one env.DB.batch —
+// one subrequest for the burst rather than one INSERT per message.
 async function sendPrivately(env, chatId, html, userId, deleteAfter, options = {}) {
-  const sent = await sendMessage(env, chatId, html, { ...options, receiverUserId: userId });
+  const { cleanups, ...sendOptions } = options;
+  const sent = await sendMessage(env, chatId, html, { ...sendOptions, receiverUserId: userId });
   if (!sent.ok) return 'failed';
   if (sent.result && sent.result.ephemeral_message_id) {
-    await scheduleCleanup(env, chatId, sent.result, userId, deleteAfter);
+    const statement = cleanupStatement(env, chatId, sent.result, userId, deleteAfter);
+    if (cleanups) cleanups.push(statement);
+    else await statement.run();
     return 'private';
   }
   if (sent.result && sent.result.message_id) {

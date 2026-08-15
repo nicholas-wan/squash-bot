@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   addBooking, bookingPanelView, BookingConflictError, boardHtml, cancelBooking,
-  deletePanelView, managerView, notifyRosterOfJoin, runMaintenance, updateBooking,
+  deletePanelView, managerView, notifyRosterOfChange, runMaintenance, updateBooking,
 } from '../src/bookings.js';
 
 const startsAt = Date.UTC(2026, 7, 19, 13, 0);
@@ -263,23 +263,100 @@ describe('public booking announcements', () => {
       { id: 3, booking_id: 3, chat_id: -999, user_id: null, slug: '@bo', name: '@bo' },
       { id: 4, booking_id: 3, chat_id: -999, user_id: 11, slug: '@alice', name: '@alice' },
     ];
-    await notifyRosterOfJoin(
+    await notifyRosterOfChange(
       {
         BOT_TOKEN: 'test', DB: bookingDb([storedBooking], roster),
         ALLOWED_CHATS: '-123,-999', DATA_CHAT_ID: '-999',
       },
-      -123, storedBooking, { id: 11, username: 'alice' }
+      -123, storedBooking, { id: 11, username: 'alice' }, 'joined'
     );
     const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
-    // Nick once; @bo has no id to send to; the joiner gets her own confirmation.
-    expect(sent.map((request) => request.body.receiver_user_id)).toEqual([7, 11]);
+    // The joiner's confirmation first, then Nick once; @bo has no id to send to.
+    expect(sent.map((request) => request.body.receiver_user_id)).toEqual([11, 7]);
     // Every one of them into the chat the tap came from. An ephemeral message
     // is only visible there, and these rows were created in the other group.
     expect(sent.every((request) => request.body.chat_id === -123)).toBe(true);
-    expect(sent[0].body.text).toContain('@alice');
-    expect(sent[0].body.text).toContain('Court 4');
-    expect(sent[1].body.text).toContain('You are on');
-    expect(sent[1].body.reply_markup.inline_keyboard[0][0].text).toBe('👍 OK');
+    expect(sent[0].body.text).toContain('You are on');
+    expect(sent[0].body.reply_markup.inline_keyboard[0][0].text).toBe('👍 OK');
+    expect(sent[1].body.text).toContain('@alice');
+    expect(sent[1].body.text).toContain('Court 4');
+  });
+
+  it('refuses to announce an action it does not recognise', async () => {
+    captureTelegram();
+    await expect(notifyRosterOfChange(
+      { BOT_TOKEN: 'test', DB: bookingDb([storedBooking], []) },
+      -123, storedBooking, { id: 11, username: 'alice' }, 'removed'
+    )).rejects.toThrow('unknown action');
+  });
+
+  it('admits when somebody on the court could not be told', async () => {
+    captureTelegram();
+    const roster = [
+      { id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick' },
+      // Seeded from config, never posted: no id to send to.
+      { id: 2, booking_id: 3, user_id: null, slug: '@bo', name: '@bo' },
+    ];
+    const { othersTold } = await notifyRosterOfChange(
+      { BOT_TOKEN: 'test', DB: bookingDb([storedBooking], roster) },
+      -123, storedBooking, { id: 11, username: 'alice' }, 'joined'
+    );
+    expect(othersTold).toBe(false);
+  });
+
+  it('writes the cleanup rows for a burst of private copies in one batch', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      JSON.stringify({ ok: true, result: { ephemeral_message_id: 99 } }),
+      { headers: { 'Content-Type': 'application/json' } }
+    )));
+    const roster = [
+      { id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick' },
+      { id: 2, booking_id: 3, user_id: 11, slug: '@alice', name: '@alice' },
+    ];
+    const db = bookingDb([storedBooking], roster);
+    const batches = [];
+    db.batch = async (statements) => {
+      batches.push(statements);
+      return statements.map(() => ({ success: true }));
+    };
+    const { othersTold } = await notifyRosterOfChange(
+      { BOT_TOKEN: 'test', DB: db },
+      -123, storedBooking, { id: 11, username: 'alice' }, 'joined'
+    );
+    // Every private copy landed, so the toast may say so — and the two
+    // sent_messages rows went in one batch, not one INSERT per send.
+    expect(othersTold).toBe(true);
+    expect(batches).toHaveLength(1);
+    expect(batches[0]).toHaveLength(2);
+  });
+
+  it('tells the rest of the court when somebody leaves, and the leaver too', async () => {
+    const requests = captureTelegram();
+    // The roster as it stands after the delete: @alice has already gone off it,
+    // so her own copy cannot be found in the loop the others are told from.
+    const roster = [
+      { id: 1, booking_id: 3, chat_id: -999, user_id: 7, slug: 'u7', name: 'Nick' },
+      { id: 3, booking_id: 3, chat_id: -999, user_id: null, slug: '@bo', name: '@bo' },
+    ];
+    await notifyRosterOfChange(
+      {
+        BOT_TOKEN: 'test', DB: bookingDb([storedBooking], roster),
+        ALLOWED_CHATS: '-123,-999', DATA_CHAT_ID: '-999',
+      },
+      -123, storedBooking, { id: 11, username: 'alice' }, 'left'
+    );
+    const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
+    // The leaver first, then the one player left who has an id to send to.
+    expect(sent.map((request) => request.body.receiver_user_id)).toEqual([11, 7]);
+    expect(sent.every((request) => request.body.chat_id === -123)).toBe(true);
+    expect(sent[0].body.text).toContain('You are off');
+    expect(sent[0].body.reply_markup.inline_keyboard[0][0].text).toBe('👍 OK');
+    expect(sent[1].body.text).toContain('@alice');
+    expect(sent[1].body.text).toContain('left');
+    // The freed slot is what the others are being told about, so it is counted
+    // from the roster as it is now rather than as it was before the tap.
+    expect(sent[1].body.text).toContain('1 slot');
+    expect(sent[1].body.text).not.toContain('@alice</b> joined');
   });
 
   it('lists a full court on the board, marked full', async () => {
