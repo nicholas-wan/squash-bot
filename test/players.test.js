@@ -244,7 +244,7 @@ describe('the private court list', () => {
   it('offers Leave, never Join, for a court you are already on', async () => {
     const view = await joinPickerView(
       { DB: db([{ booking_id: 3, slug: '@alice', name: '@alice', user_id: 9 }]) },
-      -123, { id: 9, username: 'Alice' }, now
+      -123, { id: 9, username: 'Alice' }, false, now
     );
     const button = view.replyMarkup.inline_keyboard[0][0];
     expect(button.text).toContain('🚪 Leave');
@@ -255,16 +255,34 @@ describe('the private court list', () => {
   it('offers Join to somebody who is not on it', async () => {
     const view = await joinPickerView(
       { DB: db([{ booking_id: 3, slug: '@alice', name: '@alice', user_id: 9 }]) },
-      -123, { id: 11, username: 'bob' }, now
+      -123, { id: 11, username: 'bob' }, false, now
     );
     expect(view.replyMarkup.inline_keyboard[0][0].callback_data).toBe('sb:join:3');
+  });
+
+  it('gives an admin the rosters and the manage button, and nobody else', async () => {
+    const roster = [
+      { booking_id: 3, slug: '@alice', name: '@alice', user_id: 9 },
+      { booking_id: 3, slug: '@bo', name: '@Bo', user_id: null },
+    ];
+    const who = { id: 11, username: 'bob' };
+    const member = await joinPickerView({ DB: db(roster) }, -123, who, false, now);
+    const admin = await joinPickerView({ DB: db(roster) }, -123, who, true, now);
+
+    const labels = (view) => view.replyMarkup.inline_keyboard.flat().map((b) => b.callback_data);
+    expect(labels(member)).not.toContain('sb:manage');
+    expect(labels(admin)).toContain('sb:manage');
+    // The board names nobody; this panel is private, so an admin sees who is on.
+    expect(member.html).not.toContain('@Bo');
+    expect(admin.html).toContain('@Bo');
+    expect(admin.html).toContain('Court 4');
   });
 
   it('marks a full court rather than hiding it', async () => {
     const full = ['@a', '@b', '@c'].map((slug) => ({
       booking_id: 3, slug, name: slug, user_id: null,
     }));
-    const view = await joinPickerView({ DB: db(full) }, -123, { id: 11, username: 'bob' }, now);
+    const view = await joinPickerView({ DB: db(full) }, -123, { id: 11, username: 'bob' }, false, now);
     // The board lists it, so a list that omitted it would read as a bug.
     const button = view.replyMarkup.inline_keyboard[0][0];
     expect(button.text).toContain('🔒 Full');
@@ -275,13 +293,13 @@ describe('the private court list', () => {
     const full = ['@a', '@b', '@bob'].map((slug) => ({
       booking_id: 3, slug, name: slug, user_id: null,
     }));
-    const view = await joinPickerView({ DB: db(full) }, -123, { id: 11, username: 'bob' }, now);
+    const view = await joinPickerView({ DB: db(full) }, -123, { id: 11, username: 'bob' }, false, now);
     const button = view.replyMarkup.inline_keyboard[0][0];
     expect(button.text).toContain('🚪 Leave');
     expect(button.callback_data).toBe('sb:leave:3');
   });
 
   it('hides a court that has already started', async () => {
-    expect(await joinPickerView({ DB: db([]) }, -123, { id: 11 }, startsAt + 60000)).toBe(null);
+    expect(await joinPickerView({ DB: db([]) }, -123, { id: 11 }, false, startsAt + 60000)).toBe(null);
   });
 });

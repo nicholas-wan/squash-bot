@@ -366,10 +366,11 @@ describe('Telegram commands', () => {
     const board = requests.find((request) => request.url.endsWith('/editMessageText'));
     expect(board.body.message_id).toBe(55);
     // The board keeps one compact row; picking a court happens behind Join.
-    // One row, whatever the board holds. Choosing a court happens behind Join.
-    expect(board.body.reply_markup.inline_keyboard).toHaveLength(1);
-    expect(board.body.reply_markup.inline_keyboard[0].map((button) => button.callback_data))
-      .toEqual(['sb:join', 'sb:add', 'sb:manage']);
+    // One button. Adding, managing and the admin overview live behind it, in a
+    // panel that is private and so can differ per person.
+    expect(board.body.reply_markup.inline_keyboard).toEqual([
+      [{ text: '🙋 Join', callback_data: 'sb:join' }],
+    ]);
   });
 
   it('toggles one shared court button by who tapped it', async () => {

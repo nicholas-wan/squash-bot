@@ -144,7 +144,9 @@ async function handleBoardCallback(env, callback) {
     return true;
   }
   if (data === 'sb:join') {
-    const view = await joinPickerView(env, chatId, callback.from);
+    const view = await joinPickerView(
+      env, chatId, callback.from, await isChatAdmin(env, chatId, callback.from)
+    );
     if (!view) {
       await answerCallback(env, callback.id, 'There is nothing to join yet.', true);
       return true;
@@ -278,7 +280,9 @@ async function refreshJoinPicker(env, callback) {
   const ephemeralId = callback.message && callback.message.ephemeral_message_id;
   if (!ephemeralId) return;
   const chatId = callback.message.chat.id;
-  const view = await joinPickerView(env, chatId, callback.from);
+  const view = await joinPickerView(
+    env, chatId, callback.from, await isChatAdmin(env, chatId, callback.from)
+  );
   await editEphemeralMessage(
     env, chatId, callback.from.id, ephemeralId,
     view ? view.html : '🎾 <i>Nothing left to join.</i>',
