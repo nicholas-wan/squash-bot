@@ -85,8 +85,7 @@ async function handleBoardCallback(env, callback) {
     return true;
   }
   if (data === 'sb:manage') {
-    await showPanel(env, callback,
-      await managerView(env, chatId, callback.from, await isChatAdmin(env, chatId, callback.from)));
+    await showPanel(env, callback, await managerView(env, chatId));
     await answerCallback(env, callback.id);
     return true;
   }

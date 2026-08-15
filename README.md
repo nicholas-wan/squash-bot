@@ -27,24 +27,26 @@ in 5 days · Mon 17 Aug
 ```
 
 Two short lines and a gap, because a phone wraps much past thirty characters and
-a wrapped court number reads as a wall. The roster is not on the board: with
-`DEFAULT_PLAYERS` seating the same people every time it was the same handles on
-every row, and one shared pinned message cannot answer "am I on this?" per
-person anyway. A court with no slots left comes off the board entirely — it is
-only the business of the people playing it, who still see it under 🙋 Join.
+a wrapped court number reads as a wall. Every active court is listed, booked-out
+ones included and marked `full`: the board answers "what is booked", and a court
+missing from it would read as a court nobody took. The roster is not on the
+board — with `DEFAULT_PLAYERS` seating the same people every time it was the
+same handles on every row, and one shared pinned message cannot answer "am I on
+this?" per person anyway. Who is playing is named on the court's own panel
+behind ⚙️ Manage, which is private.
 
 The board carries one row of buttons however many courts it holds. Which court
 you want is asked behind 🙋 Join rather than on the pinned message, because a
 keyboard belongs to the message and so reads the same to everyone: a row per
 booking is noise, and it still could not say whether you are on that court.
 
-**🙋 Join** and **⚙️ Manage** both open a private list, which is the only place
-a full court can appear: one pinned message shows everyone the same thing, so
-anything drawn on it is public. Join lists up to twelve courts, offering Join
-for the ones you are not on and Leave for the ones you are. Manage edits the
-date, court, or time, deletes a booking, and lets admins open extra slots or take
-a player off; a full court is listed there only for somebody on it, whoever
-booked it, or an admin. Those two admin actions stay open until the court ends,
+**🙋 Join** and **⚙️ Manage** both open a private list, so each can say
+something the shared board cannot. Join lists up to twelve courts: Join for the
+ones you are not on, Leave for the ones you are, `🔒 Full` for the rest. Manage
+names who is playing and how many slots are left, edits the date, court, or
+time, deletes a booking, and lets admins open extra slots or take a player off.
+Both list every active court, the same as the board. Those two admin actions
+stay open until the court ends,
 which is how a no-show is kept off the tab, while joining and leaving close the
 moment it starts, so nobody can play the hour and then drop off the roster to
 dodge their share. Taking a slot tells everyone already on that court, privately.

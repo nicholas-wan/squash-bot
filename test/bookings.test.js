@@ -191,21 +191,16 @@ describe('public booking announcements', () => {
     expect(label).not.toContain('#3');
   });
 
-  it('keeps a full court out of the manager for anyone unconnected to it', async () => {
+  it('lists a full court in the manager, matching the board', async () => {
     const full = ['@a', '@b', '@c'].map((slug, index) => ({
       id: index + 1, booking_id: 3, user_id: null, slug, name: slug,
     }));
-    const env = { BOT_TOKEN: 'test', DB: bookingDb([storedBooking], full) };
-    const stranger = await managerView(env, -123, { id: 99, username: 'zoe' }, false, startsAt - 1);
-    // Manage used to redraw the shared pinned keyboard, publishing this to all.
-    expect(stranger.replyMarkup.inline_keyboard.flat()
-      .some((button) => button.text.includes('Court 4'))).toBe(false);
-    expect(stranger.html).toContain('Nothing here you can change');
-
-    const player = await managerView(env, -123, { id: 98, username: 'a' }, false, startsAt - 1);
-    expect(player.replyMarkup.inline_keyboard[0][0].callback_data).toBe('sb:pick:3');
-    const admin = await managerView(env, -123, { id: 99, username: 'zoe' }, true, startsAt - 1);
-    expect(admin.replyMarkup.inline_keyboard[0][0].callback_data).toBe('sb:pick:3');
+    const view = await managerView(
+      { BOT_TOKEN: 'test', DB: bookingDb([storedBooking], full) }, -123, startsAt - 1
+    );
+    // Hiding it here would protect nothing the pinned board does not show, and
+    // would leave a booked-out court with no way to edit or delete it.
+    expect(view.replyMarkup.inline_keyboard[0][0].callback_data).toBe('sb:pick:3');
   });
 
   it('names who is playing on the court panel', async () => {
@@ -279,18 +274,15 @@ describe('public booking announcements', () => {
     expect(sent[0].body.text).toContain('Court 4');
   });
 
-  it('keeps a full court off the public board', async () => {
+  it('lists a full court on the board, marked full', async () => {
     const full = ['u7', '@dodgerblueee', '@alice'].map((slug, index) => ({
       id: index + 1, booking_id: 3, user_id: null, slug, name: slug,
     }));
     const html = await boardHtml(
       { DB: bookingDb([storedBooking], full) }, -123, Date.UTC(2026, 7, 12, 12, 0)
     );
-    // The court is nobody else's business once there is no room on it.
-    expect(html).not.toContain('Court 4');
-    expect(html).not.toContain('Wed 19 Aug');
-    // But the board stays pinned, or the Add and Join buttons go with it.
-    expect(html).toContain('Every court is taken');
+    // A court missing from the board would read as a court nobody booked.
+    expect(html).toContain('in 7 days · Wed 19 Aug\n9pm · <b>Court 4</b> · full');
   });
 
   it('rejects an overlapping court booking in the insert itself', async () => {
