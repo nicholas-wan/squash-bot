@@ -277,9 +277,12 @@ describe('public booking announcements', () => {
     // is only visible there, and these rows were created in the other group.
     expect(sent.every((request) => request.body.chat_id === -123)).toBe(true);
     expect(sent[0].body.text).toContain('You are on');
-    expect(sent[0].body.reply_markup.inline_keyboard[0][0].text).toBe('👍 OK');
     expect(sent[1].body.text).toContain('@alice');
     expect(sent[1].body.text).toContain('Court 4');
+    // Every private note can be dismissed, not just the tapper's own.
+    for (const request of sent) {
+      expect(request.body.reply_markup.inline_keyboard[0][0].text).toBe('👍 OK');
+    }
   });
 
   it('refuses to announce an action it does not recognise', async () => {

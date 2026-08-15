@@ -85,7 +85,12 @@ everyone still on it owes.
 
 A second pinned message lists who owes the organiser. Group admins clear a
 balance from it, which appends a payment to the ledger rather than erasing
-anything. It unpins itself once everyone is settled.
+anything. It unpins itself once everyone is settled. Its 🧾 **My tab** button
+sends anyone their own private breakdown — every charge and payment behind
+their total, matched by username or id so history under an old handle is
+still owned and shown. Group admins additionally get a row per open balance
+under their own breakdown, each opening that person's tab, since collecting
+is their job; members can never see anyone else's.
 
 The 2026 holiday list in `src/pricing.js` should be checked against mom.gov.sg
 each December. `PUBLIC_HOLIDAYS` replaces that list rather than adding to it, so
