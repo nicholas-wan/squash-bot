@@ -90,7 +90,11 @@ sends anyone their own private breakdown — every charge and payment behind
 their total, matched by username or id so history under an old handle is
 still owned and shown. Group admins additionally get a row per open balance
 under their own breakdown, each opening that person's tab, since collecting
-is their job; members can never see anyone else's.
+is their job; members can never see anyone else's. Clearing a balance sends
+the debtor a private receipt, and once a month — the first cron tick past 9am
+local — everyone still owing is told their own total the same private way, so
+the bot does the asking rather than a person. Both need the debtor's numeric
+id, so a config-seeded player hears nothing until they post once.
 
 The 2026 holiday list in `src/pricing.js` should be checked against mom.gov.sg
 each December. `PUBLIC_HOLIDAYS` replaces that list rather than adding to it, so
@@ -209,11 +213,12 @@ npm run db:init
 npm run db:migrate:002
 npm run db:migrate:003
 npm run db:migrate:004
+npm run db:migrate:005
 npm run db:verify
 ```
 
 Run them in that order. Everything the migrations used to create now lives in
-`schema.sql`, leaving 002 and 003 as `ALTER TABLE` alone and 004 as a no-op,
+`schema.sql`, leaving 002, 003, and 005 as `ALTER TABLE` alone and 004 as a no-op,
 because `wrangler d1 execute --file` is atomic: one failed statement rolls the
 whole file back, so a `CREATE` sharing a file with an `ALTER` would be skipped on
 a re-run rather than applied. That is what makes a re-run harmless — an already

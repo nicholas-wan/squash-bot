@@ -4,7 +4,8 @@ import {
 } from './players.js';
 import { allowedChats, boardChats, dataChatId, reachableChat, sharingData } from './scope.js';
 import { getTimezone, updatePinnedMessage } from './settings.js';
-import { chargeBooking, updateTab } from './tab.js';
+import { formatMoney } from './pricing.js';
+import { chargeBooking, tabBalances, updateTab } from './tab.js';
 import { formatDate, formatTime, localParts, zonedEpoch } from './time.js';
 import {
   deleteEphemeralMessage, deleteMessage, editReplyMarkup, escapeHtml, mentionHtml,
@@ -855,11 +856,77 @@ async function removeExpiredBookings(env, now) {
   }
 }
 
+// "in 5 days" is only true on the day it was written. Nothing else touches a
+// board that nobody books or joins, so each one is redrawn once per local day,
+// stamped first so a board Telegram refuses to edit is retried tomorrow rather
+// than every minute.
+async function refreshStaleBoards(env, now) {
+  for (const chatId of allowedChats(env)) {
+    const tz = await getTimezone(env, chatId);
+    const parts = localParts(now, tz);
+    const today = `${parts.y}-${parts.mo}-${parts.d}`;
+    const setting = await env.DB.prepare(
+      'SELECT board_message_id, board_day FROM settings WHERE chat_id = ?'
+    ).bind(chatId).first();
+    if (!setting || !setting.board_message_id || setting.board_day === today) continue;
+    await env.DB.prepare('UPDATE settings SET board_day = ? WHERE chat_id = ?')
+      .bind(today, chatId).run();
+    await updateBoard(env, chatId);
+  }
+}
+
+// Once a month, everyone still owing hears their own total — in the group, as
+// an ephemeral message only they can see, the same as every other private
+// note. The bot doing the asking is the point: nobody has to be the naggy one.
+// The month is stamped before sending so a retried cron cannot ask twice, and
+// nothing goes out before 9am local.
+async function sendMonthlyTabNotices(env, now) {
+  const chats = allowedChats(env);
+  if (!chats.length) return;
+  const chatId = dataChatId(env, chats[0]);
+  const tz = await getTimezone(env, chatId);
+  const parts = localParts(now, tz);
+  if (parts.h < 9) return;
+  const month = `${parts.y}-${parts.mo}`;
+  const setting = await env.DB.prepare(
+    'SELECT nudged_month FROM settings WHERE chat_id = ?'
+  ).bind(chatId).first();
+  if (setting && setting.nudged_month === month) return;
+  await env.DB.prepare(
+    `INSERT INTO settings (chat_id, nudged_month) VALUES (?, ?)
+     ON CONFLICT(chat_id) DO UPDATE SET nudged_month = excluded.nudged_month`
+  ).bind(chatId, month).run();
+  const monthName = new Intl.DateTimeFormat('en-SG', {
+    timeZone: tz, month: 'long', year: 'numeric',
+  }).format(new Date(now));
+  const deleteAfter = endOfLocalDay(now, tz);
+  for (const entry of await tabBalances(env, chatId)) {
+    // A row without a numeric id cannot be reached until that player posts
+    // once; the pinned tab still names them.
+    if (entry.balance <= 0 || !entry.user_id) continue;
+    await sendPrivately(env, chatId,
+      `💰 <b>Your squash tab — ${escapeHtml(monthName)}</b>\n`
+      + `Outstanding: <b>${formatMoney(entry.balance)}</b>\n\n`
+      + 'Tap 🧾 <b>My tab</b> on the pinned tab for the line-by-line story.',
+      entry.user_id, deleteAfter, { replyMarkup: OK_MARKUP });
+  }
+}
+
 export async function runMaintenance(env, now = Date.now()) {
   try {
     await sendPreReminders(env, now);
   } catch (error) {
     console.log(`Two-hour reminder maintenance failed: ${error.stack || error}`);
+  }
+  try {
+    await refreshStaleBoards(env, now);
+  } catch (error) {
+    console.log(`Board refresh maintenance failed: ${error.stack || error}`);
+  }
+  try {
+    await sendMonthlyTabNotices(env, now);
+  } catch (error) {
+    console.log(`Monthly tab notice maintenance failed: ${error.stack || error}`);
   }
   try {
     await sendDueReminders(env, now);

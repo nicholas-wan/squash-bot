@@ -580,6 +580,10 @@ describe('public booking announcements', () => {
           return {
             async first() {
               if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+              // No pinned board and a claimed month, so the daily redraw and
+              // the monthly notices stay out of this sweep's request count.
+              if (sql.includes('board_day')) return null;
+              if (sql.includes('nudged_month')) return null;
               if (sql.includes('board_message_id')) return { board_message_id: 55 };
               return null;
             },
@@ -653,5 +657,104 @@ describe('public booking announcements', () => {
     expect(sent[1].body).not.toHaveProperty('receiver_user_id');
     expect(sent[1].body.text).toContain('tg://user?id=7');
     expect(sent[1].body.text).toContain('tg://user?id=9');
+  });
+
+  // 20:00 SGT on 12 Aug 2026: past the 9am notice threshold, mid-month.
+  const cronNow = Date.UTC(2026, 7, 12, 12, 0);
+
+  function maintenanceDb({ boardDay = null, nudgedMonth = '2026-8', balances = [] } = {}) {
+    const seen = [];
+    return {
+      seen,
+      prepare(sql) {
+        return { bind(...args) {
+          seen.push({ sql, args });
+          return {
+            async first() {
+              if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+              if (sql.includes('board_day')) {
+                return { board_message_id: 55, board_day: boardDay };
+              }
+              if (sql.includes('nudged_month')) return { nudged_month: nudgedMonth };
+              if (sql.includes('board_message_id')) return { board_message_id: 55 };
+              return null;
+            },
+            async all() {
+              if (sql.includes('GROUP BY')) return { results: balances };
+              if (sql.includes('FROM booking_players')) return { results: [] };
+              if (sql.includes('FROM ledger')) return { results: [] };
+              return { results: sql.includes('ends_at >') ? [storedBooking] : [] };
+            },
+            async run() { return { meta: { changes: 1 } }; },
+          };
+        } };
+      },
+    };
+  }
+
+  it('redraws each board once per local day so relative labels stay true', async () => {
+    const requests = captureTelegram();
+    const stale = maintenanceDb({ boardDay: '2026-8-11' });
+    await runMaintenance({ BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: stale }, cronNow);
+    const edits = requests.filter((request) => request.url.endsWith('/editMessageText'));
+    expect(edits).toHaveLength(1);
+    expect(edits[0].body.message_id).toBe(55);
+    expect(edits[0].body.text).toContain('Court 4');
+    // The stamp is written before the redraw, so a board Telegram refuses to
+    // edit is retried tomorrow rather than every minute.
+    expect(stale.seen.find((query) => query.sql.includes('SET board_day')).args)
+      .toEqual(['2026-8-12', -123]);
+
+    requests.length = 0;
+    await runMaintenance({
+      BOT_TOKEN: 'test', ALLOWED_CHATS: '-123',
+      DB: maintenanceDb({ boardDay: '2026-8-12' }),
+    }, cronNow);
+    expect(requests.filter((request) => request.url.endsWith('/editMessageText')))
+      .toHaveLength(0);
+  });
+
+  it('tells each debtor their balance once a month, privately, in the group', async () => {
+    const requests = captureTelegram();
+    const db = maintenanceDb({
+      boardDay: '2026-8-12',
+      nudgedMonth: '2026-7',
+      balances: [
+        // No id to send to until they post once; the pinned tab still names them.
+        { slug: '@thadduu', user_id: null, name: '@thadduu', balance: 1400 },
+        { slug: 'u9', user_id: 9, name: '@alice', balance: 200 },
+        { slug: 'u5', user_id: 5, name: '@settled', balance: -100 },
+      ],
+    });
+    await runMaintenance({ BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: db }, cronNow);
+    const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
+    expect(sent).toHaveLength(1);
+    expect(sent[0].body.chat_id).toBe(-123);
+    expect(sent[0].body.receiver_user_id).toBe(9);
+    expect(sent[0].body.text).toContain('August 2026');
+    expect(sent[0].body.text).toContain('$2.00');
+    expect(sent[0].body.text).toContain('My tab');
+    expect(db.seen.find((query) => query.sql.includes('nudged_month) VALUES')).args)
+      .toEqual([-123, '2026-8']);
+
+    // Already stamped for this month: quiet.
+    requests.length = 0;
+    await runMaintenance({
+      BOT_TOKEN: 'test', ALLOWED_CHATS: '-123',
+      DB: maintenanceDb({ boardDay: '2026-8-12', nudgedMonth: '2026-8' }),
+    }, cronNow);
+    expect(requests.filter((request) => request.url.endsWith('/sendMessage')))
+      .toHaveLength(0);
+  });
+
+  it('holds the monthly notice back before 9am local time', async () => {
+    const requests = captureTelegram();
+    // 22:00 UTC the day before = 6:00 SGT on the 12th.
+    await runMaintenance({
+      BOT_TOKEN: 'test', ALLOWED_CHATS: '-123',
+      DB: maintenanceDb({ boardDay: '2026-8-12', nudgedMonth: '2026-7' }),
+    }, Date.UTC(2026, 7, 11, 22, 0));
+    expect(requests.filter((request) => request.url.endsWith('/sendMessage')))
+      .toHaveLength(0);
   });
 });
