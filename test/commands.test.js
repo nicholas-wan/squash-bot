@@ -459,6 +459,51 @@ describe('Telegram commands', () => {
     expect(told[0].body.text).toContain('You are off');
   });
 
+  it('receipts the debtor privately when an admin clears their balance', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      const result = String(url).endsWith('/getChatMember')
+        ? { status: 'creator' } : { message_id: 1 };
+      return new Response(JSON.stringify({ ok: true, result }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const db = {
+      prepare(sql) {
+        return { bind() { return {
+          async first() {
+            if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+            if (sql.includes('board_message_id')) {
+              return { board_message_id: null, tab_message_id: 66 };
+            }
+            return null;
+          },
+          async all() {
+            return { results: sql.includes('GROUP BY')
+              ? [{ slug: 'u42', user_id: 42, name: '@bo', balance: 1400 }] : [] };
+          },
+          async run() { return { meta: { changes: 1 } }; },
+        }; } };
+      },
+    };
+    await handleUpdate({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db }, {
+      callback_query: {
+        id: 'callback-1', data: 'tb:paid:u42',
+        from: { id: 7, username: 'nicholaswan' },
+        message: { message_id: 55, chat: { id: -123456789 } },
+      },
+    });
+    const receipt = requests
+      .filter((request) => request.url.endsWith('/sendMessage'))
+      .find((request) => request.body.receiver_user_id === 42);
+    expect(receipt.body.text).toContain('Payment received');
+    expect(receipt.body.text).toContain('$14.00');
+    expect(receipt.body.reply_markup.inline_keyboard[0][0].text).toBe('👍 OK');
+    const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+    expect(answer.body.text).toContain('cleared');
+  });
+
   it('refuses extra slots and tab settlement to members who are not admins', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
@@ -610,13 +655,24 @@ describe('Telegram commands', () => {
       ADMIN_SECRET: 'admin-secret', ALLOWED_CHATS: '', DB: emptyDb(),
     });
     expect(response.status).toBe(200);
-    const commandRequest = requests.find((request) => request.url.endsWith('/setMyCommands'));
-    expect(commandRequest.body.commands.map((command) => command.command))
-      .toEqual(['book', 'courts', 'tab', 'cancel', 'help']);
+    const menus = requests.filter((request) => request.url.endsWith('/setMyCommands'));
+    expect(menus).toHaveLength(3);
+    // The default menu carries everything; the group menu drops /cancel —
+    // parameterised and rarely a member's to run — and group admins get it back.
+    const byScope = new Map(menus.map((request) => [
+      request.body.scope ? request.body.scope.type : 'default',
+      request.body.commands.map((command) => command.command),
+    ]));
+    expect(byScope.get('default')).toEqual(['book', 'courts', 'tab', 'help', 'cancel']);
+    expect(byScope.get('all_group_chats')).toEqual(['book', 'courts', 'tab', 'help']);
+    expect(byScope.get('all_chat_administrators'))
+      .toEqual(['book', 'courts', 'tab', 'help', 'cancel']);
     // Never a group message, not even for the moment before a delete. The cost
     // is that it cannot be cleared from the sender's own chat afterwards.
-    for (const command of commandRequest.body.commands) {
-      expect(command.is_ephemeral).toBe(true);
+    for (const menu of menus) {
+      for (const command of menu.body.commands) {
+        expect(command.is_ephemeral).toBe(true);
+      }
     }
   });
 

@@ -359,6 +359,14 @@ async function handleTabCallback(env, callback) {
   const paid = data.match(/^tb:paid:(.+)$/);
   if (paid) {
     const settled = await settleUser(env, chatId, paid[1], callback.from);
+    // The ledger went quiet for the one person it is about: close the loop
+    // with a private receipt, if they have an id to send it to.
+    if (settled && settled.user_id) {
+      await sendMessage(env, chatId,
+        `✅ <b>Payment received</b> — your ${formatMoney(settled.balance)} ` +
+        'squash tab is settled. Thank you!',
+        { receiverUserId: settled.user_id, replyMarkup: OK_MARKUP });
+    }
     await answerCallback(env, callback.id,
       settled ? `${settled.name} cleared · ${formatMoney(settled.balance)}`
         : 'That balance is already clear.', !settled);
@@ -560,21 +568,37 @@ export default {
       // and answers MESSAGE_NOT_FOUND for an incoming command, which therefore
       // stays in the sender's own chat. Nobody else ever sees it, and that is
       // the trade this bot makes — it exists to keep booking out of the group.
-      const commands = await telegram(env, 'setMyCommands', { commands: [
+      // The menu is scoped: members see the everyday commands, group admins
+      // additionally see /cancel — parameterised and rarely theirs to run, so
+      // it only earns menu space for the people managing bookings. Typing a
+      // command still works for anyone the handler allows; scope only changes
+      // the menu.
+      const memberCommands = [
         { command: 'book', description: 'Add a court booking', is_ephemeral: true },
         { command: 'courts', description: 'Show or refresh the pinned court board', is_ephemeral: true },
         { command: 'tab', description: 'Show or refresh the pinned money tab', is_ephemeral: true },
-        { command: 'cancel', description: 'Cancel a booking by ID', is_ephemeral: true },
         { command: 'help', description: 'Show examples', is_ephemeral: true },
-      ] });
+      ];
+      const adminCommands = [
+        ...memberCommands,
+        { command: 'cancel', description: 'Cancel a booking by ID', is_ephemeral: true },
+      ];
+      const commands = await telegram(env, 'setMyCommands', { commands: adminCommands });
+      const groupMenu = await telegram(env, 'setMyCommands', {
+        commands: memberCommands, scope: { type: 'all_group_chats' },
+      });
+      const adminMenu = await telegram(env, 'setMyCommands', {
+        commands: adminCommands, scope: { type: 'all_chat_administrators' },
+      });
       const profile = await telegram(env, 'setMyName', { name: 'SquashBot' });
       const allowedChatIds = String(env.ALLOWED_CHATS || '').split(',').map((id) => id.trim()).filter(Boolean);
       const chats = await Promise.all(allowedChatIds.map((chatId) => telegram(env, 'getChat', { chat_id: chatId })));
-      const ok = webhook.ok && commands.ok && profile.ok && chats.every((chat) => chat.ok);
+      const ok = webhook.ok && commands.ok && groupMenu.ok && adminMenu.ok
+        && profile.ok && chats.every((chat) => chat.ok);
       const chatNames = chats.filter((chat) => chat.ok).map((chat) => chat.result.title || chat.result.id).join(', ');
       return new Response(ok
         ? `SquashBot webhook, commands, and profile are ready. Allowed chats: ${chatNames}.`
-        : JSON.stringify({ webhook, commands, profile, chats }), {
+        : JSON.stringify({ webhook, commands, groupMenu, adminMenu, profile, chats }), {
         status: ok ? 200 : 500,
       });
     }

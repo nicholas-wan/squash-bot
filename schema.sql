@@ -2,7 +2,11 @@ CREATE TABLE IF NOT EXISTS settings (
   chat_id INTEGER PRIMARY KEY,
   tz TEXT NOT NULL DEFAULT 'Asia/Singapore',
   board_message_id INTEGER,
-  tab_message_id INTEGER
+  tab_message_id INTEGER,
+  -- Local day the board was last redrawn, so relative labels stay true.
+  board_day TEXT,
+  -- Local month the last balance notice went out.
+  nudged_month TEXT
 );
 
 CREATE TABLE IF NOT EXISTS bookings (
