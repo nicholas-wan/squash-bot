@@ -1,11 +1,11 @@
 import {
   addPlayerView, authorizeBookingChange, bookingPanelView, cancelBooking, deletePanelView,
-  managerView, notifyRemovedPlayer, notifyRosterOfChange, removePlayerView,
+  managerView, notifyRemovedPlayer, notifyRosterOfChange, plusOneView, removePlayerView,
   restoreBoardButtons, runMaintenance, joinPickerView, updateBoard,
 } from './bookings.js';
 import {
   adminAddPlayer, defaultCapacity, isChatAdmin, knownPlayers, MAX_CAPACITY,
-  raiseCapacity, rememberPlayer,
+  raiseCapacity, rememberPlayer, togglePlusOne,
   joinBooking, leaveBooking, removeBookingPlayer, toggleBooking,
 } from './players.js';
 import { looksLikeBooking } from './parser.js';
@@ -276,6 +276,47 @@ async function handleBoardCallback(env, callback) {
         ? 'A +1 needs two free slots, and this court has not got them.'
         : 'Nobody to seat — the court is full, gone, or everyone known is on it.'),
       !view);
+    return true;
+  }
+  const plusFlip = data.match(/^sb:plus:(\d+):(\d+)$/);
+  if (plusFlip) {
+    if (!(await isChatAdmin(env, chatId, callback.from))) {
+      await answerCallback(env, callback.id, 'Only group admins can change a +1.', true);
+      return true;
+    }
+    const bookingId = Number(plusFlip[1]);
+    const result = await togglePlusOne(env, chatId, bookingId, Number(plusFlip[2]));
+    if (result.status === 'plus' || result.status === 'minus') {
+      // The member whose share changed is the subject, not the tapping admin.
+      await notifyRosterOfChange(env, chatId, result.booking, {
+        id: result.player.user_id || null,
+        username: result.player.slug.startsWith('@') ? result.player.slug.slice(1) : null,
+        first_name: result.player.name,
+      }, result.status);
+      await updateBoard(env, chatId);
+      const view = await plusOneView(env, chatId, bookingId);
+      if (view) await showPanel(env, callback, view);
+    }
+    const replies = {
+      plus: [`${result.player && result.player.name} now brings a +1 — two shares. `
+        + 'Everyone has been told.', false],
+      minus: [`${result.player && result.player.name}'s +1 is off — one share again.`, false],
+      full: ['No free slot for a +1. Open another slot first.', true],
+      gone: ['That player or booking has already gone.', true],
+    };
+    await answerCallback(env, callback.id, ...replies[result.status]);
+    return true;
+  }
+  const plusOpen = data.match(/^sb:plus:(\d+)$/);
+  if (plusOpen) {
+    if (!(await isChatAdmin(env, chatId, callback.from))) {
+      await answerCallback(env, callback.id, 'Only group admins can change a +1.', true);
+      return true;
+    }
+    const view = await plusOneView(env, chatId, Number(plusOpen[1]));
+    if (view) await showPanel(env, callback, view);
+    await answerCallback(env, callback.id,
+      view ? '' : 'Nobody is on that booking.', !view);
     return true;
   }
   const kicked = data.match(/^sb:kick:(\d+):(\d+)$/);

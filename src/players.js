@@ -315,6 +315,35 @@ export async function adminAddPlayer(env, chatId, bookingId, player, addedByUser
   return { status: existing ? 'already' : 'full', booking };
 }
 
+// Flips an existing member between one head and two. Granting the +1 checks
+// capacity inside the update, the same race-proof shape as the inserts;
+// taking it back always succeeds, since it only frees a slot. Charging reads
+// heads when the court expires, so flipping any time before then is enough.
+export async function togglePlusOne(env, chatId, bookingId, playerRowId) {
+  const booking = await env.DB.prepare(
+    'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
+  ).bind(bookingId, dataChatId(env, chatId), Date.now()).first();
+  if (!booking) return { status: 'gone' };
+  const player = await env.DB.prepare(
+    'SELECT * FROM booking_players WHERE id = ? AND booking_id = ?'
+  ).bind(playerRowId, bookingId).first();
+  if (!player) return { status: 'gone' };
+  if ((player.heads || 1) > 1) {
+    await env.DB.prepare('UPDATE booking_players SET heads = 1 WHERE id = ?')
+      .bind(playerRowId).run();
+    return { status: 'minus', booking, player };
+  }
+  const capacity = booking.capacity || DEFAULT_CAPACITY;
+  const bumped = await env.DB.prepare(
+    `UPDATE booking_players SET heads = 2
+     WHERE id = ? AND heads = 1
+       AND (SELECT COALESCE(SUM(heads), 0) FROM booking_players WHERE booking_id = ?) < ?`
+  ).bind(playerRowId, bookingId, capacity).run();
+  return bumped.meta.changes
+    ? { status: 'plus', booking, player }
+    : { status: 'full', booking };
+}
+
 export async function raiseCapacity(env, chatId, bookingId) {
   const result = await env.DB.prepare(
     `UPDATE bookings SET capacity = capacity + 1

@@ -492,6 +492,9 @@ export async function bookingPanelView(env, chatId, bookingId) {
   }
   if (roster.length) {
     rows.push([{
+      text: '👥 Admin: +1 for a player', callback_data: `sb:plus:${booking.id}`,
+    }]);
+    rows.push([{
       text: '🚪 Admin: remove a player', callback_data: `sb:kick:${booking.id}`,
     }]);
   }
@@ -564,6 +567,31 @@ export async function addPlayerView(env, chatId, bookingId, heads = 1) {
   };
 }
 
+// Flip a +1 on somebody already seated: each row names the member and which
+// way tapping them flips. Keyed on the roster row id like the kick picker —
+// a row id cannot go stale into somebody else the way a re-typed handle can.
+export async function plusOneView(env, chatId, bookingId) {
+  const booking = await env.DB.prepare(
+    'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
+  ).bind(bookingId, dataChatId(env, chatId), Date.now()).first();
+  if (!booking) return null;
+  const roster = await rosterFor(env, bookingId);
+  if (!roster.length) return null;
+  const tz = await getTimezone(env, chatId);
+  const rows = roster.map((player) => [{
+    text: playerHeads(player) > 1
+      ? `➖ ${player.name} +1 — back to one share`
+      : `➕ ${player.name} — bring a friend, pays double`,
+    callback_data: `sb:plus:${bookingId}:${player.id}`,
+  }]);
+  rows.push([{ text: '← Back', callback_data: `sb:pick:${bookingId}` }]);
+  return {
+    html: `👥 <b>+1 on ${escapeHtml(bookingLabel(booking, tz))}</b>\n\n`
+      + 'A friend takes a slot and a share, both carried by whoever brings them.',
+    replyMarkup: { inline_keyboard: rows },
+  };
+}
+
 export async function removePlayerView(env, chatId, bookingId) {
   const booking = await env.DB.prepare(
     'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
@@ -618,7 +646,7 @@ export async function notifyRosterOfChange(env, chatId, booking, from, action, h
   // messages would announce something that did not happen. 'added' is an
   // admin seating somebody — for them and the roster it reads like a join,
   // but the wording says who did it was not them.
-  if (action !== 'joined' && action !== 'left' && action !== 'added') {
+  if (!['joined', 'left', 'added', 'plus', 'minus'].includes(action)) {
     throw new Error(`notifyRosterOfChange: unknown action "${action}"`);
   }
   const left = action === 'left';
@@ -632,18 +660,25 @@ export async function notifyRosterOfChange(env, chatId, booking, from, action, h
     + `${compactTimeRange(booking.starts_at, booking.ends_at, tz)} · `
     + `${slotsLabel(roster, booking.capacity || DEFAULT_CAPACITY)}\n`
     + `👥 ${playerTags(roster)}`;
-  const toOthers = left
-    ? `🚪 <b>${escapeHtml(actor.name)}</b> left ${where}`
-    : (action === 'added'
-      ? `➕ <b>${escapeHtml(actor.name)}</b>${heads > 1 ? ' (+1)' : ''}`
-        + ` ${heads > 1 ? 'were' : 'was'} seated on ${where}`
-      : `🙋 <b>${escapeHtml(actor.name)}</b> joined ${where}`);
-  const toActor = (left ? `🚪 <b>You are off</b> ${where}` : `✅ <b>You are on</b> ${where}`)
-    // The sponsor hears about both shares from the bot itself, not first from
-    // the tab: a doubled charge nobody warned them about reads as a mistake.
-    + (action === 'added' && heads > 1
-      ? '\nYour +1 plays on your tab — this court counts as two shares for you.'
-      : '');
+  // The sponsor hears about both shares from the bot itself, not first from
+  // the tab: a doubled charge nobody warned them about reads as a mistake.
+  const name = escapeHtml(actor.name);
+  const twoShares = '\nYour +1 plays on your tab — this court counts as two shares for you.';
+  const toOthers = {
+    joined: `🙋 <b>${name}</b> joined ${where}`,
+    left: `🚪 <b>${name}</b> left ${where}`,
+    added: `➕ <b>${name}</b>${heads > 1 ? ' (+1)' : ''}`
+      + ` ${heads > 1 ? 'were' : 'was'} seated on ${where}`,
+    plus: `👥 <b>${name}</b> is bringing a friend to ${where}`,
+    minus: `👥 <b>${name}</b> is no longer bringing a friend to ${where}`,
+  }[action];
+  const toActor = {
+    joined: `✅ <b>You are on</b> ${where}`,
+    left: `🚪 <b>You are off</b> ${where}`,
+    added: `✅ <b>You are on</b> ${where}` + (heads > 1 ? twoShares : ''),
+    plus: `👥 <b>Your +1 is on</b> ${where}${twoShares}`,
+    minus: `👥 <b>Your +1 is off</b> ${where}\nBack to one share for you.`,
+  }[action];
   // The actor's copy is planned first whichever way the slot went — a leaver's
   // row is already deleted, so the roster could never produce it, and one path
   // for both actions beats two that must agree. Dedup is by id, not slug: one

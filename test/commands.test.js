@@ -647,6 +647,79 @@ describe('Telegram commands', () => {
     expect(requests.some((request) => request.url.endsWith('/sendMessage'))).toBe(false);
   });
 
+  function plusOneRun(updateChanges) {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      const result = String(url).endsWith('/getChatMember')
+        ? { status: 'creator' } : { message_id: 55 };
+      return new Response(JSON.stringify({ ok: true, result }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const booking = {
+      id: 3, chat_id: -123456789, court: '4', capacity: 3,
+      starts_at: Date.UTC(2026, 7, 19, 13, 0), ends_at: Date.UTC(2026, 7, 19, 14, 0),
+    };
+    const jarhead = {
+      id: 8, booking_id: 3, user_id: 42, slug: '@jarhead', name: '@jarhead', heads: 1,
+    };
+    const ran = [];
+    const db = { prepare(sql) { ran.push(sql); return { bind() { return {
+      async first() {
+        if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+        if (sql.includes('FROM booking_players WHERE id')) return jarhead;
+        if (sql.includes('SELECT * FROM bookings WHERE id')) return booking;
+        if (sql.includes('board_message_id')) return { board_message_id: 55 };
+        return null;
+      },
+      async all() {
+        if (sql.includes('FROM booking_players')) {
+          return { results: [jarhead, { id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick' }] };
+        }
+        return { results: sql.includes('ends_at >') ? [booking] : [] };
+      },
+      async run() {
+        return { meta: { changes: sql.includes('SET heads = 2') ? updateChanges : 1 } };
+      },
+    }; } }; } };
+    return { requests, ran, db };
+  }
+
+  it('lets an admin flip a +1 onto somebody already seated', async () => {
+    const { requests, ran, db } = plusOneRun(1);
+    await handleUpdate({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db }, {
+      callback_query: {
+        id: 'callback-1', data: 'sb:plus:3:8',
+        from: { id: 9, username: 'admin' },
+        message: { message_id: 55, chat: { id: -123456789 } },
+      },
+    });
+    expect(ran.some((sql) => sql.includes('SET heads = 2'))).toBe(true);
+    const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
+    expect(sent.find((request) => request.body.receiver_user_id === 42).body.text)
+      .toContain('Your +1 is on');
+    expect(sent.find((request) => request.body.receiver_user_id === 7).body.text)
+      .toContain('bringing a friend');
+    const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+    expect(answer.body.text).toContain('now brings a +1');
+  });
+
+  it('refuses a +1 when the court has no free slot for it', async () => {
+    const { requests, db } = plusOneRun(0);
+    await handleUpdate({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db }, {
+      callback_query: {
+        id: 'callback-1', data: 'sb:plus:3:8',
+        from: { id: 9, username: 'admin' },
+        message: { message_id: 55, chat: { id: -123456789 } },
+      },
+    });
+    const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+    expect(answer.body.text).toContain('No free slot');
+    // Nothing changed, so nobody is told anything.
+    expect(requests.some((request) => request.url.endsWith('/sendMessage'))).toBe(false);
+  });
+
   it('receipts the debtor privately when an admin clears their balance', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
@@ -707,7 +780,8 @@ describe('Telegram commands', () => {
       OWNER_USER_ID: '7', DB: emptyDb(),
     };
     for (const data of ['sb:cap:3', 'sb:kick:3', 'sb:kick:3:4', 'sb:addp:3',
-      'sb:addp:3:h2', 'sb:addp:3:1:@bo', 'sb:addp:3:2:@bo', 'tb:pay']) {
+      'sb:addp:3:h2', 'sb:addp:3:1:@bo', 'sb:addp:3:2:@bo', 'sb:plus:3',
+      'sb:plus:3:8', 'tb:pay']) {
       requests.length = 0;
       await handleUpdate(env, {
         callback_query: {
