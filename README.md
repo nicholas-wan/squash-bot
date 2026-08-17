@@ -49,7 +49,8 @@ straight is their job. Manage names who is playing and how
 many slots are left, edits the date, court, or time, deletes a booking, and lets
 admins open extra slots, seat a player the bot already knows — billed as if
 they joined themselves, or with a friend who costs them a second slot and a
-second share, and refused when the court has no room — or take a player off.
+second share, and refused when the court has no room — flip a +1 on or off
+somebody already seated under the same capacity rule, or take a player off.
 Every active court is listed, the
 same as the board. Those two admin actions stay open until the court ends,
 which is how a no-show is kept off the tab, while joining and leaving close the

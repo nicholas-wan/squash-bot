@@ -446,6 +446,33 @@ describe('public booking announcements', () => {
     expect(html).toContain('in 7 days · Wed 19 Aug\n<s>9pm · <b>Court 4</b> · full</s>');
   });
 
+  it('labels the +1 picker with which way each member flips', async () => {
+    const roster = [
+      { id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick', heads: 1 },
+      { id: 8, booking_id: 3, user_id: 42, slug: '@jarhead', name: '@jarhead', heads: 2 },
+    ];
+    const db = { prepare(sql) { return { bind() { return {
+      async first() {
+        if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+        if (sql.includes('SELECT * FROM bookings WHERE id')) return storedBooking;
+        return null;
+      },
+      async all() {
+        if (sql.includes('FROM booking_players')) return { results: roster };
+        return { results: [] };
+      },
+    }; } }; } };
+    const { plusOneView } = await import('../src/bookings.js');
+    const view = await plusOneView({ DB: db }, -123, 3);
+    const labels = view.replyMarkup.inline_keyboard.flat().map((button) => button.text);
+    expect(labels).toEqual([
+      '➕ Nick — bring a friend, pays double',
+      '➖ @jarhead +1 — back to one share',
+      '← Back',
+    ]);
+    expect(view.replyMarkup.inline_keyboard[1][0].callback_data).toBe('sb:plus:3:8');
+  });
+
   it('lists a full court on the board, marked full', async () => {
     const full = ['u7', '@dodgerblueee', '@alice'].map((slug, index) => ({
       id: index + 1, booking_id: 3, user_id: null, slug, name: slug,
