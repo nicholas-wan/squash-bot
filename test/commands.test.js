@@ -73,6 +73,34 @@ describe('Telegram commands', () => {
     expect(requests.some((request) => request.url.endsWith('/deleteMessage'))).toBe(false);
   });
 
+  it('answers /courts even when there is nothing to refresh', async () => {
+    // Success that looks identical to silence cannot be told apart from a
+    // broken bot, so every refresh command says what it did.
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    await handleUpdate({
+      BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: emptyDb(),
+    }, {
+      message: {
+        message_id: 5,
+        ephemeral_message_id: 88,
+        chat: { id: -123456789 },
+        from: { id: 7, first_name: 'Nick' },
+        text: '/courts',
+      },
+    });
+    const send = requests
+      .filter((request) => request.url.endsWith('/sendMessage'))
+      .find((request) => request.body.receiver_user_id === 7);
+    expect(send.body.text).toContain('Nothing is booked right now');
+    expect(send.body.reply_markup.inline_keyboard[0][0].text).toBe('👍 OK');
+  });
+
   it('opens the booking manager privately, never on the pinned message', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
@@ -459,6 +487,59 @@ describe('Telegram commands', () => {
     expect(told[0].body.text).toContain('You are off');
   });
 
+  it('lets an admin seat a known player, telling the court', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      const result = String(url).endsWith('/getChatMember')
+        ? { status: 'creator' } : { message_id: 55 };
+      return new Response(JSON.stringify({ ok: true, result }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const booking = {
+      id: 3, chat_id: -123456789, court: '4', capacity: 3,
+      starts_at: Date.UTC(2026, 7, 19, 13, 0), ends_at: Date.UTC(2026, 7, 19, 14, 0),
+    };
+    const ran = [];
+    const db = { prepare(sql) { ran.push(sql); return { bind() { return {
+      async first() {
+        if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+        if (sql.includes('SELECT * FROM bookings WHERE id')) return booking;
+        if (sql.includes('board_message_id')) return { board_message_id: 55 };
+        return null;
+      },
+      async all() {
+        if (sql.includes('FROM ledger')) {
+          return { results: [{ slug: '@bo', name: '@bo', user_id: 42 }] };
+        }
+        if (sql.includes('FROM booking_players')) {
+          return { results: [{ id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick' }] };
+        }
+        return { results: sql.includes('ends_at >') ? [booking] : [] };
+      },
+      async run() { return { meta: { changes: 1 } }; },
+    }; } }; } };
+    await handleUpdate({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db }, {
+      callback_query: {
+        id: 'callback-1', data: 'sb:addp:3:@bo',
+        from: { id: 9, username: 'admin' },
+        message: { message_id: 55, chat: { id: -123456789 } },
+      },
+    });
+    expect(ran.some((sql) => sql.startsWith('INSERT OR IGNORE INTO booking_players')))
+      .toBe(true);
+    const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
+    // The seated player is confirmed as if they joined; the court hears who
+    // was put on, worded as an admin action.
+    expect(sent.find((request) => request.body.receiver_user_id === 42).body.text)
+      .toContain('You are on');
+    expect(sent.find((request) => request.body.receiver_user_id === 7).body.text)
+      .toContain('was seated on');
+    const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+    expect(answer.body.text).toContain('@bo is on this court');
+  });
+
   it('receipts the debtor privately when an admin clears their balance', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
@@ -518,7 +599,7 @@ describe('Telegram commands', () => {
       BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789',
       OWNER_USER_ID: '7', DB: emptyDb(),
     };
-    for (const data of ['sb:cap:3', 'sb:kick:3', 'sb:kick:3:4', 'tb:pay']) {
+    for (const data of ['sb:cap:3', 'sb:kick:3', 'sb:kick:3:4', 'sb:addp:3', 'sb:addp:3:@bo', 'tb:pay']) {
       requests.length = 0;
       await handleUpdate(env, {
         callback_query: {

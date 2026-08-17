@@ -246,6 +246,64 @@ export async function removeBookingPlayer(env, chatId, bookingId, playerRowId) {
   return removed.meta.changes ? { player, booking } : null;
 }
 
+// Everyone the bot can put a name to: the config household, everyone the
+// ledger has ever charged, and whoever is seated on a current booking.
+// Expired rosters are deleted with their bookings, so the ledger is the long
+// memory here. Somebody the bot has never seen can always tap Join themselves.
+export async function knownPlayers(env, chatId) {
+  const players = new Map();
+  const remember = (slug, name, userId) => {
+    if (!slug) return;
+    const existing = players.get(slug);
+    if (!existing) {
+      players.set(slug, { slug, name: name || slug, user_id: userId || null });
+    } else if (!existing.user_id && userId) {
+      existing.user_id = userId;
+    }
+  };
+  for (const player of [ownerIdentity(env), ...defaultPlayers(env), ...unbilledPlayers(env)]) {
+    if (player) remember(player.slug, player.name, player.userId);
+  }
+  const dataChat = dataChatId(env, chatId);
+  const { results: charged } = await env.DB.prepare(
+    'SELECT slug, name, user_id FROM ledger WHERE chat_id = ? ORDER BY id'
+  ).bind(dataChat).all();
+  for (const row of charged) remember(row.slug, row.name, row.user_id);
+  const { results: seated } = await env.DB.prepare(
+    `SELECT slug, name, user_id FROM booking_players
+     WHERE booking_id IN (SELECT id FROM bookings WHERE chat_id = ?) ORDER BY id`
+  ).bind(dataChat).all();
+  for (const row of seated) remember(row.slug, row.name, row.user_id);
+  return [...players.values()];
+}
+
+// An admin seating somebody. The count check lives inside the insert exactly
+// as joinBooking's does, so this cannot squeeze past capacity — opening a slot
+// stays an explicit admin decision. Like the other admin actions it stays open
+// until the court ends: seating somebody who actually played is how their
+// share reaches the tab.
+export async function adminAddPlayer(env, chatId, bookingId, player, addedByUserId) {
+  const booking = await env.DB.prepare(
+    'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
+  ).bind(bookingId, dataChatId(env, chatId), Date.now()).first();
+  if (!booking) return { status: 'gone' };
+  const capacity = booking.capacity || DEFAULT_CAPACITY;
+  const added = await env.DB.prepare(
+    `INSERT OR IGNORE INTO booking_players
+      (booking_id, chat_id, user_id, slug, name, added_by_user_id, created_at)
+     SELECT ?, ?, ?, ?, ?, ?, ?
+     WHERE (SELECT COUNT(*) FROM booking_players WHERE booking_id = ?) < ?`
+  ).bind(
+    bookingId, chatId, player.user_id || null, player.slug, player.name,
+    addedByUserId || null, Date.now(), bookingId, capacity
+  ).run();
+  if (added.meta.changes) return { status: 'added', booking };
+  const existing = await env.DB.prepare(
+    'SELECT id FROM booking_players WHERE booking_id = ? AND slug = ?'
+  ).bind(bookingId, player.slug).first();
+  return { status: existing ? 'already' : 'full', booking };
+}
+
 export async function raiseCapacity(env, chatId, bookingId) {
   const result = await env.DB.prepare(
     `UPDATE bookings SET capacity = capacity + 1

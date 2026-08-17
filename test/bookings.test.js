@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   addBooking, bookingPanelView, BookingConflictError, boardHtml, cancelBooking,
-  deletePanelView, managerView, notifyRosterOfChange, runMaintenance, updateBooking,
+  deletePanelView, managerView, notifyRosterOfChange, runMaintenance, updateBoard,
+  updateBooking,
 } from '../src/bookings.js';
 
 const startsAt = Date.UTC(2026, 7, 19, 13, 0);
@@ -362,6 +363,33 @@ describe('public booking announcements', () => {
     expect(sent[1].body.text).not.toContain('@alice</b> joined');
   });
 
+  it('offers only unseated known players when an admin seats somebody', async () => {
+    const roster = [{ id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick' }];
+    const ledger = [
+      { slug: '@bo', name: '@bo', user_id: null },
+      // Already on the court, so not offered again.
+      { slug: 'u7', name: 'Nick', user_id: 7 },
+    ];
+    const db = { prepare(sql) { return { bind() { return {
+      async first() {
+        if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+        if (sql.includes('SELECT * FROM bookings WHERE id')) return storedBooking;
+        return null;
+      },
+      async all() {
+        if (sql.includes('FROM ledger')) return { results: ledger };
+        if (sql.includes('FROM booking_players')) return { results: roster };
+        return { results: [] };
+      },
+    }; } }; } };
+    const { addPlayerView } = await import('../src/bookings.js');
+    const view = await addPlayerView({ DB: db }, -123, 3);
+    const labels = view.replyMarkup.inline_keyboard.flat().map((button) => button.text);
+    expect(labels).toEqual(['➕ @bo', '← Back']);
+    expect(view.replyMarkup.inline_keyboard[0][0].callback_data).toBe('sb:addp:3:@bo');
+    expect(view.html).toContain('billed like anyone');
+  });
+
   it('lists a full court on the board, marked full', async () => {
     const full = ['u7', '@dodgerblueee', '@alice'].map((slug, index) => ({
       id: index + 1, booking_id: 3, user_id: null, slug, name: slug,
@@ -369,8 +397,9 @@ describe('public booking announcements', () => {
     const html = await boardHtml(
       { DB: bookingDb([storedBooking], full) }, -123, Date.UTC(2026, 7, 12, 12, 0)
     );
-    // A court missing from the board would read as a court nobody booked.
-    expect(html).toContain('in 7 days · Wed 19 Aug\n9pm · <b>Court 4</b> · full');
+    // A court missing from the board would read as a court nobody booked —
+    // it stays listed, struck through, so open slots pop at a glance.
+    expect(html).toContain('in 7 days · Wed 19 Aug\n<s>9pm · <b>Court 4</b> · full</s>');
   });
 
   it('rejects an overlapping court booking in the insert itself', async () => {
@@ -662,7 +691,9 @@ describe('public booking announcements', () => {
   // 20:00 SGT on 12 Aug 2026: past the 9am notice threshold, mid-month.
   const cronNow = Date.UTC(2026, 7, 12, 12, 0);
 
-  function maintenanceDb({ boardDay = null, nudgedMonth = '2026-8', balances = [] } = {}) {
+  function maintenanceDb({
+    boardDay = null, nudgedMonth = '2026-8', balances = [], ledgerRows = [],
+  } = {}) {
     const seen = [];
     return {
       seen,
@@ -676,13 +707,16 @@ describe('public booking announcements', () => {
                 return { board_message_id: 55, board_day: boardDay };
               }
               if (sql.includes('nudged_month')) return { nudged_month: nudgedMonth };
+              if (sql.includes('SELECT chat_id FROM booking_players')) {
+                return { chat_id: -123 };
+              }
               if (sql.includes('board_message_id')) return { board_message_id: 55 };
               return null;
             },
             async all() {
               if (sql.includes('GROUP BY')) return { results: balances };
               if (sql.includes('FROM booking_players')) return { results: [] };
-              if (sql.includes('FROM ledger')) return { results: [] };
+              if (sql.includes('FROM ledger')) return { results: ledgerRows };
               return { results: sql.includes('ends_at >') ? [storedBooking] : [] };
             },
             async run() { return { meta: { changes: 1 } }; },
@@ -725,17 +759,30 @@ describe('public booking announcements', () => {
         { slug: 'u9', user_id: 9, name: '@alice', balance: 200 },
         { slug: 'u5', user_id: 5, name: '@settled', balance: -100 },
       ],
+      ledgerRows: [{
+        slug: 'u9', user_id: 9, name: '@alice', amount_cents: 200,
+        booking_id: 5, reason: 'Court 4 · 15 Aug',
+        created_at: Date.UTC(2026, 7, 15, 14, 0),
+      }],
     });
-    await runMaintenance({ BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: db }, cronNow);
+    // The data chat id points at a group the bot has left: notices must land
+    // in the chat each player is actually reachable in, not the storage key.
+    await runMaintenance({
+      BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DATA_CHAT_ID: '-999', DB: db,
+    }, cronNow);
     const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
     expect(sent).toHaveLength(1);
     expect(sent[0].body.chat_id).toBe(-123);
     expect(sent[0].body.receiver_user_id).toBe(9);
     expect(sent[0].body.text).toContain('August 2026');
     expect(sent[0].body.text).toContain('$2.00');
-    expect(sent[0].body.text).toContain('My tab');
+    // The ask carries its own story: the itemised lines, no rate card, no
+    // pointer to go tap something else first.
+    expect(sent[0].body.text).toContain('• Court 4 · 15 Aug — $2.00');
+    expect(sent[0].body.text).not.toContain('$6/hour');
+    expect(sent[0].body.text).not.toContain('My tab');
     expect(db.seen.find((query) => query.sql.includes('nudged_month) VALUES')).args)
-      .toEqual([-123, '2026-8']);
+      .toEqual([-999, '2026-8']);
 
     // Already stamped for this month: quiet.
     requests.length = 0;
@@ -745,6 +792,36 @@ describe('public booking announcements', () => {
     }, cronNow);
     expect(requests.filter((request) => request.url.endsWith('/sendMessage')))
       .toHaveLength(0);
+  });
+
+  it('keeps a kicked sibling chat from breaking the board update', async () => {
+    // The 16 Aug outage: the bot was removed from the data chat, every board
+    // loop threw on it, and every command in the healthy chat died with it.
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      const body = JSON.parse(init.body);
+      requests.push({ url: String(url), body });
+      // The sibling chat rejects everything: edit fails, resend fails.
+      const kicked = body.chat_id === -999;
+      return new Response(JSON.stringify(kicked
+        ? { ok: false, error_code: 403, description: 'Forbidden: bot was kicked from the supergroup chat' }
+        : { ok: true, result: { message_id: 55 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const db = maintenanceDb({});
+    // Acting from the healthy chat: the sibling's failure is logged, not
+    // thrown, and the healthy chat's own pinned board still comes back.
+    await expect(updateBoard({
+      BOT_TOKEN: 'test', ALLOWED_CHATS: '-123,-999', DATA_CHAT_ID: '-999', DB: db,
+    }, -123)).resolves.toBe(55);
+    const edited = requests.filter((request) => request.url.endsWith('/editMessageText'));
+    expect(edited.some((request) => request.body.chat_id === -123)).toBe(true);
+
+    // Acting from the kicked chat itself, the failure still surfaces.
+    await expect(updateBoard({
+      BOT_TOKEN: 'test', ALLOWED_CHATS: '-123,-999', DATA_CHAT_ID: '-999', DB: db,
+    }, -999)).rejects.toThrow('kicked');
   });
 
   it('holds the monthly notice back before 9am local time', async () => {
