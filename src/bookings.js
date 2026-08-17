@@ -271,20 +271,36 @@ function shortDate(epochMs, tz) {
   }).format(new Date(epochMs)).replace(',', '');
 }
 
+// Slots one roster row holds: two when an admin seated that member with a
+// friend. A row written before the column existed carries no heads at all, and
+// stands for the one person it always did.
+function playerHeads(player) {
+  return player.heads || 1;
+}
+
+// Capacity and the tab both count people, not rows, so every comparison against
+// capacity goes through this rather than roster.length.
+function rosterHeads(roster) {
+  return roster.reduce((total, player) => total + playerHeads(player), 0);
+}
+
 // A player whose numeric id is known gets a real tag. Anyone still seeded from
 // config by username is written as plain @handle, which Telegram links and
 // notifies by itself; their id is filled in the first time they post.
 function playerTags(roster) {
   if (!roster.length) return 'nobody yet';
-  return roster.map((player) => (player.user_id
-    ? mentionHtml(player.user_id, player.name)
-    : escapeHtml(player.name))).join(', ');
+  return roster.map((player) => {
+    // A friend has no identity of their own, so they are named on the person
+    // who brought them rather than as a row nobody could tap or bill.
+    const name = playerHeads(player) > 1 ? `${player.name} +1` : player.name;
+    return player.user_id ? mentionHtml(player.user_id, name) : escapeHtml(name);
+  }).join(', ');
 }
 
 // The board stays about who is playing. Money lives on the tab.
 // What people actually want to know is whether there is room, not the ratio.
 function slotsLabel(roster, capacity) {
-  const free = Math.max(0, capacity - roster.length);
+  const free = Math.max(0, capacity - rosterHeads(roster));
   if (!free) return 'full';
   return `${free} slot${free === 1 ? '' : 's'}`;
 }
@@ -323,7 +339,7 @@ export async function joinPickerView(env, chatId, from, isAdmin = false, now = D
       `${courtName(booking)} · ${slotsLabel(roster, capacity)}`;
     if (roster.some((player) => player.slug === mySlug)) {
       rows.push([{ text: `🚪 Leave · ${label}`, callback_data: `sb:leave:${booking.id}` }]);
-    } else if (roster.length < capacity) {
+    } else if (rosterHeads(roster) < capacity) {
       rows.push([{ text: `🙋 Join · ${label}`, callback_data: `sb:join:${booking.id}` }]);
     } else {
       rows.push([{ text: `🔒 Full · ${label}`, callback_data: `sb:full:${booking.id}` }]);
@@ -469,7 +485,7 @@ export async function bookingPanelView(env, chatId, bookingId) {
   }
   const roster = await rosterFor(env, booking.id);
   // Only while a slot is free: seating somebody never squeezes past capacity.
-  if (roster.length < capacity) {
+  if (rosterHeads(roster) < capacity) {
     rows.push([{
       text: '➕ Admin: add a player', callback_data: `sb:addp:${booking.id}`,
     }]);
@@ -495,33 +511,55 @@ export async function bookingPanelView(env, chatId, bookingId) {
 // Who an admin can seat: everyone the bot knows who is not already on this
 // court, while a slot is free. Somebody the bot has never seen is not listed —
 // they are in the group anyway, and can tap 🙋 Join themselves.
-export async function addPlayerView(env, chatId, bookingId) {
+//
+// heads is what the toggle at the top of the keyboard is holding: 2 seats the
+// next person tapped with a friend, and needs two free slots rather than one,
+// so the whole panel is unavailable when only one is left.
+export async function addPlayerView(env, chatId, bookingId, heads = 1) {
   const booking = await env.DB.prepare(
     'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
   ).bind(bookingId, dataChatId(env, chatId), Date.now()).first();
   if (!booking) return null;
   const roster = await rosterFor(env, bookingId);
   const capacity = booking.capacity || DEFAULT_CAPACITY;
-  if (roster.length >= capacity) return null;
+  if (rosterHeads(roster) + heads > capacity) return null;
   const seated = new Set(roster.map((player) => player.slug));
   const encoder = new TextEncoder();
   const candidates = (await knownPlayers(env, chatId))
     .filter((player) => !seated.has(player.slug))
     // Telegram caps callback_data at 64 bytes; a slug that will not fit
     // cannot be offered as a button.
-    .filter((player) => encoder.encode(`sb:addp:${bookingId}:${player.slug}`).length <= 64)
+    .filter((player) => encoder
+      .encode(`sb:addp:${bookingId}:${heads}:${player.slug}`).length <= 64)
     .sort((a, b) => a.name.localeCompare(b.name))
     .slice(0, MAX_JOIN_BUTTONS);
   if (!candidates.length) return null;
   const tz = await getTimezone(env, chatId);
-  const rows = candidates.map((player) => [{
-    text: `➕ ${player.name}`, callback_data: `sb:addp:${bookingId}:${player.slug}`,
-  }]);
+  // The toggle sits above the names because it changes what tapping one of them
+  // does, and a switch read after the fact is a switch nobody read.
+  const rows = [[heads > 1
+    ? {
+      text: '👥 Bringing a friend: yes — pays double',
+      callback_data: `sb:addp:${bookingId}:h1`,
+    }
+    : {
+      text: '👥 Bringing a friend: no',
+      callback_data: `sb:addp:${bookingId}:h2`,
+    }]];
+  for (const player of candidates) {
+    rows.push([{
+      text: `➕ ${player.name}`,
+      callback_data: `sb:addp:${bookingId}:${heads}:${player.slug}`,
+    }]);
+  }
   rows.push([{ text: '← Back', callback_data: `sb:pick:${bookingId}` }]);
   return {
     html: `➕ <b>Seat somebody on ${escapeHtml(bookingLabel(booking, tz))}</b>\n\n`
-      + 'They are billed like anyone who joined themselves. Anyone not listed '
-      + 'can tap 🙋 Join on the pinned board.',
+      + (heads > 1
+        ? 'They take two slots and pay two shares. The friend is nobody the bot '
+          + 'knows — whoever you seat sponsors them.'
+        : 'They are billed like anyone who joined themselves. Anyone not listed '
+          + 'can tap 🙋 Join on the pinned board.'),
     replyMarkup: { inline_keyboard: rows },
   };
 }
@@ -570,7 +608,12 @@ export async function notifyRemovedPlayer(env, chatId, player, booking) {
 // to, and with DATA_CHAT_ID a roster spans groups, so honouring a row's own
 // chat_id delivered notices into whichever group that member was first seen in
 // — correct by the letter, invisible to somebody reading the other one.
-export async function notifyRosterOfChange(env, chatId, booking, from, action) {
+//
+// heads is the size of the row that changed hands, which only an admin seating
+// somebody with a friend ever makes 2. It is passed rather than read back off
+// the roster because that would rest on the seated player resolving to the same
+// slug their row was written under, which is exactly what rememberPlayer moves.
+export async function notifyRosterOfChange(env, chatId, booking, from, action, heads = 1) {
   // Loud, not lenient: an unrecognised action falling through to one of the
   // messages would announce something that did not happen. 'added' is an
   // admin seating somebody — for them and the roster it reads like a join,
@@ -592,9 +635,15 @@ export async function notifyRosterOfChange(env, chatId, booking, from, action) {
   const toOthers = left
     ? `🚪 <b>${escapeHtml(actor.name)}</b> left ${where}`
     : (action === 'added'
-      ? `➕ <b>${escapeHtml(actor.name)}</b> was seated on ${where}`
+      ? `➕ <b>${escapeHtml(actor.name)}</b>${heads > 1 ? ' (+1)' : ''}`
+        + ` ${heads > 1 ? 'were' : 'was'} seated on ${where}`
       : `🙋 <b>${escapeHtml(actor.name)}</b> joined ${where}`);
-  const toActor = left ? `🚪 <b>You are off</b> ${where}` : `✅ <b>You are on</b> ${where}`;
+  const toActor = (left ? `🚪 <b>You are off</b> ${where}` : `✅ <b>You are on</b> ${where}`)
+    // The sponsor hears about both shares from the bot itself, not first from
+    // the tab: a doubled charge nobody warned them about reads as a mistake.
+    + (action === 'added' && heads > 1
+      ? '\nYour +1 plays on your tab — this court counts as two shares for you.'
+      : '');
   // The actor's copy is planned first whichever way the slot went — a leaver's
   // row is already deleted, so the roster could never produce it, and one path
   // for both actions beats two that must agree. Dedup is by id, not slug: one

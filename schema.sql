@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS booking_players (
   slug TEXT NOT NULL,
   name TEXT NOT NULL,
   added_by_user_id INTEGER,
+  -- Seats this row holds: 2 when an admin seated them with an untracked friend,
+  -- who costs a slot and a share but has no identity to key a row on.
+  heads INTEGER NOT NULL DEFAULT 1,
   reminder_sent INTEGER NOT NULL DEFAULT 0,
   pre_reminder_sent INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,

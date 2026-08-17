@@ -19,7 +19,11 @@ export async function chargeBooking(env, booking, roster) {
   const totalCents = courtCostCents(
     booking.starts_at, booking.ends_at, tz, publicHolidays(env)
   );
-  const share = shareCents(totalCents, roster.length);
+  // Divided by heads rather than rows: a member an admin seated with a friend
+  // holds two of the court's slots, so the court splits two ways for them.
+  const share = shareCents(
+    totalCents, roster.reduce((total, player) => total + (player.heads || 1), 0)
+  );
   const household = householdSlugs(env);
   const court = booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`;
   const reason = `${court} · ${new Intl.DateTimeFormat('en-SG', {
@@ -30,13 +34,17 @@ export async function chargeBooking(env, booking, roster) {
   if (share > 0) {
     for (const player of roster) {
       if (household.has(player.slug)) continue;
+      // One row per person however many heads they brought — the unique index
+      // allows only one per booking anyway — so the reason carries the count,
+      // which is the only place a doubled charge can explain itself.
+      const heads = player.heads || 1;
       const inserted = await env.DB.prepare(
         `INSERT OR IGNORE INTO ledger
           (chat_id, slug, user_id, name, amount_cents, booking_id, reason, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       ).bind(
         booking.chat_id, player.slug, player.user_id || null, player.name,
-        share, booking.id, reason, Date.now()
+        share * heads, booking.id, heads > 1 ? `${reason} · for ${heads}` : reason, Date.now()
       ).run();
       charged += inserted.meta.changes ? 1 : 0;
     }

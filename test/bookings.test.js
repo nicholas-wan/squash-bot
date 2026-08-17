@@ -385,9 +385,65 @@ describe('public booking announcements', () => {
     const { addPlayerView } = await import('../src/bookings.js');
     const view = await addPlayerView({ DB: db }, -123, 3);
     const labels = view.replyMarkup.inline_keyboard.flat().map((button) => button.text);
-    expect(labels).toEqual(['➕ @bo', '← Back']);
-    expect(view.replyMarkup.inline_keyboard[0][0].callback_data).toBe('sb:addp:3:@bo');
+    // The friend toggle leads, because it changes what tapping a name does.
+    expect(labels).toEqual(['👥 Bringing a friend: no', '➕ @bo', '← Back']);
+    expect(view.replyMarkup.inline_keyboard[0][0].callback_data).toBe('sb:addp:3:h2');
+    expect(view.replyMarkup.inline_keyboard[1][0].callback_data).toBe('sb:addp:3:1:@bo');
     expect(view.html).toContain('billed like anyone');
+  });
+
+  it('seats the next tap with a friend once the toggle is on', async () => {
+    const seatingDb = (roster) => ({ prepare(sql) { return { bind() { return {
+      async first() {
+        if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+        if (sql.includes('SELECT * FROM bookings WHERE id')) return storedBooking;
+        return null;
+      },
+      async all() {
+        if (sql.includes('FROM ledger')) {
+          return { results: [{ slug: '@bo', name: '@bo', user_id: null }] };
+        }
+        if (sql.includes('FROM booking_players')) return { results: roster };
+        return { results: [] };
+      },
+    }; } }; } });
+    const { addPlayerView } = await import('../src/bookings.js');
+    const roster = [{ id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick' }];
+    const view = await addPlayerView({ DB: seatingDb(roster) }, -123, 3, 2);
+    expect(view.replyMarkup.inline_keyboard[0][0]).toEqual({
+      text: '👥 Bringing a friend: yes — pays double', callback_data: 'sb:addp:3:h1',
+    });
+    expect(view.replyMarkup.inline_keyboard[1][0].callback_data).toBe('sb:addp:3:2:@bo');
+    // The panel says what it costs before anybody is seated by it.
+    expect(view.html).toContain('two slots and pay two shares');
+
+    // Two of the three slots taken. One name still fits; a +1 needs the two it
+    // cannot have, and taking half of what it asked for would bill it wrong.
+    const crowded = [...roster, { id: 2, booking_id: 3, user_id: 11, slug: '@ann', name: '@ann' }];
+    expect(await addPlayerView({ DB: seatingDb(crowded) }, -123, 3, 2)).toBe(null);
+    expect(await addPlayerView({ DB: seatingDb(crowded) }, -123, 3)).not.toBe(null);
+  });
+
+  it('counts a +1 against the court on the board and the panel', async () => {
+    const roster = [{ id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick', heads: 2 }];
+    const env = { BOT_TOKEN: 'test', DB: bookingDb([storedBooking], roster) };
+    // One row, two of the three slots: a friend is a head, not a name.
+    const html = await boardHtml(env, -123, Date.UTC(2026, 7, 12, 12, 0));
+    expect(html).toContain('in 7 days · Wed 19 Aug\n9pm · <b>Court 4</b> · 1 slot');
+    const panel = await bookingPanelView(env, -123, 3);
+    expect(panel.html).toContain('<a href="tg://user?id=7">Nick +1</a>');
+    expect(panel.html).toContain('1 slot');
+  });
+
+  it('strikes out a court filled by a +1 rather than by a third name', async () => {
+    const roster = [
+      { id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick', heads: 2 },
+      { id: 2, booking_id: 3, user_id: null, slug: '@bo', name: '@bo', heads: 1 },
+    ];
+    const html = await boardHtml(
+      { DB: bookingDb([storedBooking], roster) }, -123, Date.UTC(2026, 7, 12, 12, 0)
+    );
+    expect(html).toContain('in 7 days · Wed 19 Aug\n<s>9pm · <b>Court 4</b> · full</s>');
   });
 
   it('lists a full court on the board, marked full', async () => {

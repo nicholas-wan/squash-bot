@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { joinPickerView } from '../src/bookings.js';
 import {
-  defaultCapacity, defaultPlayers, householdSlugs, identity, isChatAdmin,
-  ownerIdentity, rememberPlayer, seedRoster,
+  adminAddPlayer, defaultCapacity, defaultPlayers, householdSlugs, identity,
+  isChatAdmin, ownerIdentity, rememberPlayer, seedRoster,
 } from '../src/players.js';
 
 const env = {
@@ -218,6 +218,58 @@ describe('rosters', () => {
   });
 });
 
+describe('an admin seating somebody', () => {
+  const booking = {
+    id: 3, chat_id: -123, court: '4', capacity: 3,
+    starts_at: Date.now() + 3600000, ends_at: Date.now() + 7200000,
+  };
+
+  // The guard lives inside the insert, so the mock has to answer it the way D1
+  // would: the last bound value is the room left for the heads being seated.
+  function seatingDb(seatedHeads) {
+    const inserts = [];
+    return {
+      inserts,
+      prepare(sql) {
+        return { bind(...args) { return {
+          async first() {
+            return sql.includes('SELECT * FROM bookings WHERE id') ? booking : null;
+          },
+          async run() {
+            if (!sql.includes('INSERT OR IGNORE INTO booking_players')) {
+              return { meta: { changes: 1 } };
+            }
+            if (seatedHeads > args[args.length - 1]) return { meta: { changes: 0 } };
+            inserts.push(args);
+            return { meta: { changes: 1 } };
+          },
+        }; } };
+      },
+    };
+  }
+
+  const bo = { slug: '@bo', name: '@bo', user_id: 42 };
+
+  it('refuses a +1 with only one head free, and seats them alone', async () => {
+    const refusing = seatingDb(2);
+    // Opening a slot stays an explicit admin decision, so one short is a
+    // refusal rather than a seat quietly shrunk to fit.
+    expect((await adminAddPlayer({ DB: refusing }, -123, 3, bo, 9, 2)).status).toBe('full');
+    expect(refusing.inserts).toHaveLength(0);
+
+    const seating = seatingDb(2);
+    const alone = await adminAddPlayer({ DB: seating }, -123, 3, bo, 9);
+    expect(alone.status).toBe('added');
+    expect(seating.inserts[0][6]).toBe(1);
+  });
+
+  it('writes two heads on the one row when there is room for both', async () => {
+    const seating = seatingDb(1);
+    expect((await adminAddPlayer({ DB: seating }, -123, 3, bo, 9, 2)).status).toBe('added');
+    expect(seating.inserts[0][6]).toBe(2);
+  });
+});
+
 describe('the private court list', () => {
   const startsAt = Date.UTC(2026, 7, 19, 13, 0);
   const booking = {
@@ -308,6 +360,28 @@ describe('the private court list', () => {
     }));
     const view = await joinPickerView({ DB: db(full) }, -123, { id: 11, username: 'bob' }, false, now);
     // The board lists it, so a list that omitted it would read as a bug.
+    const button = view.replyMarkup.inline_keyboard[0][0];
+    expect(button.text).toContain('🔒 Full');
+    expect(button.callback_data).toBe('sb:full:3');
+  });
+
+  it('counts a +1 as two of the court’s slots', async () => {
+    const view = await joinPickerView(
+      { DB: db([{ booking_id: 3, slug: '@a', name: '@a', user_id: null, heads: 2 }]) },
+      -123, { id: 11, username: 'bob' }, false, now
+    );
+    const button = view.replyMarkup.inline_keyboard[0][0];
+    expect(button.callback_data).toBe('sb:join:3');
+    expect(button.text).toContain('1 slot');
+  });
+
+  it('marks a court full when a +1 took the last slot', async () => {
+    const roster = [
+      { booking_id: 3, slug: '@a', name: '@a', user_id: null, heads: 2 },
+      { booking_id: 3, slug: '@b', name: '@b', user_id: null, heads: 1 },
+    ];
+    const view = await joinPickerView({ DB: db(roster) }, -123, { id: 11, username: 'bob' }, false, now);
+    // Two rows, three heads: whoever tapped Join here would be the fourth.
     const button = view.replyMarkup.inline_keyboard[0][0];
     expect(button.text).toContain('🔒 Full');
     expect(button.callback_data).toBe('sb:full:3');

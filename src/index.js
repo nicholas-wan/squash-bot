@@ -213,52 +213,68 @@ async function handleBoardCallback(env, callback) {
     await answerCallback(env, callback.id, ...replies[result.status]);
     return true;
   }
-  const addPick = data.match(/^sb:addp:(\d+):(.+)$/);
+  // The head count comes before the slug and is a bare 1 or 2, which is what
+  // keeps this apart from the picker's own :h1 / :h2 rows — a slug can start
+  // with anything, so the digit has to be matched first and anchored.
+  const addPick = data.match(/^sb:addp:(\d+):([12]):(.+)$/);
   if (addPick) {
     if (!(await isChatAdmin(env, chatId, callback.from))) {
       await answerCallback(env, callback.id, 'Only group admins can add players.', true);
       return true;
     }
     const bookingId = Number(addPick[1]);
+    const heads = Number(addPick[2]);
     // Resolved fresh rather than trusted from the button, so a stale panel
     // cannot seat somebody under an outdated name or id.
     const candidate = (await knownPlayers(env, chatId))
-      .find((player) => player.slug === addPick[2]);
+      .find((player) => player.slug === addPick[3]);
     if (!candidate) {
       await answerCallback(env, callback.id, 'That player is no longer known.', true);
       return true;
     }
-    const result = await adminAddPlayer(env, chatId, bookingId, candidate, callback.from.id);
+    const result = await adminAddPlayer(
+      env, chatId, bookingId, candidate, callback.from.id, heads
+    );
     if (result.status === 'added') {
       // The seated player is the subject of the notice, not the admin tapping.
       await notifyRosterOfChange(env, chatId, result.booking, {
         id: candidate.user_id || null,
         username: candidate.slug.startsWith('@') ? candidate.slug.slice(1) : null,
         first_name: candidate.name,
-      }, 'added');
+      }, 'added', heads);
       await updateBoard(env, chatId);
       const view = await bookingPanelView(env, chatId, bookingId);
       if (view) await showPanel(env, callback, view);
     }
     const replies = {
-      added: [`${candidate.name} is on this court. Everyone on it has been told.`, false],
+      added: [heads > 1
+        ? `${candidate.name} +1 are on this court — two shares on the tab. `
+          + 'Everyone has been told.'
+        : `${candidate.name} is on this court. Everyone on it has been told.`, false],
       already: ['They are already on that court.', true],
-      full: ['That court is full. Open another slot first.', true],
+      full: [heads > 1
+        ? 'A +1 needs two free slots. Open another one first.'
+        : 'That court is full. Open another slot first.', true],
       gone: ['That booking has already gone.', true],
     };
     await answerCallback(env, callback.id, ...replies[result.status]);
     return true;
   }
-  const addOpen = data.match(/^sb:addp:(\d+)$/);
+  // Opening the picker and flipping its friend toggle are the same view drawn
+  // for one head or two, so they are one branch: the toggle only re-renders.
+  const addOpen = data.match(/^sb:addp:(\d+)(?::h([12]))?$/);
   if (addOpen) {
     if (!(await isChatAdmin(env, chatId, callback.from))) {
       await answerCallback(env, callback.id, 'Only group admins can add players.', true);
       return true;
     }
-    const view = await addPlayerView(env, chatId, Number(addOpen[1]));
+    const heads = Number(addOpen[2] || 1);
+    const view = await addPlayerView(env, chatId, Number(addOpen[1]), heads);
     if (view) await showPanel(env, callback, view);
     await answerCallback(env, callback.id,
-      view ? '' : 'Nobody to seat — the court is full, gone, or everyone known is on it.',
+      view ? '' : (heads > 1
+        ? 'A +1 needs two free slots, and this court has not got them.'
+        : 'Nobody to seat — the court is full, gone, or everyone known is on it.'),
       !view);
     return true;
   }
