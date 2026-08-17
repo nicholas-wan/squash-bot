@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import worker, { handleUpdate } from '../src/index.js';
+import { clearAdminCache } from '../src/players.js';
 
 function emptyDb() {
   return {
@@ -18,7 +19,11 @@ function emptyDb() {
 }
 
 describe('Telegram commands', () => {
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    clearAdminCache();
+  });
 
   it('responds to /help addressed to the bot username', async () => {
     const requests = [];
@@ -43,6 +48,48 @@ describe('Telegram commands', () => {
     expect(send.body.receiver_user_id).toBe(7);
     const removed = requests.find((request) => request.url.endsWith('/deleteMessage'));
     expect(removed.body.message_id).toBe(5);
+  });
+
+  it('clears a public command while its response is being prepared', async () => {
+    let releaseDelete;
+    const deleteGate = new Promise((resolve) => { releaseDelete = resolve; });
+    let helpLookupStarted = false;
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      if (String(url).endsWith('/deleteMessage')) await deleteGate;
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const db = {
+      prepare() {
+        return { bind() { return {
+          async first() {
+            helpLookupStarted = true;
+            return null;
+          },
+        }; } };
+      },
+    };
+    const handling = handleUpdate({
+      BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db,
+    }, {
+      message: {
+        message_id: 5,
+        chat: { id: -123456789 },
+        // No username keeps this test about command deletion rather than the
+        // independent player-identity batch.
+        from: { id: 7, first_name: 'Nick' },
+        text: '/help',
+      },
+    });
+    try {
+      // If deletion were still awaited first, the settings read could not
+      // begin while deleteMessage is deliberately held open.
+      await vi.waitFor(() => expect(helpLookupStarted).toBe(true), { timeout: 200 });
+    } finally {
+      releaseDelete();
+    }
+    await handling;
   });
 
   it('leaves an ephemeral command alone, having nothing it can delete', async () => {
@@ -490,9 +537,12 @@ describe('Telegram commands', () => {
   it('lets an admin seat a known player, telling the court', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
-      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      const body = JSON.parse(init.body);
+      requests.push({ url: String(url), body });
       const result = String(url).endsWith('/getChatMember')
-        ? { status: 'creator' } : { message_id: 55 };
+        ? { status: 'creator' }
+        : (String(url).endsWith('/sendMessage') && body.receiver_user_id
+          ? { ephemeral_message_id: 55 } : { message_id: 55 });
       return new Response(JSON.stringify({ ok: true, result }), {
         headers: { 'Content-Type': 'application/json' },
       });
@@ -520,6 +570,7 @@ describe('Telegram commands', () => {
       },
       async run() { return { meta: { changes: 1 } }; },
     }; } }; } };
+    db.batch = async (statements) => Promise.all(statements.map((statement) => statement.run()));
     await handleUpdate({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db }, {
       callback_query: {
         id: 'callback-1', data: 'sb:addp:3:1:@bo',
@@ -543,9 +594,12 @@ describe('Telegram commands', () => {
   it('seats a player with a friend as two heads on one row', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
-      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      const body = JSON.parse(init.body);
+      requests.push({ url: String(url), body });
       const result = String(url).endsWith('/getChatMember')
-        ? { status: 'creator' } : { message_id: 55 };
+        ? { status: 'creator' }
+        : (String(url).endsWith('/sendMessage') && body.receiver_user_id
+          ? { ephemeral_message_id: 55 } : { message_id: 55 });
       return new Response(JSON.stringify({ ok: true, result }), {
         headers: { 'Content-Type': 'application/json' },
       });
@@ -581,6 +635,7 @@ describe('Telegram commands', () => {
         return { meta: { changes: 1 } };
       },
     }; } }; } };
+    db.batch = async (statements) => Promise.all(statements.map((statement) => statement.run()));
     await handleUpdate({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db }, {
       callback_query: {
         id: 'callback-1', data: 'sb:addp:3:2:@bo',
@@ -650,9 +705,12 @@ describe('Telegram commands', () => {
   function plusOneRun(updateChanges) {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
-      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      const body = JSON.parse(init.body);
+      requests.push({ url: String(url), body });
       const result = String(url).endsWith('/getChatMember')
-        ? { status: 'creator' } : { message_id: 55 };
+        ? { status: 'creator' }
+        : (String(url).endsWith('/sendMessage') && body.receiver_user_id
+          ? { ephemeral_message_id: 55 } : { message_id: 55 });
       return new Response(JSON.stringify({ ok: true, result }), {
         headers: { 'Content-Type': 'application/json' },
       });
@@ -683,6 +741,7 @@ describe('Telegram commands', () => {
         return { meta: { changes: sql.includes('SET heads = 2') ? updateChanges : 1 } };
       },
     }; } }; } };
+    db.batch = async (statements) => Promise.all(statements.map((statement) => statement.run()));
     return { requests, ran, db };
   }
 
@@ -962,6 +1021,275 @@ describe('Telegram commands', () => {
     expect(telegramRequest.body).toBeInstanceOf(FormData);
     expect(JSON.parse(telegramRequest.body.get('photo'))).toEqual({
       type: 'static', photo: 'attach://profile_photo',
+    });
+  });
+
+  describe('private panel delivery', () => {
+    const panelTap = (data, env = {}) => handleUpdate({
+      BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: emptyDb(), ...env,
+    }, {
+      callback_query: {
+        id: 'callback-1', data,
+        from: { id: 7, first_name: 'Nick' },
+        message: { message_id: 55, chat: { id: -123456789 } },
+      },
+    });
+
+    it('answers when an admin panel cannot be delivered', async () => {
+      const requests = [];
+      vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+        requests.push({ url: String(url), body: JSON.parse(init.body) });
+        const refused = String(url).endsWith('/sendMessage');
+        return new Response(JSON.stringify(refused
+          ? { ok: false, description: 'USER_NOT_REACHABLE' }
+          : { ok: true, result: {} }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }));
+      await panelTap('sb:manage');
+      const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+      expect(answer.body.text).toContain('Something went wrong');
+      expect(answer.body.show_alert).toBe(true);
+    });
+
+    it('removes a tab panel if Telegram falls back to a public message', async () => {
+      const requests = [];
+      vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+        requests.push({ url: String(url), body: JSON.parse(init.body) });
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 91 } }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }));
+      // The owner shortcut avoids an unrelated getChatMember request while the
+      // test follows the same tab-panel path an ordinary member uses.
+      await panelTap('tb:mine', { OWNER_USER_ID: '7' });
+      const panel = requests.find((request) => request.url.endsWith('/sendMessage'));
+      expect(panel.body.text).toContain('Only you can see this');
+      const removed = requests.find((request) => request.url.endsWith('/deleteMessage'));
+      expect(removed.body.message_id).toBe(91);
+      const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+      expect(answer.body.text).toContain('Something went wrong');
+      expect(answer.body.show_alert).toBe(true);
+    });
+  });
+
+  // The join picker is the board's only door. Its delivery has to answer the
+  // tap whatever Telegram does with the send, because the tap's toast is the
+  // one channel that always reaches whoever pressed the button.
+  describe('join picker delivery', () => {
+    const booking = {
+      id: 3, chat_id: -123456789, court: '4', capacity: 3,
+      starts_at: Date.UTC(2026, 7, 19, 13, 0), ends_at: Date.UTC(2026, 7, 19, 14, 0),
+    };
+    const pickerDb = () => ({
+      prepare(sql) {
+        return { bind() { return {
+          async first() {
+            if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+            return null;
+          },
+          async all() {
+            if (sql.includes('FROM booking_players')) return { results: [] };
+            return { results: sql.includes('ends_at >') ? [booking] : [] };
+          },
+          async run() { return { meta: { changes: 1 } }; },
+        }; } };
+      },
+    });
+    const tap = (env) => handleUpdate(env, {
+      callback_query: {
+        id: 'callback-1', data: 'sb:join',
+        from: { id: 11, username: 'alice' },
+        message: { message_id: 55, chat: { id: -123456789 } },
+      },
+    });
+
+    it('tells the tapper when the court list cannot be sent at all', async () => {
+      const requests = [];
+      vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+        requests.push({ url: String(url), body: JSON.parse(init.body) });
+        // A refused ephemeral send — the shape a brand-new member sees.
+        const ok = !String(url).endsWith('/sendMessage');
+        return new Response(JSON.stringify(ok
+          ? { ok: true, result: { message_id: 55 } }
+          : { ok: false, description: 'USER_NOT_REACHABLE' }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }));
+      await tap({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: pickerDb() });
+      const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+      expect(answer.body.text).toContain('tap 🙋 Join again');
+      expect(answer.body.show_alert).toBe(true);
+    });
+
+    it('removes the public copy when Telegram will not deliver the list privately', async () => {
+      const requests = [];
+      vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+        requests.push({ url: String(url), body: JSON.parse(init.body) });
+        // ok, but as an ordinary group message: no ephemeral_message_id.
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 91 } }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }));
+      await tap({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: pickerDb() });
+      // "Only you can see this list" must not sit in the group.
+      const removed = requests.find((request) => request.url.endsWith('/deleteMessage'));
+      expect(removed.body.message_id).toBe(91);
+      const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+      expect(answer.body.text).toContain('tap 🙋 Join again');
+      expect(answer.body.show_alert).toBe(true);
+    });
+
+    it('points the tapper below once the list is delivered', async () => {
+      const requests = [];
+      vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+        requests.push({ url: String(url), body: JSON.parse(init.body) });
+        return new Response(JSON.stringify({
+          ok: true, result: { ephemeral_message_id: 12 },
+        }), { headers: { 'Content-Type': 'application/json' } });
+      }));
+      await tap({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: pickerDb() });
+      // Ephemeral messages may arrive without scrolling the chat, so the
+      // toast says where to look rather than saying nothing.
+      const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+      expect(answer.body.text).toContain('below');
+    });
+
+    it('answers the tap even when the handler throws', async () => {
+      const requests = [];
+      const logged = [];
+      vi.spyOn(console, 'log').mockImplementation((line) => logged.push(line));
+      vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+        requests.push({ url: String(url), body: JSON.parse(init.body) });
+        return new Response(JSON.stringify({ ok: true, result: {} }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }));
+      const db = { prepare() { throw new Error('D1 is down'); } };
+      // No username, so rememberPlayer returns before it can touch the DB and
+      // the throw lands inside the picker build itself.
+      await handleUpdate({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db }, {
+        callback_query: {
+          id: 'callback-1', data: 'sb:join',
+          from: { id: 11, first_name: 'Alice' },
+          message: { message_id: 55, chat: { id: -123456789 } },
+        },
+      });
+      // The failure is logged for the operator and answered for the tapper: an
+      // unanswered callback leaves the button spinning, which reads as a dead
+      // bot rather than a passing error.
+      expect(logged.join('\n')).toContain('Callback failed');
+      const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+      expect(answer.body.text).toContain('Something went wrong');
+      expect(answer.body.show_alert).toBe(true);
+      vi.restoreAllMocks();
+    });
+
+    it('confirms a join before the roster notices and board edit go out', async () => {
+      const requests = [];
+      vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+        requests.push({ url: String(url), body: JSON.parse(init.body) });
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 55 } }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }));
+      const db = {
+        prepare(sql) {
+          return { bind() { return {
+            async first() {
+              if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+              if (sql.includes('SELECT * FROM bookings WHERE id')) return booking;
+              if (sql.includes('board_message_id')) return { board_message_id: 55 };
+              return null;
+            },
+            async all() {
+              if (sql.includes('FROM booking_players')) return { results: [] };
+              return { results: sql.includes('ends_at >') ? [booking] : [] };
+            },
+            async run() {
+              return { meta: { changes: sql.startsWith('DELETE FROM booking_players') ? 0 : 1 } };
+            },
+          }; } };
+        },
+      };
+      await handleUpdate({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db }, {
+        callback_query: {
+          id: 'callback-1', data: 'sb:join:3',
+          from: { id: 11, username: 'alice' },
+          message: { message_id: 55, chat: { id: -123456789 } },
+        },
+      });
+      // The toast is the only feedback that expires, so it must not queue
+      // behind the notification burst and the pinned-board edit.
+      const answerAt = requests.findIndex(
+        (request) => request.url.endsWith('/answerCallbackQuery')
+      );
+      const boardEditAt = requests.findIndex(
+        (request) => request.url.endsWith('/editMessageText')
+      );
+      expect(requests[answerAt].body.text).toContain('You are in');
+      expect(answerAt).toBeGreaterThan(-1);
+      expect(boardEditAt).toBeGreaterThan(answerAt);
+      const actorNotice = requests
+        .filter((request) => request.url.endsWith('/sendMessage'))
+        .find((request) => request.body.receiver_user_id === 11
+          && request.body.text.includes('You are on'));
+      expect(actorNotice.body.callback_query_id).toBe('callback-1');
+    });
+
+    it('reports a failed in-place picker refresh without losing the join confirmation', async () => {
+      const requests = [];
+      vi.spyOn(console, 'log').mockImplementation(() => {});
+      vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+        const body = JSON.parse(init.body);
+        requests.push({ url: String(url), body });
+        if (String(url).endsWith('/editEphemeralMessageText')) {
+          return new Response(JSON.stringify({
+            ok: false, description: 'MESSAGE_CANNOT_BE_EDITED',
+          }), { headers: { 'Content-Type': 'application/json' } });
+        }
+        const result = String(url).endsWith('/sendMessage') && body.receiver_user_id
+          ? { ephemeral_message_id: 77 } : { message_id: 55 };
+        return new Response(JSON.stringify({ ok: true, result }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }));
+      const db = {
+        prepare(sql) {
+          return { bind() { return {
+            async first() {
+              if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+              if (sql.includes('SELECT * FROM bookings WHERE id')) return booking;
+              if (sql.includes('board_message_id')) return { board_message_id: 55 };
+              return null;
+            },
+            async all() {
+              if (sql.includes('FROM booking_players')) return { results: [] };
+              return { results: sql.includes('ends_at >') ? [booking] : [] };
+            },
+            async run() { return { meta: { changes: 1 } }; },
+          }; } };
+        },
+        async batch(statements) {
+          return statements.map(() => ({ success: true }));
+        },
+      };
+      await handleUpdate({
+        BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', OWNER_USER_ID: '11', DB: db,
+      }, {
+        callback_query: {
+          id: 'callback-1', data: 'sb:join:3',
+          from: { id: 11, username: 'alice' },
+          message: {
+            message_id: 55, ephemeral_message_id: 88, chat: { id: -123456789 },
+          },
+        },
+      });
+      const answers = requests.filter((request) => request.url.endsWith('/answerCallbackQuery'));
+      expect(answers[0].body.text).toContain('You are in');
+      expect(answers[1].body.text).toContain('Something went wrong');
+      expect(requests.some((request) => request.url.endsWith('/editEphemeralMessageText')))
+        .toBe(true);
     });
   });
 });

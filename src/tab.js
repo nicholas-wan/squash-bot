@@ -213,17 +213,26 @@ export async function updateTab(env, chatId) {
   const balances = await tabBalances(env, chatId);
   const html = tabHtml(env, balances);
   const markup = html ? tabMarkup(balances) : null;
-  let pinned = null;
-  for (const chat of boardChats(env, chatId)) {
+  // Shared tabs are independent Telegram calls, just like shared boards. A
+  // slow or kicked sibling should not add its full round trip to every /tab.
+  const outcomes = await Promise.all(boardChats(env, chatId).map(async (chat) => {
     try {
       const id = await updatePinnedMessage(env, chat, 'tab_message_id', html, markup, 'squash tab');
-      if (chat === chatId) pinned = id;
+      return { chat, id };
     } catch (error) {
-      if (chat === chatId) throw error;
-      console.log(`Tab update for sibling chat ${chat} failed: ${error.stack || error}`);
+      return { chat, error };
     }
+  }));
+  for (const outcome of outcomes) {
+    if (!outcome.error || outcome.chat === chatId) continue;
+    console.log(
+      `Tab update for sibling chat ${outcome.chat} failed: `
+      + `${outcome.error.stack || outcome.error}`
+    );
   }
-  return pinned;
+  const acting = outcomes.find((outcome) => outcome.chat === chatId);
+  if (acting && acting.error) throw acting.error;
+  return acting ? acting.id : null;
 }
 
 export async function settleMarkup(env, chatId) {

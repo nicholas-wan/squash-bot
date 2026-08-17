@@ -156,12 +156,28 @@ async function handleBoardCallback(env, callback) {
       await answerCallback(env, callback.id, 'There is nothing to join yet.', true);
       return true;
     }
-    await sendMessage(env, chatId, view.html, {
-      replyMarkup: view.replyMarkup,
-      receiverUserId: callback.from.id,
-      callbackQueryId: callback.id,
-    });
-    await answerCallback(env, callback.id);
+    const delivery = await sendPrivatePanel(env, callback, view);
+    // A refused send used to be ignored, which read as a dead button — for a
+    // brand-new member most of all, the one person Telegram is likeliest to
+    // refuse an ephemeral message for. The tap is the only channel left, so
+    // the failure is said there, as an alert rather than a toast.
+    if (delivery.status === 'failed') {
+      await answerCallback(env, callback.id,
+        'I could not open your court list. Please tap 🙋 Join again.', true);
+      return true;
+    }
+    // Telegram falls back to an ordinary group message when it cannot deliver
+    // an ephemeral one, which would publish "Only you can see this list" — and
+    // the rosters on it — to the whole group. Same rule as sendPrivately: the
+    // public copy goes, and the tapper is told rather than left guessing.
+    if (delivery.status === 'public-fallback') {
+      await answerCallback(env, callback.id,
+        'Telegram would not deliver your private court list. Please tap 🙋 Join again.', true);
+      return true;
+    }
+    // An ephemeral message arrives without a notification, so the chat does
+    // not always scroll to it; the toast says where to look.
+    await answerCallback(env, callback.id, '🎾 Your court list is below ⬇️');
     return true;
   }
   if (data === 'sb:close' || data === 'sb:ok') {
@@ -191,23 +207,26 @@ async function handleBoardCallback(env, callback) {
       started: ['That court has already started, so the roster is locked.', true],
       gone: ['That booking has already gone.', true],
     };
-    // Telling the court comes first. updateBoard throws when the pinned message
-    // cannot be edited or re-pinned, and the catch around this handler would
-    // then swallow the notification along with it — the people on the court
-    // would never hear, for a reason that has nothing to do with them.
     if (result.status === 'joined' || result.status === 'left') {
-      const { othersTold } = await notifyRosterOfChange(
-        env, chatId, result.booking, callback.from, result.status
+      // The slot changed hands the moment the insert or delete ran, so the
+      // toast goes out first: it is the one piece of feedback that expires,
+      // and it used to wait behind the notification burst, the board edit,
+      // and the picker refresh — long enough for Telegram to discard it,
+      // which read as a tap that did nothing. The roster's private notices
+      // carry the fuller story; the toast only confirms the slot moved.
+      await answerCallback(env, callback.id, result.status === 'left'
+        ? 'You are out. Your slot is free again.' : 'You are in.');
+      // Telling the court still comes before the board: updateBoard throws
+      // when the pinned message cannot be edited or re-pinned, and the catch
+      // around this handler would then swallow the notification along with it
+      // — the people on the court would never hear, for a reason that has
+      // nothing to do with them.
+      await notifyRosterOfChange(
+        env, chatId, result.booking, callback.from, result.status, 1,
+        { callbackQueryId: callback.id }
       );
       await updateBoard(env, chatId);
       await refreshJoinPicker(env, callback);
-      // "Has been told" is only said when it is true: a roster row seeded from
-      // config with no id to send to, or a send Telegram refused, means
-      // somebody on the court has not heard.
-      const confirmed = result.status === 'left'
-        ? 'You are out. Your slot is free again.' : 'You are in.';
-      await answerCallback(env, callback.id, othersTold
-        ? `${confirmed} Everyone else on the court has been told.` : confirmed);
       return true;
     }
     await answerCallback(env, callback.id, ...replies[result.status]);
@@ -372,6 +391,25 @@ async function handleBoardCallback(env, callback) {
   return false;
 }
 
+// A private send can come back as an ordinary group message. Every panel uses
+// this one gate so a roster or tab that says "Only you can see this" is never
+// left where everyone can read it. The caller owns the wording shown on failure.
+async function sendPrivatePanel(env, callback, view) {
+  const chatId = callback.message.chat.id;
+  const sent = await sendMessage(env, chatId, view.html, {
+    receiverUserId: callback.from.id,
+    callbackQueryId: callback.id,
+    replyMarkup: view.replyMarkup,
+  });
+  if (!sent.ok || !sent.result) return { status: 'failed', sent };
+  if (sent.result.ephemeral_message_id) return { status: 'private', sent };
+  if (sent.result.message_id) {
+    const removed = await deleteMessage(env, chatId, sent.result.message_id);
+    return { status: 'public-fallback', sent, removed };
+  }
+  return { status: 'failed', sent };
+}
+
 // Panels are private to one person. The first tap comes off the shared pinned
 // board and has to open a new ephemeral message; every tap after that arrives
 // from inside the panel and edits it in place. Nothing here ever writes to the
@@ -380,15 +418,22 @@ async function showPanel(env, callback, view) {
   const chatId = callback.message.chat.id;
   const ephemeralId = callback.message.ephemeral_message_id;
   if (ephemeralId) {
-    return editEphemeralMessage(
+    const edited = await editEphemeralMessage(
       env, chatId, callback.from.id, ephemeralId, view.html, view.replyMarkup
     );
+    if (!edited.ok) {
+      throw new Error(`Could not update private panel: ${edited.description || 'unknown Telegram error'}`);
+    }
+    return edited;
   }
-  return sendMessage(env, chatId, view.html, {
-    receiverUserId: callback.from.id,
-    callbackQueryId: callback.id,
-    replyMarkup: view.replyMarkup,
-  });
+  const delivery = await sendPrivatePanel(env, callback, view);
+  if (delivery.status !== 'private') {
+    const removal = delivery.status === 'public-fallback' && delivery.removed && !delivery.removed.ok
+      ? `; public fallback could not be removed: ${delivery.removed.description || 'unknown error'}`
+      : '';
+    throw new Error(`Could not deliver private panel (${delivery.status})${removal}`);
+  }
+  return delivery.sent;
 }
 
 // The court list is a private message to one person, so it is edited in place
@@ -400,11 +445,14 @@ async function refreshJoinPicker(env, callback) {
   const view = await joinPickerView(
     env, chatId, callback.from, await isChatAdmin(env, chatId, callback.from)
   );
-  await editEphemeralMessage(
+  const edited = await editEphemeralMessage(
     env, chatId, callback.from.id, ephemeralId,
     view ? view.html : '🎾 <i>Nothing left to join.</i>',
     view ? view.replyMarkup : { inline_keyboard: [] }
   );
+  if (!edited.ok) {
+    throw new Error(`Could not refresh private court list: ${edited.description || 'unknown Telegram error'}`);
+  }
 }
 
 async function dismissMessage(env, callback) {
@@ -517,6 +565,12 @@ export async function handleUpdate(env, update) {
       await handleBookingCallback(env, callback);
     } catch (error) {
       console.log(`Callback failed: ${error.stack || error}`);
+      // A tap must never die silently: an unanswered callback leaves the
+      // button spinning, which reads as a dead bot — even when the change
+      // itself committed before the failure. Answering twice is harmless;
+      // Telegram ignores the second answer.
+      await answerCallback(env, callback.id,
+        '⚠️ Something went wrong. Please try again.', true);
     }
     return;
   }
@@ -558,12 +612,14 @@ export async function handleUpdate(env, update) {
     // remove it: deleteEphemeralMessage takes the id of a user who *received* a
     // message from the bot, so it only reaches the bot's own ephemeral
     // messages. Aimed at an incoming command it answers MESSAGE_NOT_FOUND.
-    if (knownCommands.has(command) && msg.message_id && !msg.ephemeral_message_id) {
-      await clearSentMessage(env, msg, 'command');
-    }
+    const clearCommand = knownCommands.has(command) && msg.message_id && !msg.ephemeral_message_id
+      ? clearSentMessage(env, msg, 'command')
+      : Promise.resolve();
 
     if (command === 'start' || command === 'help') {
-      const replyMarkup = await helpBoardMarkup(env, msg.chat.id);
+      const [replyMarkup] = await Promise.all([
+        helpBoardMarkup(env, msg.chat.id), clearCommand,
+      ]);
       await sendMessage(env, msg.chat.id, helpHtml(env), {
         receiverUserId: msg.from.id,
         replyToEphemeral: msg.ephemeral_message_id || null,
@@ -572,14 +628,18 @@ export async function handleUpdate(env, update) {
       return;
     }
     if (command === 'book') {
-      await beginBooking(env, msg, args, { forceIntent: true });
+      await Promise.all([
+        beginBooking(env, msg, args, { forceIntent: true }), clearCommand,
+      ]);
       return;
     }
     // Both refresh commands answer even when nothing changed: a command whose
     // success looks identical to silence cannot be told apart from a broken
     // bot, which is exactly how one outage went unnoticed.
     if (command === 'courts') {
-      const pinned = await updateBoard(env, msg.chat.id);
+      const [pinned] = await Promise.all([
+        updateBoard(env, msg.chat.id), clearCommand,
+      ]);
       await sendMessage(env, msg.chat.id,
         pinned ? '🎾 Board refreshed — it is the pinned message.'
           : '🎾 Nothing is booked right now, so there is no board. It returns with the next booking.', {
@@ -590,7 +650,9 @@ export async function handleUpdate(env, update) {
       return;
     }
     if (command === 'tab') {
-      const pinned = await updateTab(env, msg.chat.id);
+      const [pinned] = await Promise.all([
+        updateTab(env, msg.chat.id), clearCommand,
+      ]);
       await sendMessage(env, msg.chat.id,
         pinned ? '💰 Tab refreshed — it is the pinned message.'
           : '💰 Nothing outstanding. Shares appear on the tab after a court has been played.', {
@@ -602,17 +664,18 @@ export async function handleUpdate(env, update) {
     }
     if (command === 'cancel') {
       if (!/^\d+$/.test(args)) {
-        await sendMessage(env, msg.chat.id,
+        await Promise.all([clearCommand, sendMessage(env, msg.chat.id,
           'Use <code>/cancel ID</code>, for example <code>/cancel 3</code>.', {
             receiverUserId: msg.from.id,
             replyToEphemeral: msg.ephemeral_message_id || null,
             replyMarkup: OK_MARKUP,
-          });
+          })]);
         return;
       }
-      const result = await cancelBooking(
-        env, msg.chat.id, Number(args), msg.from, `/cancel ${args}`
-      );
+      const [result] = await Promise.all([
+        cancelBooking(env, msg.chat.id, Number(args), msg.from, `/cancel ${args}`),
+        clearCommand,
+      ]);
       const replies = {
         cancelled: `🗑 Removed booking <b>#${escapeHtml(args)}</b>.`,
         gone: `I couldn't find booking <b>#${escapeHtml(args)}</b>.`,

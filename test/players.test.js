@@ -1,9 +1,14 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { joinPickerView } from '../src/bookings.js';
 import {
-  adminAddPlayer, defaultCapacity, defaultPlayers, householdSlugs, identity,
-  isChatAdmin, ownerIdentity, rememberPlayer, seedRoster,
+  adminAddPlayer, clearAdminCache, defaultCapacity, defaultPlayers, householdSlugs,
+  identity, isChatAdmin, ownerIdentity, rememberPlayer, seedRoster,
 } from '../src/players.js';
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  clearAdminCache();
+});
 
 const env = {
   OWNER: '@nicholaswan',
@@ -131,9 +136,49 @@ describe('player identity', () => {
     const admin = await isChatAdmin(env, -123, { id: 5, username: 'NicholasWan' });
     expect(admin).toBe(true);
   });
+
+  it('reuses a recent Telegram admin check', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify({
+        ok: true, result: { status: 'administrator' },
+      }), { headers: { 'Content-Type': 'application/json' } });
+    }));
+    const checkedEnv = { BOT_TOKEN: 'test-token' };
+    const who = { id: 42, username: 'alice' };
+    expect(await isChatAdmin(checkedEnv, -123, who)).toBe(true);
+    expect(await isChatAdmin(checkedEnv, -123, who)).toBe(true);
+    expect(requests.filter((request) => request.url.endsWith('/getChatMember')))
+      .toHaveLength(1);
+  });
 });
 
 describe('remembering a player', () => {
+  it('sends the three ordered identity statements in one D1 batch', async () => {
+    const statements = [];
+    const batches = [];
+    const run = vi.fn();
+    const db = {
+      prepare(sql) {
+        return { bind(...args) {
+          const statement = { sql, args, run };
+          statements.push(statement);
+          return statement;
+        } };
+      },
+      async batch(batch) {
+        batches.push(batch);
+        return batch.map(() => ({ success: true }));
+      },
+    };
+    await rememberPlayer({ DB: db }, { id: 42, username: 'Alice' });
+    expect(batches).toHaveLength(1);
+    expect(batches[0]).toEqual(statements);
+    expect(batches[0]).toHaveLength(3);
+    expect(run).not.toHaveBeenCalled();
+  });
+
   it('moves someone who picks up a username onto it, rather than splitting them', async () => {
     const rows = [
       { booking_id: 1, slug: 'u42', user_id: 42, name: 'Alice' },
