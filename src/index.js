@@ -1,10 +1,11 @@
 import {
-  authorizeBookingChange, bookingPanelView, cancelBooking, deletePanelView, managerView,
-  notifyRemovedPlayer, notifyRosterOfChange, removePlayerView, restoreBoardButtons,
-  runMaintenance, joinPickerView, updateBoard,
+  addPlayerView, authorizeBookingChange, bookingPanelView, cancelBooking, deletePanelView,
+  managerView, notifyRemovedPlayer, notifyRosterOfChange, removePlayerView,
+  restoreBoardButtons, runMaintenance, joinPickerView, updateBoard,
 } from './bookings.js';
 import {
-  defaultCapacity, isChatAdmin, MAX_CAPACITY, raiseCapacity, rememberPlayer,
+  adminAddPlayer, defaultCapacity, isChatAdmin, knownPlayers, MAX_CAPACITY,
+  raiseCapacity, rememberPlayer,
   joinBooking, leaveBooking, removeBookingPlayer, toggleBooking,
 } from './players.js';
 import { looksLikeBooking } from './parser.js';
@@ -210,6 +211,55 @@ async function handleBoardCallback(env, callback) {
       return true;
     }
     await answerCallback(env, callback.id, ...replies[result.status]);
+    return true;
+  }
+  const addPick = data.match(/^sb:addp:(\d+):(.+)$/);
+  if (addPick) {
+    if (!(await isChatAdmin(env, chatId, callback.from))) {
+      await answerCallback(env, callback.id, 'Only group admins can add players.', true);
+      return true;
+    }
+    const bookingId = Number(addPick[1]);
+    // Resolved fresh rather than trusted from the button, so a stale panel
+    // cannot seat somebody under an outdated name or id.
+    const candidate = (await knownPlayers(env, chatId))
+      .find((player) => player.slug === addPick[2]);
+    if (!candidate) {
+      await answerCallback(env, callback.id, 'That player is no longer known.', true);
+      return true;
+    }
+    const result = await adminAddPlayer(env, chatId, bookingId, candidate, callback.from.id);
+    if (result.status === 'added') {
+      // The seated player is the subject of the notice, not the admin tapping.
+      await notifyRosterOfChange(env, chatId, result.booking, {
+        id: candidate.user_id || null,
+        username: candidate.slug.startsWith('@') ? candidate.slug.slice(1) : null,
+        first_name: candidate.name,
+      }, 'added');
+      await updateBoard(env, chatId);
+      const view = await bookingPanelView(env, chatId, bookingId);
+      if (view) await showPanel(env, callback, view);
+    }
+    const replies = {
+      added: [`${candidate.name} is on this court. Everyone on it has been told.`, false],
+      already: ['They are already on that court.', true],
+      full: ['That court is full. Open another slot first.', true],
+      gone: ['That booking has already gone.', true],
+    };
+    await answerCallback(env, callback.id, ...replies[result.status]);
+    return true;
+  }
+  const addOpen = data.match(/^sb:addp:(\d+)$/);
+  if (addOpen) {
+    if (!(await isChatAdmin(env, chatId, callback.from))) {
+      await answerCallback(env, callback.id, 'Only group admins can add players.', true);
+      return true;
+    }
+    const view = await addPlayerView(env, chatId, Number(addOpen[1]));
+    if (view) await showPanel(env, callback, view);
+    await answerCallback(env, callback.id,
+      view ? '' : 'Nobody to seat — the court is full, gone, or everyone known is on it.',
+      !view);
     return true;
   }
   const kicked = data.match(/^sb:kick:(\d+):(\d+)$/);
@@ -468,20 +518,29 @@ export async function handleUpdate(env, update) {
       await beginBooking(env, msg, args, { forceIntent: true });
       return;
     }
+    // Both refresh commands answer even when nothing changed: a command whose
+    // success looks identical to silence cannot be told apart from a broken
+    // bot, which is exactly how one outage went unnoticed.
     if (command === 'courts') {
-      await updateBoard(env, msg.chat.id);
+      const pinned = await updateBoard(env, msg.chat.id);
+      await sendMessage(env, msg.chat.id,
+        pinned ? '🎾 Board refreshed — it is the pinned message.'
+          : '🎾 Nothing is booked right now, so there is no board. It returns with the next booking.', {
+          receiverUserId: msg.from.id,
+          replyToEphemeral: msg.ephemeral_message_id || null,
+          replyMarkup: OK_MARKUP,
+        });
       return;
     }
     if (command === 'tab') {
       const pinned = await updateTab(env, msg.chat.id);
-      if (!pinned) {
-        await sendMessage(env, msg.chat.id,
-          '💰 Nothing outstanding. Shares appear on the tab after a court has been played.', {
-            receiverUserId: msg.from.id,
-            replyToEphemeral: msg.ephemeral_message_id || null,
-            replyMarkup: OK_MARKUP,
-          });
-      }
+      await sendMessage(env, msg.chat.id,
+        pinned ? '💰 Tab refreshed — it is the pinned message.'
+          : '💰 Nothing outstanding. Shares appear on the tab after a court has been played.', {
+          receiverUserId: msg.from.id,
+          replyToEphemeral: msg.ephemeral_message_id || null,
+          replyMarkup: OK_MARKUP,
+        });
       return;
     }
     if (command === 'cancel') {
@@ -607,11 +666,17 @@ export default {
       if (request.method !== 'POST') return new Response('method not allowed', { status: 405 });
       if (!adminAuthorized(request, env)) return new Response('forbidden', { status: 403 });
       const chatIds = String(env.ALLOWED_CHATS || '').split(',').map((id) => id.trim()).filter(Boolean);
-      await Promise.all(chatIds.map(async (chatId) => {
-        await updateBoard(env, Number(chatId));
-        await updateTab(env, Number(chatId));
+      const outcomes = await Promise.all(chatIds.map(async (chatId) => {
+        try {
+          await updateBoard(env, Number(chatId));
+          await updateTab(env, Number(chatId));
+          return `${chatId}: ok`;
+        } catch (error) {
+          console.log(`Refresh for chat ${chatId} failed: ${error.stack || error}`);
+          return `${chatId}: failed (${error.message})`;
+        }
       }));
-      return new Response(`Refreshed the board and tab in ${chatIds.length} chat(s).`);
+      return new Response(`Refreshed board and tab — ${outcomes.join('; ')}`);
     }
 
     if (url.pathname === '/profile-photo') {

@@ -1,11 +1,10 @@
 import {
-  clearRoster, defaultCapacity, DEFAULT_CAPACITY, identity, isChatAdmin, MAX_CAPACITY,
-  rosterFor, rostersFor, seedRoster,
+  clearRoster, defaultCapacity, DEFAULT_CAPACITY, identity, isChatAdmin,
+  knownPlayers, MAX_CAPACITY, rosterFor, rostersFor, seedRoster,
 } from './players.js';
 import { allowedChats, boardChats, dataChatId, reachableChat, sharingData } from './scope.js';
 import { getTimezone, updatePinnedMessage } from './settings.js';
-import { formatMoney } from './pricing.js';
-import { chargeBooking, tabBalances, updateTab } from './tab.js';
+import { breakdownLines, chargeBooking, tabBalances, updateTab } from './tab.js';
 import { formatDate, formatTime, localParts, zonedEpoch } from './time.js';
 import {
   deleteEphemeralMessage, deleteMessage, editReplyMarkup, escapeHtml, mentionHtml,
@@ -377,13 +376,14 @@ async function renderBoard(env, chatId, now) {
   const lines = ['🎾 <b>Upcoming squash courts</b>'];
   for (const booking of bookings) {
     const roster = rosters.get(booking.id) || [];
+    const slots = slotsLabel(roster, booking.capacity || DEFAULT_CAPACITY);
+    const line = `${compactTimeRange(booking.starts_at, booking.ends_at, tz)} · ` +
+      `<b>${escapeHtml(courtName(booking))}</b> · ${slots}`;
     lines.push('');
     lines.push(formatCountdown(booking.starts_at, tz, now));
-    lines.push(
-      `${compactTimeRange(booking.starts_at, booking.ends_at, tz)} · ` +
-      `<b>${escapeHtml(courtName(booking))}</b> · ` +
-      `${slotsLabel(roster, booking.capacity || DEFAULT_CAPACITY)}`
-    );
+    // A full court stays listed — dropping it would read as a court nobody
+    // took — but struck through, so the open slots pop at a glance.
+    lines.push(slots === 'full' ? `<s>${line}</s>` : line);
   }
   return {
     html: lines.join('\n'),
@@ -395,14 +395,29 @@ export async function boardHtml(env, chatId, now = Date.now()) {
   return (await renderBoard(env, chatId, now)).html;
 }
 
-// Every group sharing these bookings gets the same pinned board.
+// Every group sharing these bookings gets the same pinned board. A sibling
+// chat gone bad — bot kicked, group deleted, pin rights revoked — is logged
+// and skipped: it must not take down the chat the tap actually came from,
+// which once turned one kicked group into every command failing everywhere.
+// Only the acting chat's own failure still surfaces, because there it is the
+// answer the person is waiting on.
 export async function updateBoard(env, chatId, now = Date.now()) {
   const board = await renderBoard(env, chatId, now);
+  // The acting chat's pinned id comes back, so a command can say whether a
+  // board exists at all — null means nothing is booked and nothing is pinned.
+  let pinned = null;
   for (const chat of boardChats(env, chatId)) {
-    await updatePinnedMessage(
-      env, chat, 'board_message_id', board.html, board.replyMarkup, 'court board'
-    );
+    try {
+      const id = await updatePinnedMessage(
+        env, chat, 'board_message_id', board.html, board.replyMarkup, 'court board'
+      );
+      if (chat === chatId) pinned = id;
+    } catch (error) {
+      if (chat === chatId) throw error;
+      console.log(`Board update for sibling chat ${chat} failed: ${error.stack || error}`);
+    }
   }
+  return pinned;
 }
 
 function bookingLabel(booking, tz) {
@@ -453,6 +468,12 @@ export async function bookingPanelView(env, chatId, bookingId) {
     }]);
   }
   const roster = await rosterFor(env, booking.id);
+  // Only while a slot is free: seating somebody never squeezes past capacity.
+  if (roster.length < capacity) {
+    rows.push([{
+      text: '➕ Admin: add a player', callback_data: `sb:addp:${booking.id}`,
+    }]);
+  }
   if (roster.length) {
     rows.push([{
       text: '🚪 Admin: remove a player', callback_data: `sb:kick:${booking.id}`,
@@ -467,6 +488,40 @@ export async function bookingPanelView(env, chatId, bookingId) {
     html: `⚙️ <b>${escapeHtml(bookingLabel(booking, tz))}</b>\n`
       + `👥 ${playerTags(roster)} · ${slotsLabel(roster, capacity)}\n\n`
       + 'Only you can see this.',
+    replyMarkup: { inline_keyboard: rows },
+  };
+}
+
+// Who an admin can seat: everyone the bot knows who is not already on this
+// court, while a slot is free. Somebody the bot has never seen is not listed —
+// they are in the group anyway, and can tap 🙋 Join themselves.
+export async function addPlayerView(env, chatId, bookingId) {
+  const booking = await env.DB.prepare(
+    'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
+  ).bind(bookingId, dataChatId(env, chatId), Date.now()).first();
+  if (!booking) return null;
+  const roster = await rosterFor(env, bookingId);
+  const capacity = booking.capacity || DEFAULT_CAPACITY;
+  if (roster.length >= capacity) return null;
+  const seated = new Set(roster.map((player) => player.slug));
+  const encoder = new TextEncoder();
+  const candidates = (await knownPlayers(env, chatId))
+    .filter((player) => !seated.has(player.slug))
+    // Telegram caps callback_data at 64 bytes; a slug that will not fit
+    // cannot be offered as a button.
+    .filter((player) => encoder.encode(`sb:addp:${bookingId}:${player.slug}`).length <= 64)
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .slice(0, MAX_JOIN_BUTTONS);
+  if (!candidates.length) return null;
+  const tz = await getTimezone(env, chatId);
+  const rows = candidates.map((player) => [{
+    text: `➕ ${player.name}`, callback_data: `sb:addp:${bookingId}:${player.slug}`,
+  }]);
+  rows.push([{ text: '← Back', callback_data: `sb:pick:${bookingId}` }]);
+  return {
+    html: `➕ <b>Seat somebody on ${escapeHtml(bookingLabel(booking, tz))}</b>\n\n`
+      + 'They are billed like anyone who joined themselves. Anyone not listed '
+      + 'can tap 🙋 Join on the pinned board.',
     replyMarkup: { inline_keyboard: rows },
   };
 }
@@ -517,8 +572,10 @@ export async function notifyRemovedPlayer(env, chatId, player, booking) {
 // — correct by the letter, invisible to somebody reading the other one.
 export async function notifyRosterOfChange(env, chatId, booking, from, action) {
   // Loud, not lenient: an unrecognised action falling through to one of the
-  // two messages would announce something that did not happen.
-  if (action !== 'joined' && action !== 'left') {
+  // messages would announce something that did not happen. 'added' is an
+  // admin seating somebody — for them and the roster it reads like a join,
+  // but the wording says who did it was not them.
+  if (action !== 'joined' && action !== 'left' && action !== 'added') {
     throw new Error(`notifyRosterOfChange: unknown action "${action}"`);
   }
   const left = action === 'left';
@@ -534,7 +591,9 @@ export async function notifyRosterOfChange(env, chatId, booking, from, action) {
     + `👥 ${playerTags(roster)}`;
   const toOthers = left
     ? `🚪 <b>${escapeHtml(actor.name)}</b> left ${where}`
-    : `🙋 <b>${escapeHtml(actor.name)}</b> joined ${where}`;
+    : (action === 'added'
+      ? `➕ <b>${escapeHtml(actor.name)}</b> was seated on ${where}`
+      : `🙋 <b>${escapeHtml(actor.name)}</b> joined ${where}`);
   const toActor = left ? `🚪 <b>You are off</b> ${where}` : `✅ <b>You are on</b> ${where}`;
   // The actor's copy is planned first whichever way the slot went — a leaver's
   // row is already deleted, so the roster could never produce it, and one path
@@ -660,12 +719,15 @@ async function sendPrivately(env, chatId, html, userId, deleteAfter, options = {
 async function remindPublicly(env, booking, roster, headline, tz) {
   // The roster line already tags everyone, so this needs nothing extra — and it
   // goes out silently, because the one message the group cannot avoid seeing
-  // should not also buzz every phone in it.
-  const sent = await sendMessage(env, booking.chat_id,
+  // should not also buzz every phone in it. The booking row lives under the
+  // data chat id, which may be no chat the bot can still post to, so the
+  // fallback goes to a chat it is actually in.
+  const chatId = reachableChat(env, { chat_id: booking.chat_id }, booking.chat_id);
+  const sent = await sendMessage(env, chatId,
     reminderHtml(booking, roster, headline, tz), { silent: true });
   if (sent.ok && sent.result) {
     await scheduleCleanup(
-      env, booking.chat_id, sent.result, null, endOfLocalDay(booking.starts_at, tz)
+      env, chatId, sent.result, null, endOfLocalDay(booking.starts_at, tz)
     );
   }
   return sent.ok;
@@ -862,16 +924,21 @@ async function removeExpiredBookings(env, now) {
 // than every minute.
 async function refreshStaleBoards(env, now) {
   for (const chatId of allowedChats(env)) {
-    const tz = await getTimezone(env, chatId);
-    const parts = localParts(now, tz);
-    const today = `${parts.y}-${parts.mo}-${parts.d}`;
-    const setting = await env.DB.prepare(
-      'SELECT board_message_id, board_day FROM settings WHERE chat_id = ?'
-    ).bind(chatId).first();
-    if (!setting || !setting.board_message_id || setting.board_day === today) continue;
-    await env.DB.prepare('UPDATE settings SET board_day = ? WHERE chat_id = ?')
-      .bind(today, chatId).run();
-    await updateBoard(env, chatId);
+    try {
+      const tz = await getTimezone(env, chatId);
+      const parts = localParts(now, tz);
+      const today = `${parts.y}-${parts.mo}-${parts.d}`;
+      const setting = await env.DB.prepare(
+        'SELECT board_message_id, board_day FROM settings WHERE chat_id = ?'
+      ).bind(chatId).first();
+      if (!setting || !setting.board_message_id || setting.board_day === today) continue;
+      await env.DB.prepare('UPDATE settings SET board_day = ? WHERE chat_id = ?')
+        .bind(today, chatId).run();
+      await updateBoard(env, chatId);
+    } catch (error) {
+      // One chat's dead board is its own problem; the others still redraw.
+      console.log(`Daily board redraw for chat ${chatId} failed: ${error.stack || error}`);
+    }
   }
 }
 
@@ -904,10 +971,23 @@ async function sendMonthlyTabNotices(env, now) {
     // A row without a numeric id cannot be reached until that player posts
     // once; the pinned tab still names them.
     if (entry.balance <= 0 || !entry.user_id) continue;
-    await sendPrivately(env, chatId,
-      `💰 <b>Your squash tab — ${escapeHtml(monthName)}</b>\n`
-      + `Outstanding: <b>${formatMoney(entry.balance)}</b>\n\n`
-      + 'Tap 🧾 <b>My tab</b> on the pinned tab for the line-by-line story.',
+    // The ask arrives with its reasons: the same line-by-line story 🧾 My tab
+    // tells, minus the rate card, so paying needs no second tap to trust.
+    const { results: rows } = await env.DB.prepare(
+      'SELECT * FROM ledger WHERE chat_id = ? AND slug = ? ORDER BY created_at, id'
+    ).bind(chatId, entry.slug).all();
+    const lines = [
+      `💰 <b>Your squash tab — ${escapeHtml(monthName)}</b>`,
+      ...breakdownLines(env, rows, tz, { pricing: false }),
+    ];
+    // An ephemeral message is only visible in the chat it is posted to, and
+    // the data chat id may be no chat at all: aim for the chat this player
+    // was last seated from, falling back to the first the bot serves.
+    const seat = await env.DB.prepare(
+      'SELECT chat_id FROM booking_players WHERE user_id = ? ORDER BY id DESC LIMIT 1'
+    ).bind(entry.user_id).first();
+    const target = reachableChat(env, { chat_id: seat && seat.chat_id }, chats[0]);
+    await sendPrivately(env, target, lines.join('\n'),
       entry.user_id, deleteAfter, { replyMarkup: OK_MARKUP });
   }
 }

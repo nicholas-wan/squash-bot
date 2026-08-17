@@ -86,7 +86,9 @@ export function tabMarkup(balances) {
 }
 
 // The balance line and the story behind it, shared by every breakdown view.
-function breakdownLines(env, rows, tz) {
+// The pricing footer is optional: the monthly notice skips it, because an
+// unprompted message should carry the ask and its reasons, not a rate card.
+export function breakdownLines(env, rows, tz, { pricing = true } = {}) {
   const lines = [];
   const balance = rows.reduce((sum, row) => sum + row.amount_cents, 0);
   if (balance > 0) {
@@ -103,8 +105,10 @@ function breakdownLines(env, rows, tz) {
         + ` — −${formatMoney(-row.amount_cents)}`
       : `• ${escapeHtml(row.reason || 'Squash')} — ${formatMoney(row.amount_cents)}`);
   }
-  lines.push('', 'Courts are $6/hour from 6pm, on weekends, and on public '
-    + 'holidays, $3/hour otherwise, split across everyone who played.');
+  if (pricing) {
+    lines.push('', 'Courts are $6/hour from 6pm, on weekends, and on public '
+      + 'holidays, $3/hour otherwise, split across everyone who played.');
+  }
   return lines;
 }
 
@@ -194,15 +198,22 @@ export function tabHtml(env, balances) {
   return lines.join('\n');
 }
 
-// Every group sharing the ledger gets the same pinned tab.
+// Every group sharing the ledger gets the same pinned tab. As with the board,
+// a sibling chat's failure is logged and skipped rather than thrown — only the
+// chat the request came from may fail loudly.
 export async function updateTab(env, chatId) {
   const balances = await tabBalances(env, chatId);
   const html = tabHtml(env, balances);
   const markup = html ? tabMarkup(balances) : null;
   let pinned = null;
   for (const chat of boardChats(env, chatId)) {
-    const id = await updatePinnedMessage(env, chat, 'tab_message_id', html, markup, 'squash tab');
-    if (chat === chatId) pinned = id;
+    try {
+      const id = await updatePinnedMessage(env, chat, 'tab_message_id', html, markup, 'squash tab');
+      if (chat === chatId) pinned = id;
+    } catch (error) {
+      if (chat === chatId) throw error;
+      console.log(`Tab update for sibling chat ${chat} failed: ${error.stack || error}`);
+    }
   }
   return pinned;
 }

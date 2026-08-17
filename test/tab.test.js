@@ -1,7 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   chargeBooking, myTabView, settleMarkup, settleUser, tabHtml, tabMarkup,
-  theirTabView,
+  theirTabView, updateTab,
 } from '../src/tab.js';
 
 const env = {
@@ -47,6 +47,42 @@ function ledgerDb(inserts) {
 }
 
 describe('money tab', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('keeps a kicked sibling chat from breaking the tab update', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      const body = JSON.parse(init.body);
+      const kicked = body.chat_id === -999;
+      return new Response(JSON.stringify(kicked
+        ? { ok: false, error_code: 403, description: 'Forbidden: bot was kicked from the supergroup chat' }
+        : { ok: true, result: { message_id: 66 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const db = { prepare(sql) { return { bind() { return {
+      async first() {
+        if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+        if (sql.includes('tab_message_id')) {
+          return { board_message_id: null, tab_message_id: 66 };
+        }
+        return null;
+      },
+      async all() {
+        return { results: sql.includes('GROUP BY')
+          ? [{ slug: 'u9', user_id: 9, name: '@alice', balance: 200 }] : [] };
+      },
+      async run() { return { meta: { changes: 1 } }; },
+    }; } }; } };
+    const shared = {
+      ...env, BOT_TOKEN: 'test', ALLOWED_CHATS: '-123,-999', DATA_CHAT_ID: '-999', DB: db,
+    };
+    // From the healthy chat, the sibling's failure is logged, not thrown, and
+    // the healthy chat's own pin still comes back.
+    await expect(updateTab(shared, -123)).resolves.toBe(66);
+    // From the kicked chat itself, the failure still surfaces.
+    await expect(updateTab(shared, -999)).rejects.toThrow('kicked');
+  });
+
   it('charges everyone except the organiser household an equal share', async () => {
     const inserts = [];
     const charged = await chargeBooking({ ...env, DB: ledgerDb(inserts) }, booking, roster);

@@ -47,7 +47,8 @@ nobody, so this is where you read it, and only for your own courts. Group admins
 get **⚙️ Manage bookings** and every roster, since keeping the household
 straight is their job. Manage names who is playing and how
 many slots are left, edits the date, court, or time, deletes a booking, and lets
-admins open extra slots or take a player off. Every active court is listed, the
+admins open extra slots, seat a player the bot already knows — billed as if
+they joined themselves, refused while the court is full — or take a player off. Every active court is listed, the
 same as the board. Those two admin actions stay open until the court ends,
 which is how a no-show is kept off the tab, while joining and leaving close the
 moment it starts, so nobody can play the hour and then drop off the roster to
@@ -92,8 +93,9 @@ still owned and shown. Group admins additionally get a row per open balance
 under their own breakdown, each opening that person's tab, since collecting
 is their job; members can never see anyone else's. Clearing a balance sends
 the debtor a private receipt, and once a month — the first cron tick past 9am
-local — everyone still owing is told their own total the same private way, so
-the bot does the asking rather than a person. Both need the debtor's numeric
+local — everyone still owing gets their itemised balance the same private way,
+so the bot does the asking rather than a person, and the ask arrives with its
+reasons. Both need the debtor's numeric
 id, so a config-seeded player hears nothing until they post once.
 
 The 2026 holiday list in `src/pricing.js` should be checked against mom.gov.sg
@@ -150,7 +152,7 @@ to reach the tab.
 | Var | Meaning |
 |---|---|
 | `ALLOWED_CHATS` | Group ids the bot answers in. Every other chat is ignored |
-| `DATA_CHAT_ID` | Optional; one of the above. Makes every listed group share one set of bookings, rosters, history, and one tab. Each group keeps its own pinned messages |
+| `DATA_CHAT_ID` | Optional. Makes every listed group share one set of bookings, rosters, history, and one tab. A storage key, not an address: it need not be a chat the bot is still in, and messages are never aimed at it unless it is also allowed |
 | `OWNER`, `OWNER_NAME` | Who pays the courts. Always an admin, never billed. `OWNER_USER_ID` is read as an alias when `OWNER` is unset |
 | `DEFAULT_PLAYERS` | Seated on every new booking, never billed |
 | `UNBILLED_PLAYERS` | Never billed, but not seated automatically |
@@ -246,9 +248,9 @@ Found by review, none of them load-bearing enough to hold a release:
   range does not count as a clock time.
 - A receipt or a removal notice that Telegram will not deliver privately is
   deleted rather than posted, so it can end up sent to nobody.
-- `DATA_CHAT_ID` is documented as one of `ALLOWED_CHATS`; the code no longer
-  requires it, but the public reminder fallback still posts to it, which needs
-  the bot to be in that chat.
+- A board or tab in a chat the bot cannot post to is logged and skipped, never
+  retried in place: it catches up on the next natural refresh after the bot is
+  re-added. Only the chat a tap came from fails loudly.
 - A chat dropped from `ALLOWED_CHATS` keeps its rows: they stop being charged and
   its old messages stop being purged.
 - Leaving deletes roster rows by current username, so a row seeded from a handle
