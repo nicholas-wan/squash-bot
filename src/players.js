@@ -123,11 +123,11 @@ export async function rememberPlayer(env, from) {
 async function addPlayer(env, chatId, bookingId, player, addedByUserId) {
   return env.DB.prepare(
     `INSERT OR IGNORE INTO booking_players
-      (booking_id, chat_id, user_id, slug, name, added_by_user_id, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
+      (booking_id, chat_id, user_id, slug, name, added_by_user_id, heads, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     bookingId, chatId, player.userId || null, player.slug, player.name,
-    addedByUserId || null, Date.now()
+    addedByUserId || null, 1, Date.now()
   ).run();
 }
 
@@ -190,13 +190,17 @@ export async function joinBooking(env, chatId, bookingId, from) {
   const capacity = booking.capacity || DEFAULT_CAPACITY;
   // The count check lives inside the insert, so two people racing for the last
   // slot cannot both win. OR IGNORE covers someone already on the roster.
+  // Heads rather than rows, because a row an admin seated with a friend on it
+  // holds two of the court's slots. Joining yourself only ever takes one.
   const joined = await env.DB.prepare(
     `INSERT OR IGNORE INTO booking_players
-      (booking_id, chat_id, user_id, slug, name, added_by_user_id, created_at)
-     SELECT ?, ?, ?, ?, ?, ?, ?
-     WHERE (SELECT COUNT(*) FROM booking_players WHERE booking_id = ?) < ?`
+      (booking_id, chat_id, user_id, slug, name, added_by_user_id, heads, created_at)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?
+     WHERE (
+       SELECT COALESCE(SUM(heads), 0) FROM booking_players WHERE booking_id = ?
+     ) < ?`
   ).bind(
-    bookingId, chatId, who.userId, who.slug, who.name, who.userId, Date.now(),
+    bookingId, chatId, who.userId, who.slug, who.name, who.userId, 1, Date.now(),
     bookingId, capacity
   ).run();
   if (joined.meta.changes) return { status: 'joined', booking };
@@ -282,7 +286,12 @@ export async function knownPlayers(env, chatId) {
 // stays an explicit admin decision. Like the other admin actions it stays open
 // until the court ends: seating somebody who actually played is how their
 // share reaches the tab.
-export async function adminAddPlayer(env, chatId, bookingId, player, addedByUserId) {
+//
+// heads is 2 when they are seated with a friend, which is the only way a roster
+// row ever stands for two people: the friend has no Telegram identity to key a
+// row on, so the member holds both slots and is billed for both. Two free heads
+// are needed for that, and one short is refused rather than rounded down.
+export async function adminAddPlayer(env, chatId, bookingId, player, addedByUserId, heads = 1) {
   const booking = await env.DB.prepare(
     'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
   ).bind(bookingId, dataChatId(env, chatId), Date.now()).first();
@@ -290,12 +299,14 @@ export async function adminAddPlayer(env, chatId, bookingId, player, addedByUser
   const capacity = booking.capacity || DEFAULT_CAPACITY;
   const added = await env.DB.prepare(
     `INSERT OR IGNORE INTO booking_players
-      (booking_id, chat_id, user_id, slug, name, added_by_user_id, created_at)
-     SELECT ?, ?, ?, ?, ?, ?, ?
-     WHERE (SELECT COUNT(*) FROM booking_players WHERE booking_id = ?) < ?`
+      (booking_id, chat_id, user_id, slug, name, added_by_user_id, heads, created_at)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?
+     WHERE (
+       SELECT COALESCE(SUM(heads), 0) FROM booking_players WHERE booking_id = ?
+     ) <= ?`
   ).bind(
     bookingId, chatId, player.user_id || null, player.slug, player.name,
-    addedByUserId || null, Date.now(), bookingId, capacity
+    addedByUserId || null, heads, Date.now(), bookingId, capacity - heads
   ).run();
   if (added.meta.changes) return { status: 'added', booking };
   const existing = await env.DB.prepare(

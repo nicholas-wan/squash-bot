@@ -48,7 +48,9 @@ get **⚙️ Manage bookings** and every roster, since keeping the household
 straight is their job. Manage names who is playing and how
 many slots are left, edits the date, court, or time, deletes a booking, and lets
 admins open extra slots, seat a player the bot already knows — billed as if
-they joined themselves, refused while the court is full — or take a player off. Every active court is listed, the
+they joined themselves, or with a friend who costs them a second slot and a
+second share, and refused when the court has no room — or take a player off.
+Every active court is listed, the
 same as the board. Those two admin actions stay open until the court ends,
 which is how a no-show is kept off the tab, while joining and leaving close the
 moment it starts, so nobody can play the hour and then drop off the roster to
@@ -82,7 +84,9 @@ organiser absorbs those shares along with the rounding remainder. With the
 example config a $6 evening court seats the organiser, one household player, and
 whoever booked it: the booker pays $2.00 and the organiser is left with $4.00.
 Because the divisor is the whole roster, taking a no-show off raises what
-everyone still on it owes.
+everyone still on it owes. The divisor counts heads rather than names: a player
+an admin seated with a friend holds two of the court's slots and pays both
+shares in one charge, the friend having nobody to bill but them.
 
 A second pinned message lists who owes the organiser. Group admins clear a
 balance from it, which appends a payment to the ledger rather than erasing
@@ -216,11 +220,13 @@ npm run db:migrate:002
 npm run db:migrate:003
 npm run db:migrate:004
 npm run db:migrate:005
+npm run db:migrate:006
 npm run db:verify
 ```
 
 Run them in that order. Everything the migrations used to create now lives in
-`schema.sql`, leaving 002, 003, and 005 as `ALTER TABLE` alone and 004 as a no-op,
+`schema.sql`, leaving 002, 003, 005, and 006 as `ALTER TABLE` alone and 004 as a
+no-op,
 because `wrangler d1 execute --file` is atomic: one failed statement rolls the
 whole file back, so a `CREATE` sharing a file with an `ALTER` would be skipped on
 a re-run rather than applied. That is what makes a re-run harmless — an already

@@ -95,6 +95,22 @@ describe('money tab', () => {
     expect(reason).toBe('Court 4 · 19 Aug');
   });
 
+  it('divides by heads and bills a +1 twice in the one row', async () => {
+    const inserts = [];
+    const withFriend = [
+      { slug: '@nicholaswan', user_id: 5, name: '@nicholaswan', heads: 1 },
+      { slug: 'u9', user_id: 9, name: 'Alice', heads: 2 },
+    ];
+    const charged = await chargeBooking({ ...env, DB: ledgerDb(inserts) }, booking, withFriend);
+    expect(charged).toBe(1);
+    // $6 across three heads, two of them hers. One row, because the tab reads
+    // as one charge per person and the reason is where the doubling shows.
+    expect(inserts).toHaveLength(1);
+    const [, slug, , , amount, , reason] = inserts[0];
+    expect({ slug, amount }).toEqual({ slug: 'u9', amount: 400 });
+    expect(reason).toBe('Court 4 · 19 Aug · for 2');
+  });
+
   it('never charges a booking twice', async () => {
     const inserts = [];
     const charged = await chargeBooking(

@@ -522,7 +522,7 @@ describe('Telegram commands', () => {
     }; } }; } };
     await handleUpdate({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db }, {
       callback_query: {
-        id: 'callback-1', data: 'sb:addp:3:@bo',
+        id: 'callback-1', data: 'sb:addp:3:1:@bo',
         from: { id: 9, username: 'admin' },
         message: { message_id: 55, chat: { id: -123456789 } },
       },
@@ -538,6 +538,113 @@ describe('Telegram commands', () => {
       .toContain('was seated on');
     const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
     expect(answer.body.text).toContain('@bo is on this court');
+  });
+
+  it('seats a player with a friend as two heads on one row', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      const result = String(url).endsWith('/getChatMember')
+        ? { status: 'creator' } : { message_id: 55 };
+      return new Response(JSON.stringify({ ok: true, result }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const booking = {
+      id: 3, chat_id: -123456789, court: '4', capacity: 3,
+      starts_at: Date.UTC(2026, 7, 19, 13, 0), ends_at: Date.UTC(2026, 7, 19, 14, 0),
+    };
+    // A live roster, so the notices read the court as it stands after the seat.
+    const players = [{ id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick', heads: 1 }];
+    const inserts = [];
+    const db = { prepare(sql) { return { bind(...args) { return {
+      async first() {
+        if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+        if (sql.includes('SELECT * FROM bookings WHERE id')) return booking;
+        if (sql.includes('board_message_id')) return { board_message_id: 55 };
+        return null;
+      },
+      async all() {
+        if (sql.includes('FROM ledger')) {
+          return { results: [{ slug: '@bo', name: '@bo', user_id: 42 }] };
+        }
+        if (sql.includes('FROM booking_players')) return { results: players };
+        return { results: sql.includes('ends_at >') ? [booking] : [] };
+      },
+      async run() {
+        if (sql.startsWith('INSERT OR IGNORE INTO booking_players')) {
+          inserts.push(args);
+          players.push({
+            id: 2, booking_id: 3, user_id: 42, slug: args[3], name: args[4], heads: args[6],
+          });
+        }
+        return { meta: { changes: 1 } };
+      },
+    }; } }; } };
+    await handleUpdate({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db }, {
+      callback_query: {
+        id: 'callback-1', data: 'sb:addp:3:2:@bo',
+        from: { id: 9, username: 'admin' },
+        message: { message_id: 55, chat: { id: -123456789 } },
+      },
+    });
+    expect(inserts[0][6]).toBe(2);
+    const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
+    // The rest of the court hears that a friend came with him, and reads the
+    // court as full: one name short, but no slots left.
+    const toNick = sent.find((request) => request.body.receiver_user_id === 7).body.text;
+    expect(toNick).toContain('<b>@bo</b> (+1) were seated on');
+    expect(toNick).toContain('@bo +1');
+    expect(toNick).toContain('full');
+    const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+    expect(answer.body.text).toContain('@bo +1 are on this court');
+    expect(answer.body.text).toContain('two shares');
+  });
+
+  it('redraws the seating picker when the friend toggle is flipped', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      const result = String(url).endsWith('/getChatMember')
+        ? { status: 'creator' } : { message_id: 55 };
+      return new Response(JSON.stringify({ ok: true, result }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const booking = {
+      id: 3, chat_id: -123456789, court: '4', capacity: 3,
+      starts_at: Date.UTC(2026, 7, 19, 13, 0), ends_at: Date.UTC(2026, 7, 19, 14, 0),
+    };
+    const db = { prepare(sql) { return { bind() { return {
+      async first() {
+        if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+        if (sql.includes('SELECT * FROM bookings WHERE id')) return booking;
+        return null;
+      },
+      async all() {
+        if (sql.includes('FROM ledger')) {
+          return { results: [{ slug: '@bo', name: '@bo', user_id: 42 }] };
+        }
+        if (sql.includes('FROM booking_players')) return { results: [] };
+        return { results: sql.includes('ends_at >') ? [booking] : [] };
+      },
+      async run() { return { meta: { changes: 1 } }; },
+    }; } }; } };
+    await handleUpdate({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db }, {
+      callback_query: {
+        id: 'callback-1', data: 'sb:addp:3:h2',
+        from: { id: 9, username: 'admin' },
+        message: { message_id: 55, ephemeral_message_id: 88, chat: { id: -123456789 } },
+      },
+    });
+    // The panel is private, so the toggle edits it in place rather than
+    // posting a second copy of the same list.
+    const edited = requests.find((request) => request.url.endsWith('/editEphemeralMessageText'));
+    expect(edited.body.text).toContain('two slots and pay two shares');
+    const buttons = edited.body.reply_markup.inline_keyboard.flat();
+    expect(buttons[0].callback_data).toBe('sb:addp:3:h1');
+    expect(buttons[1].callback_data).toBe('sb:addp:3:2:@bo');
+    expect(requests.some((request) => request.url.endsWith('/sendMessage'))).toBe(false);
   });
 
   it('receipts the debtor privately when an admin clears their balance', async () => {
@@ -599,7 +706,8 @@ describe('Telegram commands', () => {
       BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789',
       OWNER_USER_ID: '7', DB: emptyDb(),
     };
-    for (const data of ['sb:cap:3', 'sb:kick:3', 'sb:kick:3:4', 'sb:addp:3', 'sb:addp:3:@bo', 'tb:pay']) {
+    for (const data of ['sb:cap:3', 'sb:kick:3', 'sb:kick:3:4', 'sb:addp:3',
+      'sb:addp:3:h2', 'sb:addp:3:1:@bo', 'sb:addp:3:2:@bo', 'tb:pay']) {
       requests.length = 0;
       await handleUpdate(env, {
         callback_query: {
