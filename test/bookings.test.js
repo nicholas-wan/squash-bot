@@ -4,6 +4,7 @@ import {
   deletePanelView, managerView, notifyRosterOfChange, runMaintenance, updateBoard,
   updateBooking,
 } from '../src/bookings.js';
+import { clearAdminCache } from '../src/players.js';
 
 const startsAt = Date.UTC(2026, 7, 19, 13, 0);
 const endsAt = Date.UTC(2026, 7, 19, 14, 0);
@@ -42,7 +43,10 @@ function bookingDb(activeBookings, roster = []) {
 }
 
 describe('public booking announcements', () => {
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    clearAdminCache();
+  });
 
   function captureTelegram() {
     const requests = [];
@@ -905,6 +909,27 @@ describe('public booking announcements', () => {
     await expect(updateBoard({
       BOT_TOKEN: 'test', ALLOWED_CHATS: '-123,-999', DATA_CHAT_ID: '-999', DB: db,
     }, -999)).rejects.toThrow('kicked');
+  });
+
+  it('updates shared boards concurrently', async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      // Holding each edit briefly makes overlap observable without depending on
+      // wall-clock totals, which are noisy in CI.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      inFlight -= 1;
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 55 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    await updateBoard({
+      BOT_TOKEN: 'test', ALLOWED_CHATS: '-123,-999', DATA_CHAT_ID: '-999',
+      DB: maintenanceDb({}),
+    }, -123);
+    expect(maxInFlight).toBe(2);
   });
 
   it('holds the monthly notice back before 9am local time', async () => {

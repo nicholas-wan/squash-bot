@@ -4,6 +4,17 @@ import { telegram } from './telegram.js';
 export const DEFAULT_CAPACITY = 3;
 export const MAX_CAPACITY = 12;
 
+const ADMIN_CACHE_TTL_MS = 3 * 60 * 1000;
+const MAX_ADMIN_CACHE_ENTRIES = 512;
+const adminCache = new Map();
+
+// Telegram is authoritative, but admin checks sit in front of nearly every
+// management panel. A short cache removes a network round trip while keeping a
+// role change bounded; clearing is also useful after an operator changes roles.
+export function clearAdminCache() {
+  adminCache.clear();
+}
+
 // A player's stable key. Telegram usernames are how this group refers to each
 // other and are the only identity a config file can name, so they win; a numeric
 // id is the fallback for anyone without one. Keying on the id instead would
@@ -87,9 +98,25 @@ export async function isChatAdmin(env, chatId, from) {
   const owner = ownerIdentity(env);
   const who = identity(from);
   if (owner && (owner.slug === who.slug || owner.userId === who.userId)) return true;
+  const key = `${chatId}:${from.id}`;
+  const now = Date.now();
+  const cached = adminCache.get(key);
+  if (cached && cached.expiresAt > now) return cached.isAdmin;
+  if (cached) adminCache.delete(key);
   const member = await telegram(env, 'getChatMember', { chat_id: chatId, user_id: from.id });
   if (!member.ok) return false;
-  return member.result.status === 'creator' || member.result.status === 'administrator';
+  const isAdmin = member.result.status === 'creator' || member.result.status === 'administrator';
+  adminCache.set(key, { isAdmin, expiresAt: now + ADMIN_CACHE_TTL_MS });
+  // The bot serves a bounded set of groups, but pruning keeps a busy public
+  // group from turning an optimisation into unbounded isolate memory.
+  if (adminCache.size > MAX_ADMIN_CACHE_ENTRIES) {
+    for (const [entryKey, entry] of adminCache) {
+      if (entry.expiresAt <= now || adminCache.size > MAX_ADMIN_CACHE_ENTRIES) {
+        adminCache.delete(entryKey);
+      }
+    }
+  }
+  return isAdmin;
 }
 
 // Fills in the numeric id of a player who was seeded from config by username,
@@ -98,26 +125,34 @@ export async function isChatAdmin(env, chatId, from) {
 export async function rememberPlayer(env, from) {
   const who = identity(from);
   if (!who.userId || !who.username) return;
-  await env.DB.prepare(
+  const statements = [env.DB.prepare(
     'UPDATE booking_players SET user_id = ? WHERE slug = ? AND user_id IS NULL'
-  ).bind(who.userId, who.slug).run();
+  ).bind(who.userId, who.slug),
   // Someone can set or change their username long after they were first seated,
   // and config can name them by bare id, so the same human ends up spelled two
   // ways. The numeric id is what proves the two spellings are one person: their
   // old rows move onto the slug they key as now, because otherwise they are
   // offered Join for a court they are already on, take a second seat on it, and
   // are billed twice for the one game.
-  await env.DB.prepare(
+  env.DB.prepare(
     `DELETE FROM booking_players
       WHERE user_id = ? AND slug != ?
         AND booking_id IN (SELECT booking_id FROM booking_players WHERE slug = ?)`
-  ).bind(who.userId, who.slug, who.slug).run();
+  ).bind(who.userId, who.slug, who.slug),
   // Both spellings can already sit on one booking, where UNIQUE
   // (booking_id, slug) leaves no room to move the old row in: the delete above
   // drops it first so the merge is one row, not a constraint failure.
-  await env.DB.prepare(
+  env.DB.prepare(
     'UPDATE booking_players SET slug = ?, name = ? WHERE user_id = ? AND slug != ?'
-  ).bind(who.slug, who.name, who.userId, who.slug).run();
+  ).bind(who.slug, who.name, who.userId, who.slug)];
+  // These statements depend on their order, but D1 can execute the batch in
+  // one trip. The fallback keeps lightweight test doubles and local adapters
+  // useful without weakening the production path.
+  if (typeof env.DB.batch === 'function') {
+    await env.DB.batch(statements);
+    return;
+  }
+  for (const statement of statements) await statement.run();
 }
 
 async function addPlayer(env, chatId, bookingId, player, addedByUserId) {

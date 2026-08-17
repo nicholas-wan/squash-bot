@@ -320,10 +320,11 @@ function boardButtons(bookings) {
 // Join for courts they are not on and Leave for the ones they are. A shared
 // keyboard on the pinned board could never tell the two apart.
 export async function joinPickerView(env, chatId, from, isAdmin = false, now = Date.now()) {
-  const bookings = (await activeBookings(env, chatId, now))
-    .filter((booking) => booking.starts_at > now);
+  const [active, tz] = await Promise.all([
+    activeBookings(env, chatId, now), getTimezone(env, chatId),
+  ]);
+  const bookings = active.filter((booking) => booking.starts_at > now);
   if (!bookings.length) return null;
-  const tz = await getTimezone(env, chatId);
   const rosters = await rostersFor(env, chatId, bookings.map((booking) => booking.id));
   const mySlug = identity(from).slug;
 
@@ -376,8 +377,9 @@ export async function joinPickerView(env, chatId, from, isAdmin = false, now = D
 }
 
 async function renderBoard(env, chatId, now) {
-  const tz = await getTimezone(env, chatId);
-  const bookings = await activeBookings(env, chatId, now);
+  const [tz, bookings] = await Promise.all([
+    getTimezone(env, chatId), activeBookings(env, chatId, now),
+  ]);
   if (!bookings.length) return { html: null, replyMarkup: null };
   const rosters = await rostersFor(env, chatId, bookings.map((booking) => booking.id));
 
@@ -419,21 +421,31 @@ export async function boardHtml(env, chatId, now = Date.now()) {
 // answer the person is waiting on.
 export async function updateBoard(env, chatId, now = Date.now()) {
   const board = await renderBoard(env, chatId, now);
-  // The acting chat's pinned id comes back, so a command can say whether a
-  // board exists at all — null means nothing is booked and nothing is pinned.
-  let pinned = null;
-  for (const chat of boardChats(env, chatId)) {
+  // Shared chats are independent Telegram calls. Running them together keeps a
+  // dead sibling from adding one full network round trip per group, while the
+  // acting chat still decides whether the operation itself succeeds.
+  const outcomes = await Promise.all(boardChats(env, chatId).map(async (chat) => {
     try {
       const id = await updatePinnedMessage(
         env, chat, 'board_message_id', board.html, board.replyMarkup, 'court board'
       );
-      if (chat === chatId) pinned = id;
+      return { chat, id };
     } catch (error) {
-      if (chat === chatId) throw error;
-      console.log(`Board update for sibling chat ${chat} failed: ${error.stack || error}`);
+      return { chat, error };
     }
+  }));
+  for (const outcome of outcomes) {
+    if (!outcome.error || outcome.chat === chatId) continue;
+    console.log(
+      `Board update for sibling chat ${outcome.chat} failed: `
+      + `${outcome.error.stack || outcome.error}`
+    );
   }
-  return pinned;
+  const acting = outcomes.find((outcome) => outcome.chat === chatId);
+  if (acting && acting.error) throw acting.error;
+  // The acting chat's pinned id comes back, so a command can say whether a
+  // board exists at all — null means nothing is booked and nothing is pinned.
+  return acting ? acting.id : null;
 }
 
 function bookingLabel(booking, tz) {
@@ -448,8 +460,9 @@ function bookingLabel(booking, tz) {
 const MANAGER_HEADER = '⚙️ <b>Manage bookings</b>\n\nOnly you can see this list.';
 
 export async function managerView(env, chatId, now = Date.now()) {
-  const bookings = await activeBookings(env, chatId, now);
-  const tz = await getTimezone(env, chatId);
+  const [bookings, tz] = await Promise.all([
+    activeBookings(env, chatId, now), getTimezone(env, chatId),
+  ]);
   const rows = bookings.map((booking) => [{
     text: `✏️ ${bookingLabel(booking, tz)}`,
     callback_data: `sb:pick:${booking.id}`,
@@ -641,7 +654,9 @@ export async function notifyRemovedPlayer(env, chatId, player, booking) {
 // somebody with a friend ever makes 2. It is passed rather than read back off
 // the roster because that would rest on the seated player resolving to the same
 // slug their row was written under, which is exactly what rememberPlayer moves.
-export async function notifyRosterOfChange(env, chatId, booking, from, action, heads = 1) {
+export async function notifyRosterOfChange(
+  env, chatId, booking, from, action, heads = 1, { callbackQueryId = null } = {}
+) {
   // Loud, not lenient: an unrecognised action falling through to one of the
   // messages would announce something that did not happen. 'added' is an
   // admin seating somebody — for them and the roster it reads like a join,
@@ -650,10 +665,11 @@ export async function notifyRosterOfChange(env, chatId, booking, from, action, h
     throw new Error(`notifyRosterOfChange: unknown action "${action}"`);
   }
   const left = action === 'left';
-  const tz = await getTimezone(env, chatId);
-  // Read after the change, so the slot count and the roster line describe the
-  // court as it stands rather than as it was a moment ago.
-  const roster = await rosterFor(env, booking.id);
+  // These reads are independent and both sit before the notification burst;
+  // starting them together shortens the path after the tap was acknowledged.
+  const [tz, roster] = await Promise.all([
+    getTimezone(env, chatId), rosterFor(env, booking.id),
+  ]);
   const actor = identity(from);
   const where = `${escapeHtml(courtName(booking))}\n`
     + `${shortDate(booking.starts_at, tz)} · `
@@ -688,7 +704,9 @@ export async function notifyRosterOfChange(env, chatId, booking, from, action, h
   const sends = [];
   if (actor.userId) {
     told.add(actor.userId);
-    sends.push({ isActor: true, userId: actor.userId, html: toActor });
+    sends.push({
+      isActor: true, userId: actor.userId, html: toActor, callbackQueryId,
+    });
   }
   // A row with no id under another slug is someone seeded from config who has
   // never posted: unreachable, which the caller's toast should not paper over.
@@ -709,7 +727,11 @@ export async function notifyRosterOfChange(env, chatId, booking, from, action, h
   const outcomes = await Promise.all(sends.map(async (send) => ({
     isActor: send.isActor,
     outcome: await sendPrivately(env, chatId, send.html, send.userId, deleteAfter,
-      { replyMarkup: OK_MARKUP, cleanups }),
+      {
+        replyMarkup: OK_MARKUP,
+        cleanups,
+        callbackQueryId: send.isActor ? send.callbackQueryId : null,
+      }),
   })));
   if (cleanups.length) await env.DB.batch(cleanups);
   // Whether "everyone else has been told" would be true, so the caller's toast

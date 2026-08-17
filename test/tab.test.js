@@ -83,6 +83,36 @@ describe('money tab', () => {
     await expect(updateTab(shared, -999)).rejects.toThrow('kicked');
   });
 
+  it('updates shared tabs concurrently', async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      inFlight -= 1;
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 66 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const db = { prepare(sql) { return { bind() { return {
+      async first() {
+        if (sql.includes('tab_message_id')) {
+          return { board_message_id: null, tab_message_id: 66 };
+        }
+        return null;
+      },
+      async all() {
+        return { results: sql.includes('GROUP BY')
+          ? [{ slug: 'u9', user_id: 9, name: '@alice', balance: 200 }] : [] };
+      },
+    }; } }; } };
+    await updateTab({
+      ...env, BOT_TOKEN: 'test', ALLOWED_CHATS: '-123,-999', DATA_CHAT_ID: '-999', DB: db,
+    }, -123);
+    expect(maxInFlight).toBe(2);
+  });
+
   it('charges everyone except the organiser household an equal share', async () => {
     const inserts = [];
     const charged = await chargeBooking({ ...env, DB: ledgerDb(inserts) }, booking, roster);
