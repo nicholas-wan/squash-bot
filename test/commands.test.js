@@ -273,6 +273,89 @@ describe('Telegram commands', () => {
       .toBe('https://t.me/c/4418632524/20');
   });
 
+  it('reads a command punctuated like a sentence', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify({
+        ok: true, result: { ephemeral_message_id: 12 },
+      }), { headers: { 'Content-Type': 'application/json' } });
+    }));
+    const db = {
+      prepare(sql) {
+        return { bind() { return {
+          async first() {
+            return sql.includes('SELECT tz') ? { tz: 'Asia/Singapore' } : null;
+          },
+          async run() {
+            if (sql.includes('INSERT INTO booking_drafts')) {
+              return { meta: { changes: 1, last_row_id: 41 } };
+            }
+            return { meta: { changes: 1 } };
+          },
+        }; } };
+      },
+    };
+    // "/book, tmr c4 9pm" used to fail the command shape and get silence.
+    await handleUpdate({
+      BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db,
+    }, {
+      message: {
+        message_id: 5,
+        chat: { id: -123456789 },
+        from: { id: 7, first_name: 'Nick' },
+        text: '/book, tmr c4 9pm',
+      },
+    });
+    const send = requests.find((request) => request.url.endsWith('/sendMessage'));
+    expect(send.body.text).toContain('Confirm this squash booking');
+    // The details after the comma made it through: nothing left to ask, so
+    // the form is at its confirm step.
+    const labels = send.body.reply_markup.inline_keyboard.flat().map((button) => button.text);
+    expect(labels).toContain('✅ Add booking');
+    // The command itself is still cleared out of the group.
+    const removed = requests.find((request) => request.url.endsWith('/deleteMessage'));
+    expect(removed.body.message_id).toBe(5);
+  });
+
+  it('opens a blank form for a bare command with trailing punctuation', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify({
+        ok: true, result: { ephemeral_message_id: 12 },
+      }), { headers: { 'Content-Type': 'application/json' } });
+    }));
+    const db = {
+      prepare(sql) {
+        return { bind() { return {
+          async first() {
+            return sql.includes('SELECT tz') ? { tz: 'Asia/Singapore' } : null;
+          },
+          async run() {
+            if (sql.includes('INSERT INTO booking_drafts')) {
+              return { meta: { changes: 1, last_row_id: 41 } };
+            }
+            return { meta: { changes: 1 } };
+          },
+        }; } };
+      },
+    };
+    await handleUpdate({
+      BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db,
+    }, {
+      message: {
+        message_id: 5,
+        chat: { id: -123456789 },
+        from: { id: 7, first_name: 'Nick' },
+        text: '/book,',
+      },
+    });
+    const send = requests.find((request) => request.url.endsWith('/sendMessage'));
+    expect(send.body.text).toContain('Confirm this squash booking');
+    expect(send.body.text).toContain('Which date?');
+  });
+
   it('always asks for confirmation before saving a complete message', async () => {
     const requests = [];
     const sqlSeen = [];
