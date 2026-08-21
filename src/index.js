@@ -659,11 +659,16 @@ export async function handleUpdate(env, update) {
       return;
     }
 
-    const match = text.match(/^\/(\w+)(@\w+)?(?:\s+([\s\S]*))?$/);
+    // People punctuate commands the way they punctuate sentences — "/book,
+    // tmr c4 9pm" — and the strict shape used to drop exactly that on the
+    // floor without a word, which reads as a broken bot. One trailing
+    // punctuation mark after the command (or its @mention) is forgiven, and
+    // the args begin wherever they begin.
+    const match = text.match(/^\/(\w+)(@\w+)?[,.:;!]?\s*([\s\S]*)$/);
     if (!match) return;
     const command = match[1].toLowerCase();
     const mention = match[2] || null;
-    const args = (match[3] || '').trim();
+    const args = match[3].trim();
     const knownCommands = new Set(['start', 'help', 'book', 'courts', 'cancel', 'tab']);
     // A command the bot does not know used to get silence, which reads exactly
     // like a broken bot. A command addressed @another_bot stays ignored: this
