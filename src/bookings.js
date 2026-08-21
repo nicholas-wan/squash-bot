@@ -298,11 +298,14 @@ function playerTags(roster) {
 }
 
 // The board stays about who is playing. Money lives on the tab.
-// What people actually want to know is whether there is room, not the ratio.
+// Room first, then the head count: "1 slot · 2/3" answers "can I join" at a
+// glance and "how big is the game" right behind it. A full court needs no
+// ratio — full already says 3 of 3.
 function slotsLabel(roster, capacity) {
-  const free = Math.max(0, capacity - rosterHeads(roster));
+  const heads = rosterHeads(roster);
+  const free = Math.max(0, capacity - heads);
   if (!free) return 'full';
-  return `${free} slot${free === 1 ? '' : 's'}`;
+  return `${free} slot${free === 1 ? '' : 's'} · ${heads}/${capacity}`;
 }
 
 // One row, whatever the board holds. Which court you want is asked behind 🙋
@@ -326,6 +329,10 @@ export async function joinPickerView(env, chatId, from, isAdmin = false, now = D
   const bookings = active.filter((booking) => booking.starts_at > now);
   if (!bookings.length) return null;
   const rosters = await rostersFor(env, chatId, bookings.map((booking) => booking.id));
+  // May be a promise started alongside the reads above, so the getChatMember
+  // round trip it hides costs no extra wall clock. isChatAdmin never rejects,
+  // which is what makes the early return above safe to leave it unawaited.
+  isAdmin = await isAdmin;
   const mySlug = identity(from).slug;
 
   const rows = [];
@@ -734,12 +741,11 @@ export async function notifyRosterOfChange(
       }),
   })));
   if (cleanups.length) await env.DB.batch(cleanups);
-  // Whether "everyone else has been told" would be true, so the caller's toast
-  // can repeat it only when it is.
+  // Admin actions report whether their subject and the rest of the court were
+  // actually reached rather than claiming success for a refused private send.
   return {
-    othersTold: !unreachable && outcomes
-      .filter((send) => !send.isActor)
-      .every((send) => send.outcome === 'private'),
+    allTold: Boolean(actor.userId) && !unreachable
+      && outcomes.every((send) => send.outcome === 'private'),
   };
 }
 

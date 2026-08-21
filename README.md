@@ -15,7 +15,9 @@ tmr c4 2100
 
 Anything missing or ambiguous is asked with buttons rather than guessed, and
 nothing is saved until it is confirmed. No end time means one hour. Courts run
-**7am to 10pm**, so 9pm is the last slot. Overlaps on the same court are blocked
+**7am to 10pm**, so 9pm is the last slot. YCK has five courts, so the picker
+offers Courts 1–5 — and when a court is being *changed*, only the four the
+booking is not already on. Overlaps on the same court are blocked
 unless the requester reviews the conflict and chooses **Add anyway**. Every add,
 edit, and delete keeps an audit snapshot with the actor and the original text.
 
@@ -23,13 +25,14 @@ edit, and delete keeps an audit snapshot with the actor and the original text.
 
 ```text
 in 5 days · Mon 17 Aug
-9pm · Court 4 · 1 slot
+9pm · Court 4 · 1 slot · 2/3
 ```
 
 Two short lines and a gap, because a phone wraps much past thirty characters and
 a wrapped court number reads as a wall. Every active court is listed, booked-out
 ones included and marked `full`: the board answers "what is booked", and a court
-missing from it would read as a court nobody took. The roster is not on the
+missing from it would read as a court nobody took. An open court carries its
+head count too — `1 slot · 2/3` is one seat free, two of three taken. The roster is not on the
 board — with `DEFAULT_PLAYERS` seating the same people every time it was the
 same handles on every row, and one shared pinned message cannot answer "am I on
 this?" per person anyway. Who is playing is named on the court's own panel
@@ -182,8 +185,13 @@ Requirements: Telegram bot, Cloudflare Workers, and D1.
 npm install
 Copy-Item wrangler.example.toml wrangler.toml
 npx wrangler login
-npx wrangler d1 create squashbot
+npx wrangler d1 create squashbot-eu --location weur
 ```
+
+The location hint matters: Telegram delivers webhooks from Amsterdam, so the
+Worker executes there, and a database in another region charges every query a
+cross-region round trip — measured at ~200ms each while this one lived in APAC.
+The retired APAC database (`squashbot`) survives as the pre-migration backup.
 
 ```powershell
 npm run db:init
@@ -207,6 +215,11 @@ curl.exe -X POST -H "Authorization: Bearer YOUR_ADMIN_SECRET" `
 ```
 
 `POST /refresh` rebuilds the board and tab in every allowed chat.
+
+The first answer to every button tap rides back on the webhook's own HTTP
+response (Bot API, "Making requests when getting updates") instead of a
+separate round trip, and each tap logs its colo and duration — one line in
+`npx wrangler tail` — so "is it slow" is always answerable with a number.
 
 ## Upgrading a live database
 

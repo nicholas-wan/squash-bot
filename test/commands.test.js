@@ -231,7 +231,7 @@ describe('Telegram commands', () => {
         message_id: 5,
         chat: { id: -123456789 },
         from: { id: 7, first_name: 'Nick' },
-        text: '20 Aug 2026 Court 4 9pm',
+        text: '20 Aug 2027 Court 4 9pm',
       },
     });
     const send = requests.find((request) => request.url.endsWith('/sendMessage'));
@@ -279,7 +279,7 @@ describe('Telegram commands', () => {
         message_id: 5,
         chat: { id: -123456789 },
         from: { id: 7, first_name: 'Nick' },
-        text: '20 Aug 2026 Court 4 9pm',
+        text: '20 Aug 2027 Court 4 9pm',
       },
     });
     const removed = requests.find((request) => request.url.endsWith('/deleteMessage'));
@@ -318,7 +318,7 @@ describe('Telegram commands', () => {
         message_id: 5,
         chat: { id: -123456789 },
         from: { id: 7, first_name: 'Nick' },
-        text: '20 Aug 2026 Court 4 9pm',
+        text: '20 Aug 2027 Court 4 9pm',
       },
     });
     const warning = requests.find((request) => request.url.endsWith('/sendMessage')
@@ -338,8 +338,8 @@ describe('Telegram commands', () => {
       id: 41, chat_id: -123456789, user_id: 7, user_name: '@nick',
       wizard_message_id: 12, wizard_ephemeral: 1,
       payload: JSON.stringify({
-        operation: 'add', bookingId: null, sourceText: '20 Aug 2026 Court 4 9pm',
-        date: { y: 2026, mo: 8, d: 20 }, court: '4', start: { h: 21, mi: 0 }, end: null,
+        operation: 'add', bookingId: null, sourceText: '20 Aug 2027 Court 4 9pm',
+        date: { y: 2027, mo: 8, d: 20 }, court: '4', start: { h: 21, mi: 0 }, end: null,
         dateChoices: [], courtChoices: [], timeChoices: [], issues: [], conflicts: [],
       }),
     };
@@ -408,7 +408,7 @@ describe('Telegram commands', () => {
     }));
     const booking = {
       id: 3, chat_id: -123456789, court: '4', capacity: 3,
-      starts_at: Date.UTC(2026, 7, 19, 13, 0), ends_at: Date.UTC(2026, 7, 19, 14, 0),
+      starts_at: Date.UTC(2027, 7, 19, 13, 0), ends_at: Date.UTC(2027, 7, 19, 14, 0),
     };
     const db = {
       prepare(sql) {
@@ -451,7 +451,7 @@ describe('Telegram commands', () => {
   it('toggles one shared court button by who tapped it', async () => {
     const booking = {
       id: 3, chat_id: -123456789, court: '4', capacity: 3,
-      starts_at: Date.UTC(2026, 7, 19, 13, 0), ends_at: Date.UTC(2026, 7, 19, 14, 0),
+      starts_at: Date.UTC(2027, 7, 19, 13, 0), ends_at: Date.UTC(2027, 7, 19, 14, 0),
     };
     const run = async (roster) => {
       const requests = [];
@@ -549,7 +549,7 @@ describe('Telegram commands', () => {
     }));
     const booking = {
       id: 3, chat_id: -123456789, court: '4', capacity: 3,
-      starts_at: Date.UTC(2026, 7, 19, 13, 0), ends_at: Date.UTC(2026, 7, 19, 14, 0),
+      starts_at: Date.UTC(2027, 7, 19, 13, 0), ends_at: Date.UTC(2027, 7, 19, 14, 0),
     };
     const ran = [];
     const db = { prepare(sql) { ran.push(sql); return { bind() { return {
@@ -564,7 +564,12 @@ describe('Telegram commands', () => {
           return { results: [{ slug: '@bo', name: '@bo', user_id: 42 }] };
         }
         if (sql.includes('FROM booking_players')) {
-          return { results: [{ id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick' }] };
+          return { results: [
+            { id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick' },
+            // Seeded but never seen: the admin toast must not claim this person
+            // was notified when there is no numeric id to address.
+            { id: 2, booking_id: 3, user_id: null, slug: '@silent', name: '@silent' },
+          ] };
         }
         return { results: sql.includes('ends_at >') ? [booking] : [] };
       },
@@ -589,6 +594,7 @@ describe('Telegram commands', () => {
       .toContain('was seated on');
     const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
     expect(answer.body.text).toContain('@bo is on this court');
+    expect(answer.body.text).toContain('Some players could not be notified');
   });
 
   it('seats a player with a friend as two heads on one row', async () => {
@@ -606,7 +612,7 @@ describe('Telegram commands', () => {
     }));
     const booking = {
       id: 3, chat_id: -123456789, court: '4', capacity: 3,
-      starts_at: Date.UTC(2026, 7, 19, 13, 0), ends_at: Date.UTC(2026, 7, 19, 14, 0),
+      starts_at: Date.UTC(2027, 7, 19, 13, 0), ends_at: Date.UTC(2027, 7, 19, 14, 0),
     };
     // A live roster, so the notices read the court as it stands after the seat.
     const players = [{ id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick', heads: 1 }];
@@ -668,7 +674,7 @@ describe('Telegram commands', () => {
     }));
     const booking = {
       id: 3, chat_id: -123456789, court: '4', capacity: 3,
-      starts_at: Date.UTC(2026, 7, 19, 13, 0), ends_at: Date.UTC(2026, 7, 19, 14, 0),
+      starts_at: Date.UTC(2027, 7, 19, 13, 0), ends_at: Date.UTC(2027, 7, 19, 14, 0),
     };
     const db = { prepare(sql) { return { bind() { return {
       async first() {
@@ -717,7 +723,7 @@ describe('Telegram commands', () => {
     }));
     const booking = {
       id: 3, chat_id: -123456789, court: '4', capacity: 3,
-      starts_at: Date.UTC(2026, 7, 19, 13, 0), ends_at: Date.UTC(2026, 7, 19, 14, 0),
+      starts_at: Date.UTC(2027, 7, 19, 13, 0), ends_at: Date.UTC(2027, 7, 19, 14, 0),
     };
     const jarhead = {
       id: 8, booking_id: 3, user_id: 42, slug: '@jarhead', name: '@jarhead', heads: 1,
@@ -762,6 +768,7 @@ describe('Telegram commands', () => {
       .toContain('bringing a friend');
     const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
     expect(answer.body.text).toContain('now brings a +1');
+    expect(answer.body.text).toContain('Everyone has been told');
   });
 
   it('refuses a +1 when the court has no free slot for it', async () => {
@@ -893,7 +900,7 @@ describe('Telegram commands', () => {
 
   const nicksBooking = {
     id: 3, chat_id: -123456789, court: '4', created_by_user_id: 7, created_by_name: '@nick',
-    starts_at: Date.UTC(2026, 7, 19, 13, 0), ends_at: Date.UTC(2026, 7, 19, 14, 0),
+    starts_at: Date.UTC(2027, 7, 19, 13, 0), ends_at: Date.UTC(2027, 7, 19, 14, 0),
   };
 
   it('refuses /cancel from a member who did not book the court', async () => {
@@ -1024,6 +1031,47 @@ describe('Telegram commands', () => {
     });
   });
 
+  it('offers only the four other YCK courts when changing a court', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify({ ok: true, result: { ephemeral_message_id: 12 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const booking = {
+      id: 3, chat_id: -123456789, court: '4', capacity: 3, created_by_user_id: 7,
+      starts_at: Date.UTC(2027, 7, 19, 13, 0), ends_at: Date.UTC(2027, 7, 19, 14, 0),
+    };
+    const db = {
+      prepare(sql) {
+        return { bind() { return {
+          async first() {
+            if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+            if (sql.includes('FROM bookings')) return booking;
+            return null;
+          },
+          async all() { return { results: sql.includes('ends_at >') ? [booking] : [] }; },
+          async run() { return { meta: { changes: 1, last_row_id: 41 } }; },
+        }; } };
+      },
+    };
+    await handleUpdate({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db }, {
+      callback_query: {
+        id: 'callback-1', data: 'sb:edit:3:c',
+        from: { id: 7, username: 'nick' },
+        message: { message_id: 55, chat: { id: -123456789 } },
+      },
+    });
+    const form = requests.find((request) => request.url.endsWith('/sendMessage'));
+    expect(form.body.text).toContain('Which court?');
+    const labels = form.body.reply_markup.inline_keyboard.flat().map((button) => button.text);
+    const courts = labels.filter((label) => /^Court \d+$/.test(label));
+    // YCK has five courts, and the one the booking already sits on is not
+    // offered back — a button that changes nothing.
+    expect(courts).toEqual(['Court 1', 'Court 2', 'Court 3', 'Court 5']);
+  });
+
   describe('private panel delivery', () => {
     const panelTap = (data, env = {}) => handleUpdate({
       BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: emptyDb(), ...env,
@@ -1033,6 +1081,37 @@ describe('Telegram commands', () => {
         from: { id: 7, first_name: 'Nick' },
         message: { message_id: 55, chat: { id: -123456789 } },
       },
+    });
+
+    it('points at a freshly opened tab panel, but not at an in-place edit', async () => {
+      const run = async (message) => {
+        const requests = [];
+        vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+          requests.push({ url: String(url), body: JSON.parse(init.body) });
+          return new Response(JSON.stringify({
+            ok: true, result: { ephemeral_message_id: 12 },
+          }), { headers: { 'Content-Type': 'application/json' } });
+        }));
+        await handleUpdate({
+          BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789',
+          OWNER_USER_ID: '7', DB: emptyDb(),
+        }, {
+          callback_query: {
+            id: 'callback-1', data: 'tb:mine',
+            from: { id: 7, first_name: 'Nick' },
+            message,
+          },
+        });
+        return requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+      };
+      // Off the pinned tab a new message lands below, which nothing announces.
+      const opened = await run({ message_id: 55, chat: { id: -123456789 } });
+      expect(opened.body.text).toContain('below');
+      // From inside a panel the same tap edits in place; no pointer to give.
+      const edited = await run({
+        message_id: 55, ephemeral_message_id: 88, chat: { id: -123456789 },
+      });
+      expect(edited.body.text).toBe('');
     });
 
     it('answers when an admin panel cannot be delivered', async () => {
@@ -1050,6 +1129,54 @@ describe('Telegram commands', () => {
       const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
       expect(answer.body.text).toContain('Something went wrong');
       expect(answer.body.show_alert).toBe(true);
+    });
+
+    it('treats an unchanged panel edit as a harmless repeat tap', async () => {
+      const requests = [];
+      vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+        requests.push({ url: String(url), body: JSON.parse(init.body) });
+        if (String(url).endsWith('/editEphemeralMessageText')) {
+          return new Response(JSON.stringify({
+            ok: false, description: 'Bad Request: message is not modified',
+          }), { headers: { 'Content-Type': 'application/json' } });
+        }
+        return new Response(JSON.stringify({ ok: true, result: true }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }));
+      const booking = {
+        id: 3, chat_id: -123456789, court: '4', capacity: 3,
+        starts_at: Date.UTC(2027, 7, 19, 13, 0), ends_at: Date.UTC(2027, 7, 19, 14, 0),
+      };
+      const db = {
+        prepare(sql) {
+          return { bind() { return {
+            async first() {
+              if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+              if (sql.includes('SELECT * FROM bookings WHERE id')) return booking;
+              return null;
+            },
+            async all() {
+              return { results: sql.includes('FROM booking_players') ? [] : [booking] };
+            },
+          }; } };
+        },
+      };
+      await handleUpdate({
+        BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db,
+      }, {
+        callback_query: {
+          id: 'callback-1', data: 'sb:pick:3',
+          from: { id: 7, first_name: 'Nick' },
+          message: {
+            message_id: 55, ephemeral_message_id: 88, chat: { id: -123456789 },
+          },
+        },
+      });
+      const answers = requests.filter((request) => request.url.endsWith('/answerCallbackQuery'));
+      expect(answers).toHaveLength(1);
+      expect(answers[0].body.text).toBe('');
+      expect(answers[0].body.show_alert).toBe(false);
     });
 
     it('removes a tab panel if Telegram falls back to a public message', async () => {
@@ -1079,7 +1206,7 @@ describe('Telegram commands', () => {
   describe('join picker delivery', () => {
     const booking = {
       id: 3, chat_id: -123456789, court: '4', capacity: 3,
-      starts_at: Date.UTC(2026, 7, 19, 13, 0), ends_at: Date.UTC(2026, 7, 19, 14, 0),
+      starts_at: Date.UTC(2027, 7, 19, 13, 0), ends_at: Date.UTC(2027, 7, 19, 14, 0),
     };
     const pickerDb = () => ({
       prepare(sql) {
@@ -1290,6 +1417,116 @@ describe('Telegram commands', () => {
       expect(answers[1].body.text).toContain('Something went wrong');
       expect(requests.some((request) => request.url.endsWith('/editEphemeralMessageText')))
         .toBe(true);
+    });
+  });
+
+  // The Bot API accepts one method call as the webhook's own HTTP response
+  // ("Making requests when getting updates"). The API is served from Amsterdam,
+  // a quarter second from this worker, so the toast riding the response is the
+  // difference between an instant tap and a visibly laggy one.
+  describe('webhook answers', () => {
+    const webhookEnv = (db) => ({
+      BOT_TOKEN: 'test-token', WEBHOOK_SECRET: 'hook-secret',
+      ALLOWED_CHATS: '-123456789', DB: db,
+    });
+    const webhookRequest = (update) => new Request('https://worker.example/webhook', {
+      method: 'POST',
+      headers: { 'X-Telegram-Bot-Api-Secret-Token': 'hook-secret' },
+      body: JSON.stringify(update),
+    });
+
+    it('sends the join toast back on the webhook response itself', async () => {
+      const requests = [];
+      vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+        requests.push({ url: String(url), body: JSON.parse(init.body) });
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 55 } }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }));
+      const booking = {
+        id: 3, chat_id: -123456789, court: '4', capacity: 3,
+        starts_at: Date.UTC(2027, 7, 19, 13, 0), ends_at: Date.UTC(2027, 7, 19, 14, 0),
+      };
+      const db = {
+        prepare(sql) {
+          return { bind() { return {
+            async first() {
+              if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+              if (sql.includes('SELECT * FROM bookings WHERE id')) return booking;
+              if (sql.includes('board_message_id')) return { board_message_id: 55 };
+              return null;
+            },
+            async all() {
+              if (sql.includes('FROM booking_players')) return { results: [] };
+              return { results: sql.includes('ends_at >') ? [booking] : [] };
+            },
+            async run() {
+              return { meta: { changes: sql.startsWith('DELETE FROM booking_players') ? 0 : 1 } };
+            },
+          }; } };
+        },
+      };
+      const tasks = [];
+      const response = await worker.fetch(webhookRequest({
+        callback_query: {
+          id: 'callback-1', data: 'sb:join:3',
+          from: { id: 11, username: 'alice' },
+          message: { message_id: 55, chat: { id: -123456789 } },
+        },
+      }), webhookEnv(db), { waitUntil: (task) => tasks.push(task) });
+      expect(response.headers.get('Content-Type')).toBe('application/json');
+      const body = JSON.parse(await response.text());
+      expect(body.method).toBe('answerCallbackQuery');
+      expect(body.callback_query_id).toBe('callback-1');
+      expect(body.text).toContain('You are in');
+      await Promise.all(tasks);
+      // The fan-out still travelled over HTTPS after the response went out...
+      expect(requests.some((request) => request.url.endsWith('/editMessageText'))).toBe(true);
+      // ...but the toast did not: it rode the webhook response instead.
+      expect(requests.some((request) => request.url.endsWith('/answerCallbackQuery')))
+        .toBe(false);
+    });
+
+    it('answers ok when a callback produces no toast at all', async () => {
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(
+        JSON.stringify({ ok: true, result: {} }),
+        { headers: { 'Content-Type': 'application/json' } }
+      )));
+      const tasks = [];
+      // Data no handler claims: the arm must be released by handling ending,
+      // not by a toast, or this response would hang until the timeout.
+      const response = await worker.fetch(webhookRequest({
+        callback_query: {
+          id: 'callback-2', data: 'xx:unknown',
+          from: { id: 11, username: 'alice' },
+          message: { message_id: 55, chat: { id: -123456789 } },
+        },
+      }), webhookEnv(emptyDb()), { waitUntil: (task) => tasks.push(task) });
+      expect(await response.text()).toBe('ok');
+      await Promise.all(tasks);
+    });
+
+    it('keeps answering message updates with a plain ok', async () => {
+      const requests = [];
+      vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+        requests.push({ url: String(url), body: JSON.parse(init.body) });
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }));
+      const tasks = [];
+      const response = await worker.fetch(webhookRequest({
+        message: {
+          message_id: 5,
+          ephemeral_message_id: 88,
+          chat: { id: -123456789 },
+          from: { id: 7, first_name: 'Nick' },
+          text: '/help',
+        },
+      }), webhookEnv(emptyDb()), { waitUntil: (task) => tasks.push(task) });
+      expect(await response.text()).toBe('ok');
+      await Promise.all(tasks);
+      expect(requests.some((request) => request.url.endsWith('/sendMessage'))).toBe(true);
     });
   });
 });

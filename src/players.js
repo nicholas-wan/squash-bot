@@ -10,7 +10,7 @@ const adminCache = new Map();
 
 // Telegram is authoritative, but admin checks sit in front of nearly every
 // management panel. A short cache removes a network round trip while keeping a
-// role change bounded; clearing is also useful after an operator changes roles.
+// role change bounded.
 export function clearAdminCache() {
   adminCache.clear();
 }

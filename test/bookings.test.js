@@ -248,7 +248,7 @@ describe('public booking announcements', () => {
     const html = await boardHtml(
       { DB: bookingDb([storedBooking], roster) }, -123, Date.UTC(2026, 7, 12, 12, 0)
     );
-    expect(html).toContain('in 7 days · Wed 19 Aug\n9pm · <b>Court 4</b> · 1 slot');
+    expect(html).toContain('in 7 days · Wed 19 Aug\n9pm · <b>Court 4</b> · 1 slot · 2/3');
     // The roster repeats the same handles on every row, so it moved behind Join.
     expect(html).not.toContain('👥');
     expect(html).not.toContain('@Dodgerblueee');
@@ -305,11 +305,11 @@ describe('public booking announcements', () => {
       // Seeded from config, never posted: no id to send to.
       { id: 2, booking_id: 3, user_id: null, slug: '@bo', name: '@bo' },
     ];
-    const { othersTold } = await notifyRosterOfChange(
+    const { allTold } = await notifyRosterOfChange(
       { BOT_TOKEN: 'test', DB: bookingDb([storedBooking], roster) },
       -123, storedBooking, { id: 11, username: 'alice' }, 'joined'
     );
-    expect(othersTold).toBe(false);
+    expect(allTold).toBe(false);
   });
 
   it('writes the cleanup rows for a burst of private copies in one batch', async () => {
@@ -327,13 +327,13 @@ describe('public booking announcements', () => {
       batches.push(statements);
       return statements.map(() => ({ success: true }));
     };
-    const { othersTold } = await notifyRosterOfChange(
+    const { allTold } = await notifyRosterOfChange(
       { BOT_TOKEN: 'test', DB: db },
       -123, storedBooking, { id: 11, username: 'alice' }, 'joined'
     );
-    // Every private copy landed, so the toast may say so — and the two
-    // sent_messages rows went in one batch, not one INSERT per send.
-    expect(othersTold).toBe(true);
+    // Every private copy landed, and the two sent_messages rows went in one
+    // batch rather than one INSERT per send.
+    expect(allTold).toBe(true);
     expect(batches).toHaveLength(1);
     expect(batches[0]).toHaveLength(2);
   });
