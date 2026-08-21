@@ -6,13 +6,13 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "db:init": "wrangler d1 execute squashbot --remote --file=schema.sql",
-    "db:migrate:002": "wrangler d1 execute squashbot --remote --file=migrations/002-players-and-tab.sql",
-    "db:migrate:003": "wrangler d1 execute squashbot --remote --file=migrations/003-per-player-reminders.sql",
-    "db:migrate:004": "wrangler d1 execute squashbot --remote --file=migrations/004-reminder-cleanup.sql",
-    "db:migrate:005": "wrangler d1 execute squashbot --remote --file=migrations/005-board-day-and-monthly-notices.sql",
-    "db:migrate:006": "wrangler d1 execute squashbot --remote --file=migrations/006-plus-ones.sql",
-    "db:verify": "wrangler d1 execute squashbot --remote --command=\"SELECT (SELECT count(tab_message_id) + count(board_day) + count(nudged_month) FROM settings) + (SELECT count(capacity) + count(charged) FROM bookings) + (SELECT count(reminder_sent) + count(pre_reminder_sent) + count(heads) FROM booking_players) AS schema_ok\"",
+    "db:init": "wrangler d1 execute squashbot-eu --remote --file=schema.sql",
+    "db:migrate:002": "wrangler d1 execute squashbot-eu --remote --file=migrations/002-players-and-tab.sql",
+    "db:migrate:003": "wrangler d1 execute squashbot-eu --remote --file=migrations/003-per-player-reminders.sql",
+    "db:migrate:004": "wrangler d1 execute squashbot-eu --remote --file=migrations/004-reminder-cleanup.sql",
+    "db:migrate:005": "wrangler d1 execute squashbot-eu --remote --file=migrations/005-board-day-and-monthly-notices.sql",
+    "db:migrate:006": "wrangler d1 execute squashbot-eu --remote --file=migrations/006-plus-ones.sql",
+    "db:verify": "wrangler d1 execute squashbot-eu --remote --command=\"SELECT (SELECT count(tab_message_id) + count(board_day) + count(nudged_month) FROM settings) + (SELECT count(capacity) + count(charged) FROM bookings) + (SELECT count(reminder_sent) + count(pre_reminder_sent) + count(heads) FROM booking_players) AS schema_ok\"",
     "test": "vitest run"
   },
   "devDependencies": {

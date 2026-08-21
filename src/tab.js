@@ -149,6 +149,9 @@ export async function myTabView(env, chatId, from, isAdmin = false) {
   // owes is part of keeping the household straight, the same reason Manage
   // shows them every roster.
   let replyMarkup = OK_MARKUP;
+  // May be a promise started alongside the ledger read; awaited only here,
+  // where the answer is first needed. isChatAdmin never rejects.
+  isAdmin = await isAdmin;
   if (isAdmin) {
     const others = (await tabBalances(env, chatId))
       .filter((entry) => settleKey(entry.slug));

@@ -106,7 +106,49 @@ export function unpinMessage(env, chatId, messageId) {
   return telegram(env, 'unpinChatMessage', { chat_id: chatId, message_id: messageId });
 }
 
+// The first answer to a tap can ride back on the webhook's own HTTP response
+// instead of costing a separate round trip to api.telegram.org — the Bot API
+// allows one method call as the webhook reply ("Making requests when getting
+// updates"), and that round trip is the whole toast latency: the API is served
+// from Amsterdam, a quarter second away from this worker. The webhook route
+// arms a capture before handling starts; the first answerCallback for that id
+// resolves it, and every later answer — or any answer with no arm, as in tests
+// and re-answers — travels over HTTPS exactly as before. Keyed by callback id,
+// which Telegram makes unique per tap, so two updates being handled in one
+// isolate cannot take each other's answers.
+const webhookAnswers = new Map();
+
+export function armWebhookAnswer(callbackId) {
+  let capture;
+  const promise = new Promise((resolve) => { capture = resolve; });
+  webhookAnswers.set(callbackId, capture);
+  return {
+    promise,
+    // Arming must always be undone: an id whose answer never comes would leak,
+    // and once the webhook has been answered without the toast, the eventual
+    // answer has to fall back to HTTPS rather than resolve a response nobody
+    // is waiting on. Resolving twice is a no-op, so disarming after a capture
+    // is harmless.
+    disarm() {
+      webhookAnswers.delete(callbackId);
+      capture(null);
+    },
+  };
+}
+
 export function answerCallback(env, callbackId, text = '', showAlert = false) {
+  const capture = webhookAnswers.get(callbackId);
+  if (capture) {
+    webhookAnswers.delete(callbackId);
+    capture({
+      method: 'answerCallbackQuery',
+      callback_query_id: callbackId, text, show_alert: showAlert,
+    });
+    // Telegram never reports the outcome of a method returned on the webhook,
+    // so success is asserted rather than known — the same blindness every
+    // fired-and-forgotten HTTPS answer already has in practice.
+    return Promise.resolve({ ok: true, result: true });
+  }
   return telegram(env, 'answerCallbackQuery', {
     callback_query_id: callbackId, text, show_alert: showAlert,
   });

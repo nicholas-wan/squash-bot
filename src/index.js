@@ -15,8 +15,8 @@ import {
   theirTabView, updateTab,
 } from './tab.js';
 import {
-  answerCallback, deleteEphemeralMessage, deleteMessage, editEphemeralMessage,
-  editReplyMarkup, escapeHtml, OK_MARKUP, sendMessage,
+  answerCallback, armWebhookAnswer, deleteEphemeralMessage, deleteMessage,
+  editEphemeralMessage, editReplyMarkup, escapeHtml, OK_MARKUP, sendMessage,
   setBotProfilePhoto, telegram,
 } from './telegram.js';
 import {
@@ -118,9 +118,16 @@ async function handleBoardCallback(env, callback) {
     }
     const field = { d: 'date', c: 'court', t: 'time' }[edit[2]];
     const found = await beginEditBooking(env, callback, Number(edit[1]), field);
-    if (found) await restoreBoardButtons(env, chatId, messageId);
+    // The toast answers first — the wizard is already on its way, and the
+    // board restore below is bookkeeping the tapper should not wait on.
     await answerCallback(env, callback.id,
       found ? `Change ${field} form opened` : 'That booking has already gone.', !found);
+    // Restoring the board's buttons only means anything when the tap came off
+    // the pinned board itself. From a private panel the message id is the
+    // ephemeral one's 0, and the edit was a doomed request on every tap.
+    if (found && !callback.message.ephemeral_message_id && messageId) {
+      await restoreBoardButtons(env, chatId, messageId);
+    }
     return true;
   }
   const remove = data.match(/^sb:delete:(\d+)$/);
@@ -149,8 +156,11 @@ async function handleBoardCallback(env, callback) {
     return true;
   }
   if (data === 'sb:join') {
+    // Started, not awaited: the admin lookup is a Telegram round trip that
+    // can overlap the picker's own D1 reads. isChatAdmin never rejects, so
+    // handing the promise down is safe; the view awaits it when needed.
     const view = await joinPickerView(
-      env, chatId, callback.from, await isChatAdmin(env, chatId, callback.from)
+      env, chatId, callback.from, isChatAdmin(env, chatId, callback.from)
     );
     if (!view) {
       await answerCallback(env, callback.id, 'There is nothing to join yet.', true);
@@ -254,22 +264,25 @@ async function handleBoardCallback(env, callback) {
     const result = await adminAddPlayer(
       env, chatId, bookingId, candidate, callback.from.id, heads
     );
+    let allTold = false;
     if (result.status === 'added') {
       // The seated player is the subject of the notice, not the admin tapping.
-      await notifyRosterOfChange(env, chatId, result.booking, {
+      ({ allTold } = await notifyRosterOfChange(env, chatId, result.booking, {
         id: candidate.user_id || null,
         username: candidate.slug.startsWith('@') ? candidate.slug.slice(1) : null,
         first_name: candidate.name,
-      }, 'added', heads);
+      }, 'added', heads));
       await updateBoard(env, chatId);
       const view = await bookingPanelView(env, chatId, bookingId);
       if (view) await showPanel(env, callback, view);
     }
+    const delivery = allTold
+      ? 'Everyone on it has been told.' : 'Some players could not be notified.';
     const replies = {
       added: [heads > 1
         ? `${candidate.name} +1 are on this court — two shares on the tab. `
-          + 'Everyone has been told.'
-        : `${candidate.name} is on this court. Everyone on it has been told.`, false],
+          + delivery
+        : `${candidate.name} is on this court. ${delivery}`, false],
       already: ['They are already on that court.', true],
       full: [heads > 1
         ? 'A +1 needs two free slots. Open another one first.'
@@ -305,21 +318,25 @@ async function handleBoardCallback(env, callback) {
     }
     const bookingId = Number(plusFlip[1]);
     const result = await togglePlusOne(env, chatId, bookingId, Number(plusFlip[2]));
+    let allTold = false;
     if (result.status === 'plus' || result.status === 'minus') {
       // The member whose share changed is the subject, not the tapping admin.
-      await notifyRosterOfChange(env, chatId, result.booking, {
+      ({ allTold } = await notifyRosterOfChange(env, chatId, result.booking, {
         id: result.player.user_id || null,
         username: result.player.slug.startsWith('@') ? result.player.slug.slice(1) : null,
         first_name: result.player.name,
-      }, result.status);
+      }, result.status));
       await updateBoard(env, chatId);
       const view = await plusOneView(env, chatId, bookingId);
       if (view) await showPanel(env, callback, view);
     }
+    const delivery = allTold
+      ? 'Everyone has been told.' : 'Some players could not be notified.';
     const replies = {
       plus: [`${result.player && result.player.name} now brings a +1 — two shares. `
-        + 'Everyone has been told.', false],
-      minus: [`${result.player && result.player.name}'s +1 is off — one share again.`, false],
+        + delivery, false],
+      minus: [`${result.player && result.player.name}'s +1 is off — one share again. `
+        + delivery, false],
       full: ['No free slot for a +1. Open another slot first.', true],
       gone: ['That player or booking has already gone.', true],
     };
@@ -410,6 +427,11 @@ async function sendPrivatePanel(env, callback, view) {
   return { status: 'failed', sent };
 }
 
+function editSucceeded(result) {
+  return result.ok
+    || String(result.description || '').includes('message is not modified');
+}
+
 // Panels are private to one person. The first tap comes off the shared pinned
 // board and has to open a new ephemeral message; every tap after that arrives
 // from inside the panel and edits it in place. Nothing here ever writes to the
@@ -421,7 +443,7 @@ async function showPanel(env, callback, view) {
     const edited = await editEphemeralMessage(
       env, chatId, callback.from.id, ephemeralId, view.html, view.replyMarkup
     );
-    if (!edited.ok) {
+    if (!editSucceeded(edited)) {
       throw new Error(`Could not update private panel: ${edited.description || 'unknown Telegram error'}`);
     }
     return edited;
@@ -442,15 +464,16 @@ async function refreshJoinPicker(env, callback) {
   const ephemeralId = callback.message && callback.message.ephemeral_message_id;
   if (!ephemeralId) return;
   const chatId = callback.message.chat.id;
+  // The promise overlaps the picker's reads, exactly as the sb:join open does.
   const view = await joinPickerView(
-    env, chatId, callback.from, await isChatAdmin(env, chatId, callback.from)
+    env, chatId, callback.from, isChatAdmin(env, chatId, callback.from)
   );
   const edited = await editEphemeralMessage(
     env, chatId, callback.from.id, ephemeralId,
     view ? view.html : '🎾 <i>Nothing left to join.</i>',
     view ? view.replyMarkup : { inline_keyboard: [] }
   );
-  if (!edited.ok) {
+  if (!editSucceeded(edited)) {
     throw new Error(`Could not refresh private court list: ${edited.description || 'unknown Telegram error'}`);
   }
 }
@@ -476,11 +499,18 @@ async function handleTabCallback(env, callback) {
   // comes off the pinned tab and opens a new private message; a Back tap from
   // inside a panel edits it in place, which showPanel tells apart by itself.
   if (data === 'tb:mine') {
+    // The admin lookup overlaps the ledger reads; myTabView awaits it late.
     const view = await myTabView(
-      env, chatId, callback.from, await isChatAdmin(env, chatId, callback.from)
+      env, chatId, callback.from, isChatAdmin(env, chatId, callback.from)
     );
     await showPanel(env, callback, view);
-    await answerCallback(env, callback.id);
+    // A first open comes off the pinned tab and lands as a new message below
+    // it, which nothing announces — an ephemeral message arrives without a
+    // notification, so the chat does not always scroll to it. The toast says
+    // where to look, exactly as the join picker's does. A tap from inside a
+    // panel edits it in place, where a pointer would only mislead.
+    await answerCallback(env, callback.id,
+      callback.message.ephemeral_message_id ? '' : '🧾 Your tab is below ⬇️');
     return true;
   }
   const theirs = data.match(/^tb:mine:(.+)$/);
@@ -612,6 +642,8 @@ export async function handleUpdate(env, update) {
     // remove it: deleteEphemeralMessage takes the id of a user who *received* a
     // message from the bot, so it only reaches the bot's own ephemeral
     // messages. Aimed at an incoming command it answers MESSAGE_NOT_FOUND.
+    // clearSentMessage reports Telegram failures itself and resolves, so it is
+    // safe to start here and await alongside the command's useful work.
     const clearCommand = knownCommands.has(command) && msg.message_id && !msg.ephemeral_message_id
       ? clearSentMessage(env, msg, 'command')
       : Promise.resolve();
@@ -707,6 +739,12 @@ export async function handleUpdate(env, update) {
   }
 }
 
+// How long the webhook response may wait for the first toast. The slowest
+// pre-answer path — opening the court list, one ephemeral send to Amsterdam —
+// sits well under a second, so anything past this bound is Telegram misbehaving,
+// where a plain ok and an HTTPS answer is the safer shape.
+const WEBHOOK_ANSWER_WAIT_MS = 2000;
+
 function adminAuthorized(request, env) {
   if (!env.ADMIN_SECRET) return false;
   return request.headers.get('Authorization') === `Bearer ${env.ADMIN_SECRET}`
@@ -726,6 +764,36 @@ export default {
         update = await request.json();
       } catch {
         return new Response('bad request', { status: 400 });
+      }
+      const callback = update && update.callback_query;
+      if (callback && callback.id) {
+        const started = Date.now();
+        // The first toast rides back on this very response when it is ready in
+        // time, sparing the tapper the round trip to Amsterdam that a separate
+        // answerCallbackQuery costs. The wait is bounded: past it the arm is
+        // dropped, the answer falls back to HTTPS, and Telegram is not left
+        // holding the webhook long enough to redeliver the whole update.
+        const reply = armWebhookAnswer(callback.id);
+        ctx.waitUntil(handleUpdate(env, update).finally(() => reply.disarm()));
+        const answer = await Promise.race([
+          reply.promise,
+          new Promise((resolve) => setTimeout(() => resolve(null), WEBHOOK_ANSWER_WAIT_MS)),
+        ]);
+        if (!answer) reply.disarm();
+        // One line per tap for `npx wrangler tail`: the colo names which side
+        // of the world this ran on — next to Telegram (EU colos) or next to
+        // the D1 primary (SIN) — and the duration is what the tapper waited
+        // for their toast. Slowness blames whichever backend is far away.
+        console.log(
+          `Webhook callback handled at ${(request.cf && request.cf.colo) || 'unknown colo'}: `
+          + `${answer ? 'toast rode the response' : 'no toast in time'} `
+          + `after ${Date.now() - started}ms`
+        );
+        return answer
+          ? new Response(JSON.stringify(answer), {
+            headers: { 'Content-Type': 'application/json' },
+          })
+          : new Response('ok');
       }
       ctx.waitUntil(handleUpdate(env, update));
       return new Response('ok');

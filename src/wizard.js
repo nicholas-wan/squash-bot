@@ -69,7 +69,13 @@ function prepareChoices(payload, now, tz) {
   const field = firstMissing(payload);
   if (field === 'date' && !payload.dateChoices.length) payload.dateChoices = defaultDateChoices(now, tz);
   if (field === 'court' && !payload.courtChoices.length) {
-    payload.courtChoices = ['1', '2', '3', '4', '5', '6', '7', '8'];
+    // YCK has five courts. When the court is being *changed*, the one the
+    // booking already sits on is dropped from the buttons — offering it back
+    // would be a button that changes nothing.
+    const current = payload.priorCourt
+      ? String(payload.priorCourt).trim().toLowerCase() : null;
+    payload.courtChoices = ['1', '2', '3', '4', '5']
+      .filter((court) => court !== current);
   }
   if (field === 'time' && !payload.timeChoices.length) payload.timeChoices = defaultTimeChoices();
   return field;
@@ -159,9 +165,10 @@ function wizardView(id, payload, now, tz) {
 async function startWizard(env, msg, text, payload, callbackQueryId, bookingId = null) {
   const now = Date.now();
   const tz = await getTimezone(env, msg.chat.id);
-  await env.DB.prepare('DELETE FROM booking_drafts WHERE chat_id = ? AND user_id = ?')
-    .bind(msg.chat.id, msg.from.id).run();
-  const inserted = await env.DB.prepare(
+  const clearDraft = env.DB.prepare(
+    'DELETE FROM booking_drafts WHERE chat_id = ? AND user_id = ?'
+  ).bind(msg.chat.id, msg.from.id);
+  const insertDraft = env.DB.prepare(
     `INSERT INTO booking_drafts
       (chat_id, user_id, user_name, source_text, booking_id, payload,
        source_message_id, created_at)
@@ -169,7 +176,16 @@ async function startWizard(env, msg, text, payload, callbackQueryId, bookingId =
   ).bind(
     msg.chat.id, msg.from.id, userName(msg.from), String(text), bookingId,
     JSON.stringify(payload), msg.message_id || null, now
-  ).run();
+  );
+  // Order matters, but D1 can run the pair in one round trip. The fallback
+  // keeps lightweight test doubles useful without weakening production.
+  let inserted;
+  if (typeof env.DB.batch === 'function') {
+    [, inserted] = await env.DB.batch([clearDraft, insertDraft]);
+  } else {
+    await clearDraft.run();
+    inserted = await insertDraft.run();
+  }
   const id = inserted.meta.last_row_id;
   const view = wizardView(id, payload, now, tz);
   const sent = await sendMessage(env, msg.chat.id, view.html, {
@@ -254,7 +270,8 @@ export async function beginEditBooking(env, callback, bookingId, field) {
     dateChoices: [], courtChoices: [], timeChoices: [], issues: [], conflicts: [],
   };
   if (field === 'date') payload.date = null;
-  if (field === 'court') payload.court = null;
+  // The court being edited away is remembered so the picker can leave it out.
+  if (field === 'court') { payload.priorCourt = booking.court; payload.court = null; }
   if (field === 'time') { payload.start = null; payload.end = null; }
   return startWizard(env, {
     chat: callback.message.chat,
@@ -332,7 +349,13 @@ export async function handleBookingCallback(env, callback) {
   }
   if (action === 'x') {
     if (value === 'd') { payload.date = null; payload.dateChoices = []; }
-    if (value === 'c') { payload.court = null; payload.courtChoices = []; }
+    if (value === 'c') {
+      // Same rule as the manage flow: the court being moved away from is not
+      // offered back. Falls back to any earlier remembered court, so tapping
+      // Change court twice keeps excluding the right one.
+      payload.priorCourt = payload.court || payload.priorCourt || null;
+      payload.court = null; payload.courtChoices = [];
+    }
     if (value === 't') { payload.start = null; payload.end = null; payload.timeChoices = []; }
     payload.issues = []; payload.conflicts = [];
     await saveAndRender(env, row, payload);
