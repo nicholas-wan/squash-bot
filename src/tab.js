@@ -1,3 +1,4 @@
+import { courtName } from './format.js';
 import { courtCostCents, formatMoney, publicHolidays, shareCents } from './pricing.js';
 import { householdSlugs, identity, ownerName } from './players.js';
 import { boardChats, dataChatId } from './scope.js';
@@ -25,10 +26,7 @@ export async function chargeBooking(env, booking, roster) {
     totalCents, roster.reduce((total, player) => total + (player.heads || 1), 0)
   );
   const household = householdSlugs(env);
-  const court = booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`;
-  const reason = `${court} · ${new Intl.DateTimeFormat('en-SG', {
-    timeZone: tz, day: 'numeric', month: 'short',
-  }).format(new Date(booking.starts_at))}`;
+  const reason = `${courtName(booking)} · ${shortDay(booking.starts_at, tz)}`;
 
   let charged = 0;
   if (share > 0) {
@@ -93,6 +91,22 @@ export function tabMarkup(balances) {
   return { inline_keyboard: rows };
 }
 
+// The ledger is append-only, so a breakdown of every row ever would grow past
+// Telegram's message limit within a year and start failing exactly where the
+// money is justified. The last time the running balance hit zero is the natural
+// cut: everything before it is a settled story, everything after it is why the
+// current balance is what it is. The totals agree because the dropped prefix
+// sums to nothing.
+function currentRows(rows) {
+  let sum = 0;
+  let lastZero = -1;
+  rows.forEach((row, index) => {
+    sum += row.amount_cents;
+    if (sum === 0) lastZero = index;
+  });
+  return { shown: rows.slice(lastZero + 1), settled: lastZero + 1 };
+}
+
 // The balance line and the story behind it, shared by every breakdown view.
 // The pricing footer is optional: the monthly notice skips it, because an
 // unprompted message should carry the ask and its reasons, not a rate card.
@@ -105,7 +119,12 @@ export function breakdownLines(env, rows, tz, { pricing = true } = {}) {
     lines.push(balance < 0 ? `In credit: <b>${formatMoney(-balance)}</b>` : 'All settled.');
   }
   lines.push('');
-  for (const row of rows) {
+  const { shown, settled } = currentRows(rows);
+  if (settled) {
+    lines.push(`Earlier history — ${settled} settled ${settled === 1 ? 'entry' : 'entries'} not shown.`);
+    if (shown.length) lines.push('');
+  }
+  for (const row of shown) {
     // Charges carry their date in the reason; a payment's reason only names
     // who cleared it, so its date is read off the row instead.
     lines.push(row.amount_cents < 0

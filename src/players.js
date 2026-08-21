@@ -208,9 +208,11 @@ export async function rostersFor(env, chatId, bookingIds) {
   return rosters;
 }
 
+// A booking that is still live: not yet ended, scoped to this chat's data.
+// Exported because every panel and admin action starts with this exact read.
 // Joining and leaving both close when the court starts, so nobody can play a
 // full hour and then drop off the roster to dodge their share.
-async function openBooking(env, chatId, bookingId) {
+export async function openBooking(env, chatId, bookingId) {
   return env.DB.prepare(
     'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
   ).bind(bookingId, dataChatId(env, chatId), Date.now()).first();
@@ -271,9 +273,7 @@ export async function leaveBooking(env, chatId, bookingId, from) {
 // also how a no-show is kept off the tab: charging happens once the court
 // expires, using whoever is still on the roster then.
 export async function removeBookingPlayer(env, chatId, bookingId, playerRowId) {
-  const booking = await env.DB.prepare(
-    'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
-  ).bind(bookingId, dataChatId(env, chatId), Date.now()).first();
+  const booking = await openBooking(env, chatId, bookingId);
   if (!booking) return null;
   const player = await env.DB.prepare(
     'SELECT * FROM booking_players WHERE id = ? AND booking_id = ?'
@@ -304,8 +304,15 @@ export async function knownPlayers(env, chatId) {
     if (player) remember(player.slug, player.name, player.userId);
   }
   const dataChat = dataChatId(env, chatId);
+  // Grouped rather than scanned: the ledger is append-only and grows forever,
+  // and this sits on the hot path of every admin panel. The name subquery
+  // keeps the latest spelling, the same rule the pinned tab uses.
   const { results: charged } = await env.DB.prepare(
-    'SELECT slug, name, user_id FROM ledger WHERE chat_id = ? ORDER BY id'
+    `SELECT l.slug AS slug, MAX(l.user_id) AS user_id,
+            (SELECT name FROM ledger
+              WHERE chat_id = l.chat_id AND slug = l.slug
+              ORDER BY created_at DESC, id DESC LIMIT 1) AS name
+     FROM ledger AS l WHERE l.chat_id = ? GROUP BY l.slug ORDER BY l.slug`
   ).bind(dataChat).all();
   for (const row of charged) remember(row.slug, row.name, row.user_id);
   const { results: seated } = await env.DB.prepare(
@@ -327,9 +334,7 @@ export async function knownPlayers(env, chatId) {
 // row on, so the member holds both slots and is billed for both. Two free heads
 // are needed for that, and one short is refused rather than rounded down.
 export async function adminAddPlayer(env, chatId, bookingId, player, addedByUserId, heads = 1) {
-  const booking = await env.DB.prepare(
-    'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
-  ).bind(bookingId, dataChatId(env, chatId), Date.now()).first();
+  const booking = await openBooking(env, chatId, bookingId);
   if (!booking) return { status: 'gone' };
   const capacity = booking.capacity || DEFAULT_CAPACITY;
   const added = await env.DB.prepare(
@@ -355,9 +360,7 @@ export async function adminAddPlayer(env, chatId, bookingId, player, addedByUser
 // taking it back always succeeds, since it only frees a slot. Charging reads
 // heads when the court expires, so flipping any time before then is enough.
 export async function togglePlusOne(env, chatId, bookingId, playerRowId) {
-  const booking = await env.DB.prepare(
-    'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
-  ).bind(bookingId, dataChatId(env, chatId), Date.now()).first();
+  const booking = await openBooking(env, chatId, bookingId);
   if (!booking) return { status: 'gone' };
   const player = await env.DB.prepare(
     'SELECT * FROM booking_players WHERE id = ? AND booking_id = ?'

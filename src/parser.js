@@ -281,7 +281,11 @@ export function extractTime(text) {
   return { value: null, choices: [], issue: 'I could not read that time.' };
 }
 
-const COURT_ABBREVIATION = /\b(?:ct|c)\s*#?\s*(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)\b/i;
+// A bare `c` only counts when it is attached to its number (`c4`, `c#4`):
+// "Room C 2 at 8pm" is conversation, and booking by message deletes the
+// original, so a false positive here destroys somebody's unrelated text.
+// `ct`/`crt` are deliberate abbreviations and may keep their space.
+const COURT_ABBREVIATION = /\b(?:crt|ct)\s*#?\s*(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)\b|\bc#?\d{1,2}\b/i;
 const CLOCK_TOKEN = /\b(?:\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm)|\d{1,2}[:.]\d{2}|(?:[01]?\d|2[0-3])[0-5]\d|noon|midnight)\b/i;
 
 export function looksLikeBooking(text, forceIntent = false) {

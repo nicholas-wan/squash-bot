@@ -74,338 +74,362 @@ async function helpBoardMarkup(env, chatId) {
   return { inline_keyboard: rows };
 }
 
-async function handleBoardCallback(env, callback) {
-  const data = String(callback.data || '');
-  if (!data.startsWith('sb:') || !callback.message) return false;
-  const chatId = callback.message.chat.id;
-  const messageId = callback.message.message_id;
-
-  if (data === 'sb:add') {
-    await beginBooking(env, {
-      chat: callback.message.chat,
-      from: callback.from,
-      message_id: messageId,
-    }, '', { forceIntent: true, callbackQueryId: callback.id });
-    await answerCallback(env, callback.id, 'Booking form opened');
-    return true;
-  }
-  if (data === 'sb:manage') {
-    await showPanel(env, callback, await managerView(env, chatId));
-    await answerCallback(env, callback.id);
-    return true;
-  }
-  if (data === 'sb:back') {
-    await restoreBoardButtons(env, chatId, messageId);
-    await answerCallback(env, callback.id);
-    return true;
-  }
-  const pick = data.match(/^sb:pick:(\d+)$/);
-  if (pick) {
-    const view = await bookingPanelView(env, chatId, Number(pick[1]));
-    if (view) await showPanel(env, callback, view);
-    await answerCallback(env, callback.id, view ? '' : 'That booking has already gone.', !view);
-    if (!view) await updateBoard(env, chatId);
-    return true;
-  }
-  const edit = data.match(/^sb:edit:(\d+):([dct])$/);
-  if (edit) {
-    const permitted = await authorizeBookingChange(
-      env, chatId, Number(edit[1]), callback.from, 'edit'
-    );
-    if (!permitted.allowed) {
-      await answerCallback(env, callback.id, permitted.message, true);
-      return true;
-    }
-    const field = { d: 'date', c: 'court', t: 'time' }[edit[2]];
-    const found = await beginEditBooking(env, callback, Number(edit[1]), field);
-    // The toast answers first — the wizard is already on its way, and the
-    // board restore below is bookkeeping the tapper should not wait on.
-    await answerCallback(env, callback.id,
-      found ? `Change ${field} form opened` : 'That booking has already gone.', !found);
-    // Restoring the board's buttons only means anything when the tap came off
-    // the pinned board itself. From a private panel the message id is the
-    // ephemeral one's 0, and the edit was a doomed request on every tap.
-    if (found && !callback.message.ephemeral_message_id && messageId) {
-      await restoreBoardButtons(env, chatId, messageId);
-    }
-    return true;
-  }
-  const remove = data.match(/^sb:delete:(\d+)$/);
-  if (remove) {
-    const permitted = await authorizeBookingChange(
-      env, chatId, Number(remove[1]), callback.from, 'delete'
-    );
-    if (!permitted.allowed) {
-      await answerCallback(env, callback.id, permitted.message, true);
-      return true;
-    }
-    const view = await deletePanelView(env, chatId, Number(remove[1]));
-    if (view) await showPanel(env, callback, view);
-    await answerCallback(env, callback.id, view ? '' : 'That booking has already gone.', !view);
-    if (!view) await updateBoard(env, chatId);
-    return true;
-  }
-  const cancel = data.match(/^sb:cancel:(\d+)$/);
-  if (cancel) {
-    const result = await cancelBooking(
-      env, chatId, Number(cancel[1]), callback.from, 'Deleted from pinned booking manager'
-    );
-    const removed = result.status === 'cancelled';
-    await answerCallback(env, callback.id,
-      removed ? 'Booking cancelled' : result.message, !removed);
-    return true;
-  }
-  if (data === 'sb:join') {
-    // Started, not awaited: the admin lookup is a Telegram round trip that
-    // can overlap the picker's own D1 reads. isChatAdmin never rejects, so
-    // handing the promise down is safe; the view awaits it when needed.
-    const view = await joinPickerView(
-      env, chatId, callback.from, isChatAdmin(env, chatId, callback.from)
-    );
-    if (!view) {
-      await answerCallback(env, callback.id, 'There is nothing to join yet.', true);
-      return true;
-    }
-    const delivery = await sendPrivatePanel(env, callback, view);
-    // A refused send used to be ignored, which read as a dead button — for a
-    // brand-new member most of all, the one person Telegram is likeliest to
-    // refuse an ephemeral message for. The tap is the only channel left, so
-    // the failure is said there, as an alert rather than a toast.
-    if (delivery.status === 'failed') {
-      await answerCallback(env, callback.id,
-        'I could not open your court list. Please tap 🙋 Join again.', true);
-      return true;
-    }
-    // Telegram falls back to an ordinary group message when it cannot deliver
-    // an ephemeral one, which would publish "Only you can see this list" — and
-    // the rosters on it — to the whole group. Same rule as sendPrivately: the
-    // public copy goes, and the tapper is told rather than left guessing.
-    if (delivery.status === 'public-fallback') {
-      await answerCallback(env, callback.id,
-        'Telegram would not deliver your private court list. Please tap 🙋 Join again.', true);
-      return true;
-    }
-    // An ephemeral message arrives without a notification, so the chat does
-    // not always scroll to it; the toast says where to look.
-    await answerCallback(env, callback.id, '🎾 Your court list is below ⬇️');
-    return true;
-  }
-  if (data === 'sb:close' || data === 'sb:ok') {
-    await dismissMessage(env, callback);
-    await answerCallback(env, callback.id);
-    return true;
-  }
-  const full = data.match(/^sb:full:(\d+)$/);
-  if (full) {
-    await answerCallback(env, callback.id,
-      'That court is full. A group admin can open another slot.', true);
-    return true;
-  }
-  const join = data.match(/^sb:join:(\d+)$/);
-  const leave = data.match(/^sb:leave:(\d+)$/);
-  const tap = data.match(/^sb:tap:(\d+)$/);
-  if (join || leave || tap) {
-    const bookingId = Number((join || leave || tap)[1]);
-    let result;
-    if (tap) result = await toggleBooking(env, chatId, bookingId, callback.from);
-    else if (join) result = await joinBooking(env, chatId, bookingId, callback.from);
-    else result = await leaveBooking(env, chatId, bookingId, callback.from);
-    const replies = {
-      already: ['You are already on that court.', true],
-      absent: ['You were not on that court.', true],
-      full: ['That court is full. A group admin can open another slot.', true],
-      started: ['That court has already started, so the roster is locked.', true],
-      gone: ['That booking has already gone.', true],
-    };
-    if (result.status === 'joined' || result.status === 'left') {
-      // The slot changed hands the moment the insert or delete ran, so the
-      // toast goes out first: it is the one piece of feedback that expires,
-      // and it used to wait behind the notification burst, the board edit,
-      // and the picker refresh — long enough for Telegram to discard it,
-      // which read as a tap that did nothing. The roster's private notices
-      // carry the fuller story; the toast only confirms the slot moved.
-      await answerCallback(env, callback.id, result.status === 'left'
-        ? 'You are out. Your slot is free again.' : 'You are in.');
-      // Telling the court still comes before the board: updateBoard throws
-      // when the pinned message cannot be edited or re-pinned, and the catch
-      // around this handler would then swallow the notification along with it
-      // — the people on the court would never hear, for a reason that has
-      // nothing to do with them.
-      await notifyRosterOfChange(
-        env, chatId, result.booking, callback.from, result.status, 1,
-        { callbackQueryId: callback.id }
-      );
-      await updateBoard(env, chatId);
-      await refreshJoinPicker(env, callback);
-      return true;
-    }
-    await answerCallback(env, callback.id, ...replies[result.status]);
-    return true;
-  }
+// Every tap the pinned board and its private panels can produce, one row per
+// route, tried in order — a two-part pattern (a seat pick with its slug, a +1
+// flip or kick with its row id) must sit above its one-part opener, or the
+// opener swallows it. A route with `admin` is refused with that exact toast
+// before its handler runs. Telegram never checks that callback data matches a
+// button the bot drew, so a modified client can send any string — which taps
+// are gated, and which deliberately are not, reads straight down this table.
+// sb:manage and sb:pick only *render*, but what they render includes rosters a
+// non-admin member is deliberately not shown, so they carry the gate too;
+// sb:edit, sb:delete, and sb:cancel guard themselves through
+// authorizeBookingChange, whose booker-or-admin rule this table cannot express.
+const MANAGE_ADMIN = 'Only group admins can manage bookings.';
+const SEAT_ADMIN = 'Only group admins can add players.';
+const PLUS_ADMIN = 'Only group admins can change a +1.';
+const KICK_ADMIN = 'Only group admins can remove players.';
+const boardRoutes = [
+  { pattern: /^sb:add$/, handler: beginBoardBooking },
+  { pattern: /^sb:manage$/, admin: MANAGE_ADMIN, handler: openManager },
+  { pattern: /^sb:back$/, handler: restoreBoard },
+  { pattern: /^sb:pick:(\d+)$/, admin: MANAGE_ADMIN, handler: openBookingPanel },
+  { pattern: /^sb:edit:(\d+):([dct])$/, handler: openEditForm },
+  { pattern: /^sb:delete:(\d+)$/, handler: openDeleteConfirmation },
+  { pattern: /^sb:cancel:(\d+)$/, handler: cancelFromPanel },
+  { pattern: /^sb:join$/, handler: openJoinPicker },
+  { pattern: /^sb:(?:close|ok)$/, handler: dismissTapped },
+  { pattern: /^sb:full:(\d+)$/, handler: fullCourtToast },
+  { pattern: /^sb:(join|leave|tap):(\d+)$/, handler: moveSlot },
   // The head count comes before the slug and is a bare 1 or 2, which is what
   // keeps this apart from the picker's own :h1 / :h2 rows — a slug can start
   // with anything, so the digit has to be matched first and anchored.
-  const addPick = data.match(/^sb:addp:(\d+):([12]):(.+)$/);
-  if (addPick) {
-    if (!(await isChatAdmin(env, chatId, callback.from))) {
-      await answerCallback(env, callback.id, 'Only group admins can add players.', true);
+  { pattern: /^sb:addp:(\d+):([12]):(.+)$/, admin: SEAT_ADMIN, handler: seatPickedPlayer },
+  { pattern: /^sb:addp:(\d+)(?::h([12]))?$/, admin: SEAT_ADMIN, handler: openSeatPicker },
+  { pattern: /^sb:plus:(\d+):(\d+)$/, admin: PLUS_ADMIN, handler: flipPlusOne },
+  { pattern: /^sb:plus:(\d+)$/, admin: PLUS_ADMIN, handler: openPlusOnePicker },
+  { pattern: /^sb:kick:(\d+):(\d+)$/, admin: KICK_ADMIN, handler: removePickedPlayer },
+  { pattern: /^sb:kick:(\d+)$/, admin: KICK_ADMIN, handler: openRemovePicker },
+  { pattern: /^sb:cap:(\d+)$/, admin: 'Only group admins can open extra slots.', handler: raiseSlotCount },
+];
+
+// The one dispatch both route tables share. Returns true when a route claimed
+// the tap, whether its handler ran or its admin guard refused it.
+async function dispatchCallback(env, callback, routes) {
+  const data = String(callback.data || '');
+  for (const route of routes) {
+    const match = data.match(route.pattern);
+    if (!match) continue;
+    if (route.admin
+      && !(await isChatAdmin(env, callback.message.chat.id, callback.from))) {
+      await answerCallback(env, callback.id, route.admin, true);
       return true;
     }
-    const bookingId = Number(addPick[1]);
-    const heads = Number(addPick[2]);
-    // Resolved fresh rather than trusted from the button, so a stale panel
-    // cannot seat somebody under an outdated name or id.
-    const candidate = (await knownPlayers(env, chatId))
-      .find((player) => player.slug === addPick[3]);
-    if (!candidate) {
-      await answerCallback(env, callback.id, 'That player is no longer known.', true);
-      return true;
-    }
-    const result = await adminAddPlayer(
-      env, chatId, bookingId, candidate, callback.from.id, heads
-    );
-    let allTold = false;
-    if (result.status === 'added') {
-      // The seated player is the subject of the notice, not the admin tapping.
-      ({ allTold } = await notifyRosterOfChange(env, chatId, result.booking, {
-        id: candidate.user_id || null,
-        username: candidate.slug.startsWith('@') ? candidate.slug.slice(1) : null,
-        first_name: candidate.name,
-      }, 'added', heads));
-      await updateBoard(env, chatId);
-      const view = await bookingPanelView(env, chatId, bookingId);
-      if (view) await showPanel(env, callback, view);
-    }
-    const delivery = allTold
-      ? 'Everyone on it has been told.' : 'Some players could not be notified.';
-    const replies = {
-      added: [heads > 1
-        ? `${candidate.name} +1 are on this court — two shares on the tab. `
-          + delivery
-        : `${candidate.name} is on this court. ${delivery}`, false],
-      already: ['They are already on that court.', true],
-      full: [heads > 1
-        ? 'A +1 needs two free slots. Open another one first.'
-        : 'That court is full. Open another slot first.', true],
-      gone: ['That booking has already gone.', true],
-    };
-    await answerCallback(env, callback.id, ...replies[result.status]);
-    return true;
-  }
-  // Opening the picker and flipping its friend toggle are the same view drawn
-  // for one head or two, so they are one branch: the toggle only re-renders.
-  const addOpen = data.match(/^sb:addp:(\d+)(?::h([12]))?$/);
-  if (addOpen) {
-    if (!(await isChatAdmin(env, chatId, callback.from))) {
-      await answerCallback(env, callback.id, 'Only group admins can add players.', true);
-      return true;
-    }
-    const heads = Number(addOpen[2] || 1);
-    const view = await addPlayerView(env, chatId, Number(addOpen[1]), heads);
-    if (view) await showPanel(env, callback, view);
-    await answerCallback(env, callback.id,
-      view ? '' : (heads > 1
-        ? 'A +1 needs two free slots, and this court has not got them.'
-        : 'Nobody to seat — the court is full, gone, or everyone known is on it.'),
-      !view);
-    return true;
-  }
-  const plusFlip = data.match(/^sb:plus:(\d+):(\d+)$/);
-  if (plusFlip) {
-    if (!(await isChatAdmin(env, chatId, callback.from))) {
-      await answerCallback(env, callback.id, 'Only group admins can change a +1.', true);
-      return true;
-    }
-    const bookingId = Number(plusFlip[1]);
-    const result = await togglePlusOne(env, chatId, bookingId, Number(plusFlip[2]));
-    let allTold = false;
-    if (result.status === 'plus' || result.status === 'minus') {
-      // The member whose share changed is the subject, not the tapping admin.
-      ({ allTold } = await notifyRosterOfChange(env, chatId, result.booking, {
-        id: result.player.user_id || null,
-        username: result.player.slug.startsWith('@') ? result.player.slug.slice(1) : null,
-        first_name: result.player.name,
-      }, result.status));
-      await updateBoard(env, chatId);
-      const view = await plusOneView(env, chatId, bookingId);
-      if (view) await showPanel(env, callback, view);
-    }
-    const delivery = allTold
-      ? 'Everyone has been told.' : 'Some players could not be notified.';
-    const replies = {
-      plus: [`${result.player && result.player.name} now brings a +1 — two shares. `
-        + delivery, false],
-      minus: [`${result.player && result.player.name}'s +1 is off — one share again. `
-        + delivery, false],
-      full: ['No free slot for a +1. Open another slot first.', true],
-      gone: ['That player or booking has already gone.', true],
-    };
-    await answerCallback(env, callback.id, ...replies[result.status]);
-    return true;
-  }
-  const plusOpen = data.match(/^sb:plus:(\d+)$/);
-  if (plusOpen) {
-    if (!(await isChatAdmin(env, chatId, callback.from))) {
-      await answerCallback(env, callback.id, 'Only group admins can change a +1.', true);
-      return true;
-    }
-    const view = await plusOneView(env, chatId, Number(plusOpen[1]));
-    if (view) await showPanel(env, callback, view);
-    await answerCallback(env, callback.id,
-      view ? '' : 'Nobody is on that booking.', !view);
-    return true;
-  }
-  const kicked = data.match(/^sb:kick:(\d+):(\d+)$/);
-  if (kicked) {
-    if (!(await isChatAdmin(env, chatId, callback.from))) {
-      await answerCallback(env, callback.id, 'Only group admins can remove players.', true);
-      return true;
-    }
-    const removed = await removeBookingPlayer(
-      env, chatId, Number(kicked[1]), Number(kicked[2])
-    );
-    if (removed) {
-      await updateBoard(env, chatId);
-      await notifyRemovedPlayer(env, chatId, removed.player, removed.booking);
-      const view = await bookingPanelView(env, chatId, Number(kicked[1]));
-      if (view) await showPanel(env, callback, view);
-    }
-    await answerCallback(env, callback.id,
-      removed ? `${removed.player.name} is off this booking.`
-        : 'That player has already gone.', !removed);
-    return true;
-  }
-  const kick = data.match(/^sb:kick:(\d+)$/);
-  if (kick) {
-    if (!(await isChatAdmin(env, chatId, callback.from))) {
-      await answerCallback(env, callback.id, 'Only group admins can remove players.', true);
-      return true;
-    }
-    const shown = await removePlayerView(env, chatId, Number(kick[1]));
-    if (shown) await showPanel(env, callback, shown);
-    await answerCallback(env, callback.id,
-      shown ? '' : 'Nobody is on that booking.', !shown);
-    return true;
-  }
-  const capacity = data.match(/^sb:cap:(\d+)$/);
-  if (capacity) {
-    if (!(await isChatAdmin(env, chatId, callback.from))) {
-      await answerCallback(env, callback.id, 'Only group admins can open extra slots.', true);
-      return true;
-    }
-    const raised = await raiseCapacity(env, chatId, Number(capacity[1]));
-    if (raised) {
-      await updateBoard(env, chatId);
-      const view = await bookingPanelView(env, chatId, Number(capacity[1]));
-      if (view) await showPanel(env, callback, view);
-    }
-    await answerCallback(env, callback.id,
-      raised ? `This court now holds ${raised} players.`
-        : `That booking has gone, or it is already at the ${MAX_CAPACITY} player limit.`,
-      !raised);
+    await route.handler(env, callback, match);
     return true;
   }
   return false;
+}
+
+function handleBoardCallback(env, callback) {
+  if (!String(callback.data || '').startsWith('sb:') || !callback.message) {
+    return false;
+  }
+  return dispatchCallback(env, callback, boardRoutes);
+}
+
+async function beginBoardBooking(env, callback) {
+  await beginBooking(env, {
+    chat: callback.message.chat,
+    from: callback.from,
+    message_id: callback.message.message_id,
+  }, '', { forceIntent: true, callbackQueryId: callback.id });
+  await answerCallback(env, callback.id, 'Booking form opened');
+}
+
+async function openManager(env, callback) {
+  await showPanel(env, callback, await managerView(env, callback.message.chat.id));
+  await answerCallback(env, callback.id);
+}
+
+async function restoreBoard(env, callback) {
+  await restoreBoardButtons(
+    env, callback.message.chat.id, callback.message.message_id
+  );
+  await answerCallback(env, callback.id);
+}
+
+async function openBookingPanel(env, callback, match) {
+  const chatId = callback.message.chat.id;
+  const view = await bookingPanelView(env, chatId, Number(match[1]));
+  if (view) await showPanel(env, callback, view);
+  await answerCallback(env, callback.id, view ? '' : 'That booking has already gone.', !view);
+  if (!view) await updateBoard(env, chatId);
+}
+
+async function openEditForm(env, callback, match) {
+  const chatId = callback.message.chat.id;
+  const messageId = callback.message.message_id;
+  const permitted = await authorizeBookingChange(
+    env, chatId, Number(match[1]), callback.from, 'edit'
+  );
+  if (!permitted.allowed) {
+    await answerCallback(env, callback.id, permitted.message, true);
+    return;
+  }
+  const field = { d: 'date', c: 'court', t: 'time' }[match[2]];
+  const found = await beginEditBooking(env, callback, Number(match[1]), field);
+  // The toast answers first — the wizard is already on its way, and the
+  // board restore below is bookkeeping the tapper should not wait on.
+  await answerCallback(env, callback.id,
+    found ? `Change ${field} form opened` : 'That booking has already gone.', !found);
+  // Restoring the board's buttons only means anything when the tap came off
+  // the pinned board itself. From a private panel the message id is the
+  // ephemeral one's 0, and the edit was a doomed request on every tap.
+  if (found && !callback.message.ephemeral_message_id && messageId) {
+    await restoreBoardButtons(env, chatId, messageId);
+  }
+}
+
+async function openDeleteConfirmation(env, callback, match) {
+  const chatId = callback.message.chat.id;
+  const permitted = await authorizeBookingChange(
+    env, chatId, Number(match[1]), callback.from, 'delete'
+  );
+  if (!permitted.allowed) {
+    await answerCallback(env, callback.id, permitted.message, true);
+    return;
+  }
+  const view = await deletePanelView(env, chatId, Number(match[1]));
+  if (view) await showPanel(env, callback, view);
+  await answerCallback(env, callback.id, view ? '' : 'That booking has already gone.', !view);
+  if (!view) await updateBoard(env, chatId);
+}
+
+async function cancelFromPanel(env, callback, match) {
+  const result = await cancelBooking(
+    env, callback.message.chat.id, Number(match[1]), callback.from,
+    'Deleted from pinned booking manager'
+  );
+  const removed = result.status === 'cancelled';
+  await answerCallback(env, callback.id,
+    removed ? 'Booking cancelled' : result.message, !removed);
+}
+
+async function openJoinPicker(env, callback) {
+  const chatId = callback.message.chat.id;
+  // Started, not awaited: the admin lookup is a Telegram round trip that
+  // can overlap the picker's own D1 reads. isChatAdmin never rejects, so
+  // handing the promise down is safe; the view awaits it when needed.
+  const view = await joinPickerView(
+    env, chatId, callback.from, isChatAdmin(env, chatId, callback.from)
+  );
+  if (!view) {
+    await answerCallback(env, callback.id, 'There is nothing to join yet.', true);
+    return;
+  }
+  const delivery = await sendPrivatePanel(env, callback, view);
+  // A refused send used to be ignored, which read as a dead button — for a
+  // brand-new member most of all, the one person Telegram is likeliest to
+  // refuse an ephemeral message for. The tap is the only channel left, so
+  // the failure is said there, as an alert rather than a toast.
+  if (delivery.status === 'failed') {
+    await answerCallback(env, callback.id,
+      'I could not open your court list. Please tap 🙋 Join again.', true);
+    return;
+  }
+  // Telegram falls back to an ordinary group message when it cannot deliver
+  // an ephemeral one, which would publish "Only you can see this list" — and
+  // the rosters on it — to the whole group. Same rule as sendPrivately: the
+  // public copy goes, and the tapper is told rather than left guessing.
+  if (delivery.status === 'public-fallback') {
+    await answerCallback(env, callback.id,
+      'Telegram would not deliver your private court list. Please tap 🙋 Join again.', true);
+    return;
+  }
+  // An ephemeral message arrives without a notification, so the chat does
+  // not always scroll to it; the toast says where to look.
+  await answerCallback(env, callback.id, '🎾 Your court list is below ⬇️');
+}
+
+async function dismissTapped(env, callback) {
+  await dismissMessage(env, callback);
+  await answerCallback(env, callback.id);
+}
+
+async function fullCourtToast(env, callback) {
+  await answerCallback(env, callback.id,
+    'That court is full. A group admin can open another slot.', true);
+}
+
+async function moveSlot(env, callback, match) {
+  const chatId = callback.message.chat.id;
+  const action = match[1];
+  const bookingId = Number(match[2]);
+  let result;
+  if (action === 'tap') result = await toggleBooking(env, chatId, bookingId, callback.from);
+  else if (action === 'join') result = await joinBooking(env, chatId, bookingId, callback.from);
+  else result = await leaveBooking(env, chatId, bookingId, callback.from);
+  const replies = {
+    already: ['You are already on that court.', true],
+    absent: ['You were not on that court.', true],
+    full: ['That court is full. A group admin can open another slot.', true],
+    started: ['That court has already started, so the roster is locked.', true],
+    gone: ['That booking has already gone.', true],
+  };
+  if (result.status === 'joined' || result.status === 'left') {
+    // The slot changed hands the moment the insert or delete ran, so the
+    // toast goes out first: it is the one piece of feedback that expires,
+    // and it used to wait behind the notification burst, the board edit,
+    // and the picker refresh — long enough for Telegram to discard it,
+    // which read as a tap that did nothing. The roster's private notices
+    // carry the fuller story; the toast only confirms the slot moved.
+    await answerCallback(env, callback.id, result.status === 'left'
+      ? 'You are out. Your slot is free again.' : 'You are in.');
+    // Telling the court still comes before the board: updateBoard throws
+    // when the pinned message cannot be edited or re-pinned, and the catch
+    // around this handler would then swallow the notification along with it
+    // — the people on the court would never hear, for a reason that has
+    // nothing to do with them.
+    await notifyRosterOfChange(
+      env, chatId, result.booking, callback.from, result.status, 1,
+      { callbackQueryId: callback.id }
+    );
+    await updateBoard(env, chatId);
+    await refreshJoinPicker(env, callback);
+    return;
+  }
+  await answerCallback(env, callback.id, ...replies[result.status]);
+}
+
+async function seatPickedPlayer(env, callback, match) {
+  const chatId = callback.message.chat.id;
+  const bookingId = Number(match[1]);
+  const heads = Number(match[2]);
+  // Resolved fresh rather than trusted from the button, so a stale panel
+  // cannot seat somebody under an outdated name or id.
+  const candidate = (await knownPlayers(env, chatId))
+    .find((player) => player.slug === match[3]);
+  if (!candidate) {
+    await answerCallback(env, callback.id, 'That player is no longer known.', true);
+    return;
+  }
+  const result = await adminAddPlayer(
+    env, chatId, bookingId, candidate, callback.from.id, heads
+  );
+  let allTold = false;
+  if (result.status === 'added') {
+    // The seated player is the subject of the notice, not the admin tapping.
+    ({ allTold } = await notifyRosterOfChange(env, chatId, result.booking, {
+      id: candidate.user_id || null,
+      username: candidate.slug.startsWith('@') ? candidate.slug.slice(1) : null,
+      first_name: candidate.name,
+    }, 'added', heads));
+    await updateBoard(env, chatId);
+    const view = await bookingPanelView(env, chatId, bookingId);
+    if (view) await showPanel(env, callback, view);
+  }
+  const delivery = allTold
+    ? 'Everyone on it has been told.' : 'Some players could not be notified.';
+  const replies = {
+    added: [heads > 1
+      ? `${candidate.name} +1 are on this court — two shares on the tab. `
+        + delivery
+      : `${candidate.name} is on this court. ${delivery}`, false],
+    already: ['They are already on that court.', true],
+    full: [heads > 1
+      ? 'A +1 needs two free slots. Open another one first.'
+      : 'That court is full. Open another slot first.', true],
+    gone: ['That booking has already gone.', true],
+  };
+  await answerCallback(env, callback.id, ...replies[result.status]);
+}
+
+// Opening the picker and flipping its friend toggle are the same view drawn
+// for one head or two, so they are one route: the toggle only re-renders.
+async function openSeatPicker(env, callback, match) {
+  const chatId = callback.message.chat.id;
+  const heads = Number(match[2] || 1);
+  const view = await addPlayerView(env, chatId, Number(match[1]), heads);
+  if (view) await showPanel(env, callback, view);
+  await answerCallback(env, callback.id,
+    view ? '' : (heads > 1
+      ? 'A +1 needs two free slots, and this court has not got them.'
+      : 'Nobody to seat — the court is full, gone, or everyone known is on it.'),
+    !view);
+}
+
+async function flipPlusOne(env, callback, match) {
+  const chatId = callback.message.chat.id;
+  const bookingId = Number(match[1]);
+  const result = await togglePlusOne(env, chatId, bookingId, Number(match[2]));
+  let allTold = false;
+  if (result.status === 'plus' || result.status === 'minus') {
+    // The member whose share changed is the subject, not the tapping admin.
+    ({ allTold } = await notifyRosterOfChange(env, chatId, result.booking, {
+      id: result.player.user_id || null,
+      username: result.player.slug.startsWith('@') ? result.player.slug.slice(1) : null,
+      first_name: result.player.name,
+    }, result.status));
+    await updateBoard(env, chatId);
+    const view = await plusOneView(env, chatId, bookingId);
+    if (view) await showPanel(env, callback, view);
+  }
+  const delivery = allTold
+    ? 'Everyone has been told.' : 'Some players could not be notified.';
+  const replies = {
+    plus: [`${result.player && result.player.name} now brings a +1 — two shares. `
+      + delivery, false],
+    minus: [`${result.player && result.player.name}'s +1 is off — one share again. `
+      + delivery, false],
+    full: ['No free slot for a +1. Open another slot first.', true],
+    gone: ['That player or booking has already gone.', true],
+  };
+  await answerCallback(env, callback.id, ...replies[result.status]);
+}
+
+async function openPlusOnePicker(env, callback, match) {
+  const view = await plusOneView(env, callback.message.chat.id, Number(match[1]));
+  if (view) await showPanel(env, callback, view);
+  await answerCallback(env, callback.id,
+    view ? '' : 'Nobody is on that booking.', !view);
+}
+
+async function removePickedPlayer(env, callback, match) {
+  const chatId = callback.message.chat.id;
+  const removed = await removeBookingPlayer(
+    env, chatId, Number(match[1]), Number(match[2])
+  );
+  if (removed) {
+    await updateBoard(env, chatId);
+    await notifyRemovedPlayer(env, chatId, removed.player, removed.booking);
+    const view = await bookingPanelView(env, chatId, Number(match[1]));
+    if (view) await showPanel(env, callback, view);
+  }
+  await answerCallback(env, callback.id,
+    removed ? `${removed.player.name} is off this booking.`
+      : 'That player has already gone.', !removed);
+}
+
+async function openRemovePicker(env, callback, match) {
+  const shown = await removePlayerView(env, callback.message.chat.id, Number(match[1]));
+  if (shown) await showPanel(env, callback, shown);
+  await answerCallback(env, callback.id,
+    shown ? '' : 'Nobody is on that booking.', !shown);
+}
+
+async function raiseSlotCount(env, callback, match) {
+  const chatId = callback.message.chat.id;
+  const raised = await raiseCapacity(env, chatId, Number(match[1]));
+  if (raised) {
+    await updateBoard(env, chatId);
+    const view = await bookingPanelView(env, chatId, Number(match[1]));
+    if (view) await showPanel(env, callback, view);
+  }
+  await answerCallback(env, callback.id,
+    raised ? `This court now holds ${raised} players.`
+      : `That booking has gone, or it is already at the ${MAX_CAPACITY} player limit.`,
+    !raised);
 }
 
 // A private send can come back as an ordinary group message. Every panel uses
@@ -489,87 +513,90 @@ async function dismissMessage(env, callback) {
   }
 }
 
-async function handleTabCallback(env, callback) {
-  const data = String(callback.data || '');
-  if (!data.startsWith('tb:') || !callback.message) return false;
+// tb:mine carries no guard on purpose: anyone may read their own breakdown.
+// Everything under it settles money or reads somebody else's, which is admin
+// work — the same table shape as the board's, gated the same way.
+const SETTLE_ADMIN = 'Only group admins can settle the tab.';
+const tabRoutes = [
+  { pattern: /^tb:mine$/, handler: openMyTab },
+  { pattern: /^tb:mine:(.+)$/, admin: 'Only group admins can read another tab.', handler: openTheirTab },
+  { pattern: /^tb:back$/, admin: SETTLE_ADMIN, handler: closeSettlePicker },
+  { pattern: /^tb:pay$/, admin: SETTLE_ADMIN, handler: openSettlePicker },
+  { pattern: /^tb:paid:(.+)$/, admin: SETTLE_ADMIN, handler: settleTapped },
+  { pattern: /^tb:pay:(.+)$/, admin: SETTLE_ADMIN, handler: confirmSettle },
+];
+
+function handleTabCallback(env, callback) {
+  if (!String(callback.data || '').startsWith('tb:') || !callback.message) {
+    return false;
+  }
+  return dispatchCallback(env, callback, tabRoutes);
+}
+
+// The first tap comes off the pinned tab and opens a new private message; a
+// Back tap from inside a panel edits it in place, which showPanel tells apart
+// by itself.
+async function openMyTab(env, callback) {
   const chatId = callback.message.chat.id;
-  const messageId = callback.message.message_id;
+  // The admin lookup overlaps the ledger reads; myTabView awaits it late.
+  const view = await myTabView(
+    env, chatId, callback.from, isChatAdmin(env, chatId, callback.from)
+  );
+  await showPanel(env, callback, view);
+  // A first open comes off the pinned tab and lands as a new message below
+  // it, which nothing announces — an ephemeral message arrives without a
+  // notification, so the chat does not always scroll to it. The toast says
+  // where to look, exactly as the join picker's does. A tap from inside a
+  // panel edits it in place, where a pointer would only mislead.
+  await answerCallback(env, callback.id,
+    callback.message.ephemeral_message_id ? '' : '🧾 Your tab is below ⬇️');
+}
 
-  // Before the admin gate: anyone may read their own breakdown. The first tap
-  // comes off the pinned tab and opens a new private message; a Back tap from
-  // inside a panel edits it in place, which showPanel tells apart by itself.
-  if (data === 'tb:mine') {
-    // The admin lookup overlaps the ledger reads; myTabView awaits it late.
-    const view = await myTabView(
-      env, chatId, callback.from, isChatAdmin(env, chatId, callback.from)
-    );
-    await showPanel(env, callback, view);
-    // A first open comes off the pinned tab and lands as a new message below
-    // it, which nothing announces — an ephemeral message arrives without a
-    // notification, so the chat does not always scroll to it. The toast says
-    // where to look, exactly as the join picker's does. A tap from inside a
-    // panel edits it in place, where a pointer would only mislead.
-    await answerCallback(env, callback.id,
-      callback.message.ephemeral_message_id ? '' : '🧾 Your tab is below ⬇️');
-    return true;
-  }
-  const theirs = data.match(/^tb:mine:(.+)$/);
-  if (theirs) {
-    if (!(await isChatAdmin(env, chatId, callback.from))) {
-      await answerCallback(env, callback.id,
-        'Only group admins can read another tab.', true);
-      return true;
-    }
-    const view = await theirTabView(env, chatId, theirs[1]);
-    if (view) await showPanel(env, callback, view);
-    await answerCallback(env, callback.id,
-      view ? '' : 'Nothing on that tab any more.', !view);
-    return true;
-  }
+async function openTheirTab(env, callback, match) {
+  const view = await theirTabView(env, callback.message.chat.id, match[1]);
+  if (view) await showPanel(env, callback, view);
+  await answerCallback(env, callback.id,
+    view ? '' : 'Nothing on that tab any more.', !view);
+}
 
-  if (!(await isChatAdmin(env, chatId, callback.from))) {
-    await answerCallback(env, callback.id, 'Only group admins can settle the tab.', true);
-    return true;
+async function closeSettlePicker(env, callback) {
+  await updateTab(env, callback.message.chat.id);
+  await answerCallback(env, callback.id);
+}
+
+async function openSettlePicker(env, callback) {
+  const chatId = callback.message.chat.id;
+  await editReplyMarkup(env, chatId, callback.message.message_id,
+    await settleMarkup(env, chatId));
+  await answerCallback(env, callback.id, 'Choose whose debt to clear');
+}
+
+async function settleTapped(env, callback, match) {
+  const chatId = callback.message.chat.id;
+  const settled = await settleUser(env, chatId, match[1], callback.from);
+  // The ledger went quiet for the one person it is about: close the loop
+  // with a private receipt, if they have an id to send it to.
+  if (settled && settled.user_id) {
+    await sendMessage(env, chatId,
+      `✅ <b>Payment received</b> — your ${formatMoney(settled.balance)} ` +
+      'squash tab is settled. Thank you!',
+      { receiverUserId: settled.user_id, replyMarkup: OK_MARKUP });
   }
-  if (data === 'tb:back') {
+  await answerCallback(env, callback.id,
+    settled ? `${settled.name} cleared · ${formatMoney(settled.balance)}`
+      : 'That balance is already clear.', !settled);
+}
+
+async function confirmSettle(env, callback, match) {
+  const chatId = callback.message.chat.id;
+  const confirmation = await confirmSettleMarkup(env, chatId, match[1]);
+  if (!confirmation) {
     await updateTab(env, chatId);
-    await answerCallback(env, callback.id);
-    return true;
+    await answerCallback(env, callback.id, 'That balance is already clear.', true);
+    return;
   }
-  if (data === 'tb:pay') {
-    await editReplyMarkup(env, chatId, messageId, await settleMarkup(env, chatId));
-    await answerCallback(env, callback.id, 'Choose whose debt to clear');
-    return true;
-  }
-  const paid = data.match(/^tb:paid:(.+)$/);
-  if (paid) {
-    const settled = await settleUser(env, chatId, paid[1], callback.from);
-    // The ledger went quiet for the one person it is about: close the loop
-    // with a private receipt, if they have an id to send it to.
-    if (settled && settled.user_id) {
-      await sendMessage(env, chatId,
-        `✅ <b>Payment received</b> — your ${formatMoney(settled.balance)} ` +
-        'squash tab is settled. Thank you!',
-        { receiverUserId: settled.user_id, replyMarkup: OK_MARKUP });
-    }
-    await answerCallback(env, callback.id,
-      settled ? `${settled.name} cleared · ${formatMoney(settled.balance)}`
-        : 'That balance is already clear.', !settled);
-    return true;
-  }
-  const pick = data.match(/^tb:pay:(.+)$/);
-  if (pick) {
-    const confirmation = await confirmSettleMarkup(env, chatId, pick[1]);
-    if (!confirmation) {
-      await updateTab(env, chatId);
-      await answerCallback(env, callback.id, 'That balance is already clear.', true);
-      return true;
-    }
-    await editReplyMarkup(env, chatId, messageId, confirmation.markup);
-    await answerCallback(env, callback.id);
-    return true;
-  }
-  return false;
+  await editReplyMarkup(env, chatId, callback.message.message_id, confirmation.markup);
+  await answerCallback(env, callback.id);
 }
 
 // Clearing the message needs the Delete Messages admin right. Failing quietly
@@ -632,11 +659,28 @@ export async function handleUpdate(env, update) {
       return;
     }
 
-    const match = text.match(/^\/(\w+)(?:@\w+)?(?:\s+([\s\S]*))?$/);
+    const match = text.match(/^\/(\w+)(@\w+)?(?:\s+([\s\S]*))?$/);
     if (!match) return;
     const command = match[1].toLowerCase();
-    const args = (match[2] || '').trim();
+    const mention = match[2] || null;
+    const args = (match[3] || '').trim();
     const knownCommands = new Set(['start', 'help', 'book', 'courts', 'cancel', 'tab']);
+    // A command the bot does not know used to get silence, which reads exactly
+    // like a broken bot. A command addressed @another_bot stays ignored: this
+    // bot does not know its own username to compare against, and answering
+    // someone else's command would be noise.
+    if (!knownCommands.has(command)) {
+      if (mention) return;
+      await sendMessage(env, msg.chat.id,
+        `I don't know <code>/${escapeHtml(command)}</code>. ` +
+        'Try /book, /courts, /tab, /cancel, or /help.',
+        {
+          receiverUserId: msg.from.id,
+          replyToEphemeral: msg.ephemeral_message_id || null,
+          replyMarkup: OK_MARKUP,
+        });
+      return;
+    }
     // Only a public copy can be cleared. A command Telegram delivered
     // ephemerally is already private to whoever sent it, and the bot cannot
     // remove it: deleteEphemeralMessage takes the id of a user who *received* a
@@ -685,12 +729,26 @@ export async function handleUpdate(env, update) {
       const [pinned] = await Promise.all([
         updateTab(env, msg.chat.id), clearCommand,
       ]);
+      if (pinned) {
+        await sendMessage(env, msg.chat.id,
+          '💰 Tab refreshed — it is the pinned message.', {
+            receiverUserId: msg.from.id,
+            replyToEphemeral: msg.ephemeral_message_id || null,
+            replyMarkup: OK_MARKUP,
+          });
+        return;
+      }
+      // With everyone settled there is no pinned tab and so no 🧾 button —
+      // which left no way at all to read your own history. The command is the
+      // only door left, so it opens the same private breakdown the button does.
+      const view = await myTabView(
+        env, msg.chat.id, msg.from, isChatAdmin(env, msg.chat.id, msg.from)
+      );
       await sendMessage(env, msg.chat.id,
-        pinned ? '💰 Tab refreshed — it is the pinned message.'
-          : '💰 Nothing outstanding. Shares appear on the tab after a court has been played.', {
+        `💰 Nothing outstanding on the group tab.\n\n${view.html}`, {
           receiverUserId: msg.from.id,
           replyToEphemeral: msg.ephemeral_message_id || null,
-          replyMarkup: OK_MARKUP,
+          replyMarkup: view.replyMarkup,
         });
       return;
     }

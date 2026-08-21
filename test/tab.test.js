@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  chargeBooking, myTabView, settleMarkup, settleUser, tabHtml, tabMarkup,
-  theirTabView, updateTab,
+  breakdownLines, chargeBooking, myTabView, settleMarkup,
+  settleUser, tabHtml, tabMarkup, theirTabView, updateTab,
 } from '../src/tab.js';
 
 const env = {
@@ -346,4 +346,32 @@ describe('money tab', () => {
     expect(html).toContain('In credit');
     expect(html).toContain('• @alice — $1.50');
   });
+
+  it('replays only the story since the balance last hit zero', () => {
+    // The ledger is append-only, so an unbounded breakdown would outgrow a
+    // Telegram message within a year. Settled history is counted, not shown.
+    const rows = [
+      { amount_cents: 200, reason: 'Court 4 · 1 Aug', created_at: 0 },
+      { amount_cents: -200, reason: 'Cleared by Nick', created_at: 0 },
+      { amount_cents: 300, reason: 'Court 4 · 15 Aug', created_at: 0 },
+    ];
+    const lines = breakdownLines(env, rows, 'Asia/Singapore').join('\n');
+    expect(lines).toContain('Owed to Nicholas: <b>$3.00</b>');
+    expect(lines).toContain('Earlier history — 2 settled entries not shown.');
+    expect(lines).toContain('Court 4 · 15 Aug');
+    expect(lines).not.toContain('Court 4 · 1 Aug —');
+    expect(lines).not.toContain('Cleared by Nick');
+  });
+
+  it('keeps a breakdown with nothing settled complete', () => {
+    const rows = [
+      { amount_cents: 200, reason: 'Court 4 · 1 Aug', created_at: 0 },
+      { amount_cents: 300, reason: 'Court 4 · 15 Aug', created_at: 0 },
+    ];
+    const lines = breakdownLines(env, rows, 'Asia/Singapore').join('\n');
+    expect(lines).toContain('Court 4 · 1 Aug');
+    expect(lines).toContain('Court 4 · 15 Aug');
+    expect(lines).not.toContain('Earlier history');
+  });
+
 });
