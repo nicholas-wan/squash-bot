@@ -189,6 +189,15 @@ describe('booking intent', () => {
     expect(analyzeBooking('he beat me 11-9, 11-7 last night', NOW, TZ)).toBeNull();
     expect(analyzeBooking('c4 tomorrow 9pm', NOW, TZ)).not.toBeNull();
   });
+
+  it('takes a bare c only when it is attached to its number', () => {
+    // Booking by message deletes the original, so a false positive here
+    // destroys somebody's unrelated text.
+    expect(analyzeBooking('Room C 2 at 8pm', NOW, TZ)).toBeNull();
+    expect(analyzeBooking('meet at c 4 around 9pm?', NOW, TZ)).toBeNull();
+    expect(analyzeBooking('tmr c4 2100', NOW, TZ)).not.toBeNull();
+    expect(analyzeBooking('ct 4 tomorrow 9pm', NOW, TZ)).not.toBeNull();
+  });
 });
 
 describe('pinned-board countdown', () => {

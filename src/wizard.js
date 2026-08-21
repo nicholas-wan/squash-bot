@@ -1,10 +1,11 @@
 import {
   addBooking, BookingConflictError, getTimezone, updateBooking,
 } from './bookings.js';
+import { courtName } from './format.js';
+import { openBooking } from './players.js';
 import {
   analyzeBooking, bookingFromDraft, BookingParseError, formatClock, parseField,
 } from './parser.js';
-import { dataChatId } from './scope.js';
 import { formatDate, formatTime, localParts, zonedEpoch } from './time.js';
 import {
   answerCallback, deleteEphemeralMessage, deleteMessage, editEphemeralMessage,
@@ -58,9 +59,11 @@ function defaultDateChoices(now, tz) {
   return Array.from({ length: 7 }, (_, index) => dateAdd(p.y, p.mo, p.d, index));
 }
 
-// Courts run 7am to 10pm, so 9pm is the last slot that can be offered.
+// Courts run 7am to 10pm, so 9pm is the last slot that can be offered. Noon
+// and 5pm are there because weekday daytime is the half-price window, and
+// reaching it should not cost a "Type another time" round trip.
 function defaultTimeChoices() {
-  return [7, 8, 18, 19, 20, 21].map((h) => ({
+  return [7, 8, 12, 17, 18, 19, 20, 21].map((h) => ({
     start: { h, mi: 0 }, end: null, label: formatClock({ h, mi: 0 }),
   }));
 }
@@ -105,8 +108,7 @@ function wizardView(id, payload, now, tz) {
   if (payload.conflicts && payload.conflicts.length) {
     lines.push('', '⚠️ <b>This overlaps an existing booking:</b>');
     for (const conflict of payload.conflicts) {
-      const court = conflict.court.startsWith('Court ')
-        ? conflict.court : `Court ${conflict.court}`;
+      const court = courtName(conflict);
       lines.push(
         `• ${escapeHtml(court)} · ${formatDate(conflict.starts_at, tz)} · ` +
         `${formatTime(conflict.starts_at, tz)}–${formatTime(conflict.ends_at, tz)}`
@@ -165,6 +167,13 @@ function wizardView(id, payload, now, tz) {
 async function startWizard(env, msg, text, payload, callbackQueryId, bookingId = null) {
   const now = Date.now();
   const tz = await getTimezone(env, msg.chat.id);
+  // A replaced draft used to leave its form behind: the row went, the message
+  // stayed, and every tap on it answered "expired" forever. The old form is
+  // read before the row is cleared so it can be taken down with it.
+  const stale = await env.DB.prepare(
+    `SELECT wizard_message_id, wizard_ephemeral FROM booking_drafts
+     WHERE chat_id = ? AND user_id = ?`
+  ).bind(msg.chat.id, msg.from.id).first();
   const clearDraft = env.DB.prepare(
     'DELETE FROM booking_drafts WHERE chat_id = ? AND user_id = ?'
   ).bind(msg.chat.id, msg.from.id);
@@ -187,6 +196,14 @@ async function startWizard(env, msg, text, payload, callbackQueryId, bookingId =
     inserted = await insertDraft.run();
   }
   const id = inserted.meta.last_row_id;
+  // Best-effort: a form Telegram cannot delete is the state before this fix.
+  if (stale && stale.wizard_message_id) {
+    if (stale.wizard_ephemeral) {
+      await deleteEphemeralMessage(env, msg.chat.id, msg.from.id, stale.wizard_message_id);
+    } else {
+      await deleteMessage(env, msg.chat.id, stale.wizard_message_id);
+    }
+  }
   const view = wizardView(id, payload, now, tz);
   const sent = await sendMessage(env, msg.chat.id, view.html, {
     replyMarkup: view.replyMarkup,
@@ -202,6 +219,18 @@ async function startWizard(env, msg, text, payload, callbackQueryId, bookingId =
   await env.DB.prepare(
     'UPDATE booking_drafts SET payload = ?, wizard_message_id = ?, wizard_ephemeral = ? WHERE id = ?'
   ).bind(JSON.stringify(view.payload), messageId, ephemeralId ? 1 : 0, id).run();
+  // Registered for the end-of-life sweep like every reminder and receipt: a
+  // finished form deletes itself, so the sweep only ever finds abandoned ones
+  // — which used to linger forever. Deleting an already-gone message is the
+  // same outcome, so the double booking is harmless.
+  await env.DB.prepare(
+    `INSERT INTO sent_messages
+      (chat_id, receiver_user_id, message_id, is_ephemeral, delete_after, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).bind(
+    msg.chat.id, ephemeralId ? msg.from.id : null, messageId,
+    ephemeralId ? 1 : 0, now + DRAFT_LIFETIME_MS, now
+  ).run();
   return true;
 }
 
@@ -251,9 +280,7 @@ export async function beginBooking(env, msg, text, {
 
 export async function beginEditBooking(env, callback, bookingId, field) {
   const chatId = callback.message.chat.id;
-  const booking = await env.DB.prepare(
-    'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
-  ).bind(bookingId, dataChatId(env, chatId), Date.now()).first();
+  const booking = await openBooking(env, chatId, bookingId);
   if (!booking) return false;
   const tz = await getTimezone(env, chatId);
   const start = localParts(booking.starts_at, tz);

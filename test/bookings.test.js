@@ -166,6 +166,86 @@ describe('public booking announcements', () => {
     });
   });
 
+  // The cancel and edit notices share this shape: roster on the court, a
+  // private send that stays private, and getChatMember for the admin gate.
+  function rosteredDb(booking, roster) {
+    return {
+      prepare(sql) {
+        return { bind() { return {
+          async first() {
+            if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+            if (sql.includes('board_message_id')) return { board_message_id: 55 };
+            if (sql.includes('SELECT * FROM bookings WHERE id')) return booking;
+            return null;
+          },
+          async all() {
+            if (sql.includes('FROM booking_players')) return { results: roster };
+            return { results: [] };
+          },
+          async run() { return { meta: { changes: 1 } }; },
+        }; } };
+      },
+      async batch(statements) {
+        return Promise.all(statements.map((statement) => statement.run()));
+      },
+    };
+  }
+
+  function capturePrivateTelegram() {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      const result = String(url).endsWith('/getChatMember')
+        ? { status: 'member' } : { ephemeral_message_id: 12 };
+      return new Response(JSON.stringify({ ok: true, result }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    return requests;
+  }
+
+  it('tells the rest of the court when a booking is cancelled', async () => {
+    const requests = capturePrivateTelegram();
+    const roster = [
+      { id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick' },
+      { id: 2, booking_id: 3, user_id: 9, slug: 'u9', name: 'Alice' },
+    ];
+    const result = await cancelBooking(
+      { BOT_TOKEN: 'test', DB: rosteredDb(bookedByNick, roster) },
+      -123, 3, { id: 7, first_name: 'Nick' }, '/cancel 3'
+    );
+    expect(result.status).toBe('cancelled');
+    const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
+    // Alice may already hold her 8am reminder; the actor has their own toast.
+    expect(sent.map((request) => request.body.receiver_user_id)).toEqual([9]);
+    expect(sent[0].body.text).toContain('Cancelled');
+    expect(sent[0].body.text).toContain('Court 4');
+    expect(sent[0].body.text).toContain('Nick');
+  });
+
+  it('tells the rest of the court when a booking moves', async () => {
+    const requests = capturePrivateTelegram();
+    const roster = [
+      { id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick' },
+      { id: 2, booking_id: 3, user_id: 9, slug: 'u9', name: 'Alice' },
+    ];
+    const saved = await updateBooking(
+      { BOT_TOKEN: 'test', DB: rosteredDb(bookedByNick, roster) },
+      -123, 3, {
+        court: '5',
+        startsAt: bookedByNick.starts_at + 3600000,
+        endsAt: bookedByNick.ends_at + 3600000,
+        reminderAt: bookedByNick.starts_at,
+      }, { id: 7, first_name: 'Nick' }, 'Edited with SquashBot'
+    );
+    expect(saved).toBe(true);
+    const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
+    expect(sent.map((request) => request.body.receiver_user_id)).toEqual([9]);
+    // Old details ride along so the change reads as a change.
+    expect(sent[0].body.text).toContain('Now: Court 5');
+    expect(sent[0].body.text).toContain('Was: Court 4');
+  });
+
   it('deletes a booking receipt Telegram could not keep private', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
@@ -930,6 +1010,28 @@ describe('public booking announcements', () => {
       DB: maintenanceDb({}),
     }, -123);
     expect(maxInFlight).toBe(2);
+  });
+
+  it('sends the monthly notice for every chat keeping its own books', async () => {
+    const requests = captureTelegram();
+    // Without DATA_CHAT_ID each chat is its own set of books; the old shape
+    // served only the first and silently skipped every other chat's debtors.
+    await runMaintenance({
+      BOT_TOKEN: 'test', ALLOWED_CHATS: '-123,-456',
+      DB: maintenanceDb({
+        boardDay: '2026-8-12',
+        nudgedMonth: '2026-7',
+        balances: [{ slug: 'u9', user_id: 9, name: '@alice', balance: 200 }],
+        ledgerRows: [{
+          slug: 'u9', user_id: 9, name: '@alice', amount_cents: 200,
+          booking_id: 5, reason: 'Court 4 · 15 Aug',
+          created_at: Date.UTC(2026, 7, 15, 14, 0),
+        }],
+      }),
+    }, cronNow);
+    const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
+    expect(sent.map((request) => request.body.chat_id)).toEqual([-123, -456]);
+    expect(sent.every((request) => request.body.receiver_user_id === 9)).toBe(true);
   });
 
   it('holds the monthly notice back before 9am local time', async () => {

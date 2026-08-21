@@ -5,13 +5,31 @@ const DEFAULT_TZ = 'Asia/Singapore';
 const SCHEMA_DEFAULT_TZ = 'Asia/Singapore';
 const PINNED_COLUMNS = new Set(['board_message_id', 'tab_message_id']);
 
+// The timezone is a D1 query on nearly every code path, often several times per
+// update, and the answer changes approximately never — nothing writes tz today.
+// Cached per database handle rather than globally, so tests and local adapters
+// with their own DB never read another's answer, and a redeployed isolate
+// starts clean.
+const TZ_CACHE_TTL_MS = 5 * 60 * 1000;
+const tzCache = new WeakMap();
+
 // The settings row is created by pinning a board, which never writes tz, so the
 // column falls to its NOT NULL default. Reading that default back as a per-chat
 // choice would silently retire DEFAULT_TIMEZONE the moment a chat pins anything,
 // so it counts as unset here and only a tz written on purpose outranks the env.
 export async function getTimezone(env, chatId) {
+  let perDb = tzCache.get(env.DB);
+  if (!perDb) tzCache.set(env.DB, (perDb = new Map()));
+  const cached = perDb.get(chatId);
+  const now = Date.now();
+  if (cached && cached.expiresAt > now) {
+    return cached.chosen || env.DEFAULT_TIMEZONE || DEFAULT_TZ;
+  }
   const row = await env.DB.prepare('SELECT tz FROM settings WHERE chat_id = ?').bind(chatId).first();
   const chosen = row && row.tz !== SCHEMA_DEFAULT_TZ ? row.tz : null;
+  // Only the database's answer is cached; the env fallback stays live so a
+  // redeployed DEFAULT_TIMEZONE is honoured without waiting out the TTL.
+  perDb.set(chatId, { chosen, expiresAt: now + TZ_CACHE_TTL_MS });
   return chosen || env.DEFAULT_TIMEZONE || DEFAULT_TZ;
 }
 

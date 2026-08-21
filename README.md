@@ -61,7 +61,9 @@ moment it starts, so nobody can play the hour and then drop off the roster to
 dodge their share. Taking a slot or giving one up tells the court privately: whoever
 tapped gets a confirmation, everyone else on the court gets word of it, both
 naming the roster as it stands after the tap — so a freed slot is news rather
-than something noticed later on the board. These and
+than something noticed later on the board. A cancelled or moved booking is
+announced to its roster the same private way — a reminder may already be in
+hand, and silence there is how no-shows happen. These and
 the removal notice go to the chat the tap came from, not the one each roster row
 was created in — an ephemeral message is only visible where it is posted, and
 under `DATA_CHAT_ID` a roster spans groups, so a notice sent by the row would
@@ -94,9 +96,13 @@ shares in one charge, the friend having nobody to bill but them.
 
 A second pinned message lists who owes the organiser. Group admins clear a
 balance from it, which appends a payment to the ledger rather than erasing
-anything. It unpins itself once everyone is settled. Its 🧾 **My tab** button
-sends anyone their own private breakdown — every charge and payment behind
-their total, matched by username or id so history under an old handle is
+anything. It unpins itself once everyone is settled — `/tab` then answers with
+your own private breakdown instead, so history stays readable between rounds.
+Its 🧾 **My tab** button
+sends anyone their own private breakdown — every charge and payment since
+they last settled, with earlier history counted rather than replayed, because
+an append-only ledger rendered whole would outgrow a Telegram message within
+a year. Rows are matched by username or id so history under an old handle is
 still owned and shown. Group admins additionally get a row per open balance
 under their own breakdown, each opening that person's tab, since collecting
 is their job; members can never see anyone else's. Clearing a balance sends
@@ -262,10 +268,10 @@ Found by review, none of them load-bearing enough to hold a release:
 - `getTimezone` reads a `tz` of `Asia/Singapore` as "never set" so
   `DEFAULT_TIMEZONE` stays reachable. Nothing writes `tz` today, but a future
   per-chat override set to Singapore would be ignored.
-- The intent gate accepts a standalone `c` before a number, so `Room C 2 at 8pm`
-  opens a booking form — and booking by message deletes the original.
-  `c4 tmr 8-9` is the opposite case and is still rejected, because a bare hour
-  range does not count as a clock time.
+- The intent gate takes a bare `c` only when it is attached to its number, so
+  `tmr c4 2100` books and `Room C 2 at 8pm` stays conversation — but `c 4 9pm`
+  now needs `/book` or the word `court`. `c4 tmr 8-9` is still rejected,
+  because a bare hour range does not count as a clock time.
 - A receipt or a removal notice that Telegram will not deliver privately is
   deleted rather than posted, so it can end up sent to nobody.
 - A board or tab in a chat the bot cannot post to is logged and skipped, never

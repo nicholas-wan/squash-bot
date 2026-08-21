@@ -50,6 +50,78 @@ describe('Telegram commands', () => {
     expect(removed.body.message_id).toBe(5);
   });
 
+  it('answers an unknown command instead of staying silent', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify({ ok: true, result: { ephemeral_message_id: 12 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    await handleUpdate({
+      BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: emptyDb(),
+    }, {
+      message: {
+        message_id: 5,
+        chat: { id: -123456789 },
+        from: { id: 7, first_name: 'Nick' },
+        text: '/froots',
+      },
+    });
+    const send = requests.find((request) => request.url.endsWith('/sendMessage'));
+    expect(send.body.text).toContain('/froots');
+    expect(send.body.text).toContain('/courts');
+    expect(send.body.receiver_user_id).toBe(7);
+  });
+
+  it('ignores an unknown command aimed at another bot', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify({ ok: true, result: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    await handleUpdate({
+      BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: emptyDb(),
+    }, {
+      message: {
+        message_id: 5,
+        chat: { id: -123456789 },
+        from: { id: 7, first_name: 'Nick' },
+        text: '/froots@some_other_bot',
+      },
+    });
+    expect(requests.some((request) => request.url.endsWith('/sendMessage'))).toBe(false);
+  });
+
+  it('answers /tab with a private breakdown when nothing is outstanding', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify({ ok: true, result: { ephemeral_message_id: 12 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    await handleUpdate({
+      BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789',
+      OWNER_USER_ID: '7', DB: emptyDb(),
+    }, {
+      message: {
+        message_id: 5,
+        chat: { id: -123456789 },
+        from: { id: 7, first_name: 'Nick' },
+        text: '/tab',
+      },
+    });
+    // An empty ledger pins no tab and so offers no 🧾 button; the command is
+    // the only door left to your own history.
+    const send = requests.find((request) => request.url.endsWith('/sendMessage'));
+    expect(send.body.text).toContain('Nothing outstanding on the group tab.');
+    expect(send.body.text).toContain('Your squash tab');
+    expect(send.body.receiver_user_id).toBe(7);
+  });
+
   it('clears a public command while its response is being prepared', async () => {
     let releaseDelete;
     const deleteGate = new Promise((resolve) => { releaseDelete = resolve; });
@@ -157,7 +229,9 @@ describe('Telegram commands', () => {
       }), { headers: { 'Content-Type': 'application/json' } });
     }));
     await handleUpdate({
-      BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: emptyDb(),
+      // The owner shortcut stands in for the admin gate Manage now sits behind.
+      BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789',
+      OWNER_USER_ID: '7', DB: emptyDb(),
     }, {
       callback_query: {
         id: 'callback-1', data: 'sb:manage',
@@ -1125,7 +1199,7 @@ describe('Telegram commands', () => {
           headers: { 'Content-Type': 'application/json' },
         });
       }));
-      await panelTap('sb:manage');
+      await panelTap('sb:manage', { OWNER_USER_ID: '7' });
       const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
       expect(answer.body.text).toContain('Something went wrong');
       expect(answer.body.show_alert).toBe(true);
@@ -1163,7 +1237,8 @@ describe('Telegram commands', () => {
         },
       };
       await handleUpdate({
-        BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db,
+        BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789',
+        OWNER_USER_ID: '7', DB: db,
       }, {
         callback_query: {
           id: 'callback-1', data: 'sb:pick:3',

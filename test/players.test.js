@@ -346,7 +346,8 @@ describe('the private court list', () => {
     const button = view.replyMarkup.inline_keyboard[0][0];
     expect(button.text).toContain('🚪 Leave');
     expect(button.callback_data).toBe('sb:leave:3');
-    expect(button.text).toContain('2 slots');
+    // Numeric courts compress to fit a phone-width button.
+    expect(button.text).toContain('C4');
   });
 
   it('offers Join to somebody who is not on it', async () => {
@@ -417,7 +418,7 @@ describe('the private court list', () => {
     );
     const button = view.replyMarkup.inline_keyboard[0][0];
     expect(button.callback_data).toBe('sb:join:3');
-    expect(button.text).toContain('1 slot');
+    expect(button.text).toContain('1 left');
   });
 
   it('marks a court full when a +1 took the last slot', async () => {

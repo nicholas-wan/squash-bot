@@ -1,7 +1,8 @@
 import {
   clearRoster, defaultCapacity, DEFAULT_CAPACITY, identity, isChatAdmin,
-  knownPlayers, MAX_CAPACITY, rosterFor, rostersFor, seedRoster,
+  knownPlayers, MAX_CAPACITY, openBooking, rosterFor, rostersFor, seedRoster,
 } from './players.js';
+import { courtName, shortCourtName } from './format.js';
 import { allowedChats, boardChats, dataChatId, reachableChat, sharingData } from './scope.js';
 import { getTimezone, updatePinnedMessage } from './settings.js';
 import { breakdownLines, chargeBooking, tabBalances, updateTab } from './tab.js';
@@ -74,7 +75,7 @@ async function confirmToBooker(env, chatId, bookingId, booking, capacity, from, 
   const tz = await getTimezone(env, chatId);
   const startsAt = booking.startsAt ?? booking.starts_at;
   const endsAt = booking.endsAt ?? booking.ends_at;
-  const court = booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`;
+  const court = courtName(booking);
   const roster = await rosterFor(env, bookingId);
   // If OK is never tapped it still clears itself at the end of the day, and a
   // receipt Telegram could not keep private is removed rather than left up.
@@ -162,6 +163,20 @@ export async function updateBooking(
     'UPDATE booking_players SET reminder_sent = ?, pre_reminder_sent = ? WHERE booking_id = ?'
   ).bind(parsed.reminderAt <= now ? 1 : 0, preReminderAt <= now ? 1 : 0, id).run();
   await recordAudit(env, id, chatId, 'edited', from, sourceText, before, parsed);
+  // A moved court is news to everyone on it: the re-armed reminders would say
+  // so eventually, but not before somebody plans their evening around the old
+  // time. Old details ride along so the change reads as a change.
+  const roster = await rosterFor(env, id);
+  if (roster.length) {
+    const tz = await getTimezone(env, chatId);
+    await notifyRosterDirectly(env, chatId, roster,
+      `✏️ <b>Booking changed</b> by <b>${escapeHtml(actorName(from) || 'an admin')}</b>\n` +
+      `Now: ${escapeHtml(courtName(parsed))} · ${formatDate(parsed.startsAt, tz)} · ` +
+      `${compactTimeRange(parsed.startsAt, parsed.endsAt, tz)}\n` +
+      `Was: ${escapeHtml(courtName(before))} · ${formatDate(before.starts_at, tz)} · ` +
+      `${compactTimeRange(before.starts_at, before.ends_at, tz)}`,
+      endOfLocalDay(parsed.startsAt, tz), from && from.id);
+  }
   await updateBoard(env, chatId);
   return true;
 }
@@ -206,6 +221,9 @@ export async function cancelBooking(env, chatId, id, from = null, sourceText = n
       booking: null,
     };
   }
+  // Read before the delete: clearRoster is about to take the only record of
+  // who needs to hear that this court is gone.
+  const roster = await rosterFor(env, id);
   const result = await env.DB.prepare('DELETE FROM bookings WHERE id = ? AND chat_id = ?')
     .bind(id, dataChatId(env, chatId)).run();
   if (!result.meta.changes) {
@@ -214,6 +232,19 @@ export async function cancelBooking(env, chatId, id, from = null, sourceText = n
   // A cancelled booking is never played, so it never reaches the tab.
   await clearRoster(env, id);
   await recordAudit(env, id, chatId, 'deleted', from, sourceText, booking, null);
+  // The roster hears before the board is touched, for the same reason a join
+  // notice does: a board Telegram refuses to edit must not swallow the one
+  // message that stops somebody showing up to a cancelled court. Their 8am
+  // reminder may already be in hand; silence here is how no-shows happen.
+  if (roster.length) {
+    const tz = await getTimezone(env, chatId);
+    await notifyRosterDirectly(env, chatId, roster,
+      `🗑 <b>Cancelled</b> — ${escapeHtml(courtName(booking))}\n` +
+      `${formatDate(booking.starts_at, tz)} · ` +
+      `${compactTimeRange(booking.starts_at, booking.ends_at, tz)}` +
+      (from ? `\nCancelled by <b>${escapeHtml(actorName(from))}</b>.` : ''),
+      endOfLocalDay(booking.starts_at, tz), from && from.id);
+  }
   await updateBoard(env, chatId);
   return { allowed: true, status: 'cancelled', message: '', booking };
 }
@@ -258,10 +289,6 @@ async function activeBookings(env, chatId, now = Date.now()) {
 // cannot reach, so it has to be the longer of the two. If it were the same
 // length it would drop exactly the courts the board sends people here for.
 const MAX_JOIN_BUTTONS = 12;
-
-function courtName(booking) {
-  return booking.court.startsWith('Court ') ? booking.court : `Court ${booking.court}`;
-}
 
 // The comma Intl puts after the weekday is dropped: these read alongside “·”
 // separators, and on a phone every character counts against wrapping.
@@ -339,18 +366,24 @@ export async function joinPickerView(env, chatId, from, isAdmin = false, now = D
   // Every court the board lists appears here too, full ones marked rather than
   // hidden: a court you can see pinned and then cannot find in this list reads
   // as a bug, and the board no longer keeps full courts back.
+  // The labels are as short as they can stay unambiguous: a phone truncates
+  // button text from the right, so the free-slot count — the reason to tap —
+  // has to survive the cut. Full rows drop it; the padlock already says full.
   for (const booking of bookings.slice(0, MAX_JOIN_BUTTONS)) {
     const roster = rosters.get(booking.id) || [];
     const capacity = booking.capacity || DEFAULT_CAPACITY;
-    const label = `${shortDate(booking.starts_at, tz)} · ` +
+    const label = `${shortDate(booking.starts_at, tz)} ` +
       `${compactTimeRange(booking.starts_at, booking.ends_at, tz)} · ` +
-      `${courtName(booking)} · ${slotsLabel(roster, capacity)}`;
+      `${shortCourtName(booking)}`;
+    const free = Math.max(0, capacity - rosterHeads(roster));
     if (roster.some((player) => player.slug === mySlug)) {
-      rows.push([{ text: `🚪 Leave · ${label}`, callback_data: `sb:leave:${booking.id}` }]);
-    } else if (rosterHeads(roster) < capacity) {
-      rows.push([{ text: `🙋 Join · ${label}`, callback_data: `sb:join:${booking.id}` }]);
+      rows.push([{ text: `🚪 Leave ${label}`, callback_data: `sb:leave:${booking.id}` }]);
+    } else if (free) {
+      rows.push([{
+        text: `🙋 Join ${label} · ${free} left`, callback_data: `sb:join:${booking.id}`,
+      }]);
     } else {
-      rows.push([{ text: `🔒 Full · ${label}`, callback_data: `sb:full:${booking.id}` }]);
+      rows.push([{ text: `🔒 Full ${label}`, callback_data: `sb:full:${booking.id}` }]);
     }
   }
   // The board carries a single Join button, so this panel is the only way in.
@@ -484,9 +517,7 @@ export async function managerView(env, chatId, now = Date.now()) {
 }
 
 export async function bookingPanelView(env, chatId, bookingId) {
-  const booking = await env.DB.prepare(
-    'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
-  ).bind(bookingId, dataChatId(env, chatId), Date.now()).first();
+  const booking = await openBooking(env, chatId, bookingId);
   if (!booking) return null;
   const tz = await getTimezone(env, chatId);
   const capacity = booking.capacity || DEFAULT_CAPACITY;
@@ -539,9 +570,7 @@ export async function bookingPanelView(env, chatId, bookingId) {
 // next person tapped with a friend, and needs two free slots rather than one,
 // so the whole panel is unavailable when only one is left.
 export async function addPlayerView(env, chatId, bookingId, heads = 1) {
-  const booking = await env.DB.prepare(
-    'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
-  ).bind(bookingId, dataChatId(env, chatId), Date.now()).first();
+  const booking = await openBooking(env, chatId, bookingId);
   if (!booking) return null;
   const roster = await rosterFor(env, bookingId);
   const capacity = booking.capacity || DEFAULT_CAPACITY;
@@ -591,9 +620,7 @@ export async function addPlayerView(env, chatId, bookingId, heads = 1) {
 // way tapping them flips. Keyed on the roster row id like the kick picker —
 // a row id cannot go stale into somebody else the way a re-typed handle can.
 export async function plusOneView(env, chatId, bookingId) {
-  const booking = await env.DB.prepare(
-    'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
-  ).bind(bookingId, dataChatId(env, chatId), Date.now()).first();
+  const booking = await openBooking(env, chatId, bookingId);
   if (!booking) return null;
   const roster = await rosterFor(env, bookingId);
   if (!roster.length) return null;
@@ -613,9 +640,7 @@ export async function plusOneView(env, chatId, bookingId) {
 }
 
 export async function removePlayerView(env, chatId, bookingId) {
-  const booking = await env.DB.prepare(
-    'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
-  ).bind(bookingId, dataChatId(env, chatId), Date.now()).first();
+  const booking = await openBooking(env, chatId, bookingId);
   if (!booking) return null;
   const roster = await rosterFor(env, bookingId);
   if (!roster.length) return null;
@@ -629,6 +654,24 @@ export async function removePlayerView(env, chatId, bookingId) {
     html: `🚪 <b>Take somebody off ${escapeHtml(bookingLabel(booking, tz))}</b>`,
     replyMarkup: { inline_keyboard: rows },
   };
+}
+
+// One private note to everyone reachable on a roster, minus whoever acted —
+// they already have their toast. Used for the changes that have no join-shaped
+// wording: a cancelled court and a moved one. Dedup is by id, like
+// notifyRosterOfChange, and the cleanup rows land in one batch.
+async function notifyRosterDirectly(env, chatId, roster, html, deleteAfter, excludeUserId = null) {
+  const told = new Set();
+  const cleanups = [];
+  await Promise.all(roster.map((player) => {
+    if (!player.user_id || player.user_id === excludeUserId || told.has(player.user_id)) {
+      return null;
+    }
+    told.add(player.user_id);
+    return sendPrivately(env, chatId, html, player.user_id, deleteAfter,
+      { replyMarkup: OK_MARKUP, cleanups });
+  }));
+  if (cleanups.length) await env.DB.batch(cleanups);
 }
 
 // The person taken off is told privately. Deliberately narrower than the
@@ -750,9 +793,7 @@ export async function notifyRosterOfChange(
 }
 
 export async function deletePanelView(env, chatId, bookingId) {
-  const booking = await env.DB.prepare(
-    'SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?'
-  ).bind(bookingId, dataChatId(env, chatId), Date.now()).first();
+  const booking = await openBooking(env, chatId, bookingId);
   if (!booking) return null;
   const tz = await getTimezone(env, chatId);
   return {
@@ -1062,7 +1103,22 @@ async function refreshStaleBoards(env, now) {
 async function sendMonthlyTabNotices(env, now) {
   const chats = allowedChats(env);
   if (!chats.length) return;
-  const chatId = dataChatId(env, chats[0]);
+  // One pass per set of books: the single shared ledger under DATA_CHAT_ID, or
+  // each chat's own when nothing is shared. The old shape served only
+  // chats[0], which silently skipped every other unshared chat's debtors.
+  const dataChats = [...new Set(chats.map((chat) => dataChatId(env, chat)))];
+  for (const chatId of dataChats) {
+    try {
+      await sendMonthlyTabNoticesFor(
+        env, now, chatId, chats.includes(chatId) ? chatId : chats[0]
+      );
+    } catch (error) {
+      console.log(`Monthly tab notices for chat ${chatId} failed: ${error.stack || error}`);
+    }
+  }
+}
+
+async function sendMonthlyTabNoticesFor(env, now, chatId, fallbackChat) {
   const tz = await getTimezone(env, chatId);
   const parts = localParts(now, tz);
   if (parts.h < 9) return;
@@ -1094,11 +1150,11 @@ async function sendMonthlyTabNotices(env, now) {
     ];
     // An ephemeral message is only visible in the chat it is posted to, and
     // the data chat id may be no chat at all: aim for the chat this player
-    // was last seated from, falling back to the first the bot serves.
+    // was last seated from, falling back to one the bot serves.
     const seat = await env.DB.prepare(
       'SELECT chat_id FROM booking_players WHERE user_id = ? ORDER BY id DESC LIMIT 1'
     ).bind(entry.user_id).first();
-    const target = reachableChat(env, { chat_id: seat && seat.chat_id }, chats[0]);
+    const target = reachableChat(env, { chat_id: seat && seat.chat_id }, fallbackChat);
     await sendPrivately(env, target, lines.join('\n'),
       entry.user_id, deleteAfter, { replyMarkup: OK_MARKUP });
   }
