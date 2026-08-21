@@ -197,7 +197,8 @@ npx wrangler d1 create squashbot-eu --location weur
 The location hint matters: Telegram delivers webhooks from Amsterdam, so the
 Worker executes there, and a database in another region charges every query a
 cross-region round trip — measured at ~200ms each while this one lived in APAC.
-The retired APAC database (`squashbot`) survives as the pre-migration backup.
+The retired APAC database is gone; `backup-20260817.sql` is the pre-migration
+snapshot.
 
 ```powershell
 npm run db:init
