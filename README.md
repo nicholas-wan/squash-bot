@@ -142,7 +142,15 @@ Each player is reminded two hours before their court and again at 10am on the
 day. Reminders and receipts clear themselves at the end of the day they are
 about. Telegram does not guarantee ephemeral delivery when the recipient is
 offline; if it refuses, the private copy is deleted and the whole roster is
-reminded once in the group rather than one public post per player.
+reminded once in the group rather than one public post per player. Refusal is
+the detectable case only: Telegram can also accept an ephemeral send — id
+returned, success reported — and still drop it for an offline recipient,
+which is documented Bot API behaviour and was confirmed live. A tap's
+`callback_query_id` grants reliable delivery, which is why every panel and
+receipt arrives; a cron reminder has no tap to ride on, so it only reliably
+reaches players who are online when it fires. The fix would be reminders as
+ordinary DMs — stored and pushed, needing each player to Start the bot once —
+considered and declined to keep the bot group-only.
 
 ## Commands
 
