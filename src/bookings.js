@@ -234,7 +234,7 @@ export async function cancelBooking(env, chatId, id, from = null, sourceText = n
   await recordAudit(env, id, chatId, 'deleted', from, sourceText, booking, null);
   // The roster hears before the board is touched, for the same reason a join
   // notice does: a board Telegram refuses to edit must not swallow the one
-  // message that stops somebody showing up to a cancelled court. Their 8am
+  // message that stops somebody showing up to a cancelled court. Their morning
   // reminder may already be in hand; silence here is how no-shows happen.
   if (roster.length) {
     const tz = await getTimezone(env, chatId);

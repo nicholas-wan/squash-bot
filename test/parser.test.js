@@ -14,7 +14,8 @@ describe('parseBooking', () => {
     expect(booking.court).toBe('4');
     expect(local(booking.startsAt)).toMatchObject({ y: 2026, mo: 8, d: 13, h: 21, mi: 0 });
     expect(booking.endsAt - booking.startsAt).toBe(60 * 60 * 1000);
-    expect(local(booking.reminderAt)).toMatchObject({ d: 13, h: 8, mi: 0 });
+    // The morning-of reminder lands at 10am local.
+    expect(local(booking.reminderAt)).toMatchObject({ d: 13, h: 10, mi: 0 });
   });
 
   it('supports an explicit end time', () => {

@@ -359,8 +359,11 @@ export function bookingFromDraft(draft, nowMs = Date.now(), tz = 'Asia/Singapore
     endsAt = zonedEpoch(y, mo, d, CLOSE_HOUR, 0, tz);
   }
   const midnight = zonedEpoch(y, mo, d, 0, 0, tz);
-  const eightAm = zonedEpoch(y, mo, d, 8, 0, tz);
-  const reminderAt = Math.max(midnight, Math.min(eightAm, startsAt - 60 * 60 * 1000));
+  // The morning-of reminder. Mid-morning rather than 8am, so it lands when
+  // people are awake and looking at their phone; a court earlier than 11am
+  // is reminded an hour before it instead, and never before its own midnight.
+  const tenAm = zonedEpoch(y, mo, d, 10, 0, tz);
+  const reminderAt = Math.max(midnight, Math.min(tenAm, startsAt - 60 * 60 * 1000));
   return { court: String(draft.court), startsAt, endsAt, reminderAt };
 }
 
