@@ -901,15 +901,40 @@ describe('public booking announcements', () => {
     expect(edits).toHaveLength(1);
     expect(edits[0].body.message_id).toBe(55);
     expect(edits[0].body.text).toContain('Court 4');
-    // The stamp is written before the redraw, so a board Telegram refuses to
-    // edit is retried tomorrow rather than every minute.
-    expect(stale.seen.find((query) => query.sql.includes('SET board_day')).args)
-      .toEqual(['2026-8-12', -123]);
+    // The hour is claimed before the redraw so a throw cannot retry every
+    // minute; success trades it for the day's stamp, which ends the retrying.
+    // cronNow is 20:00 Singapore time.
+    expect(stale.seen
+      .filter((query) => query.sql.includes('SET board_day'))
+      .map((query) => query.args))
+      .toEqual([['2026-8-12~20', -123], ['2026-8-12', -123]]);
 
     requests.length = 0;
     await runMaintenance({
       BOT_TOKEN: 'test', ALLOWED_CHATS: '-123',
       DB: maintenanceDb({ boardDay: '2026-8-12' }),
+    }, cronNow);
+    expect(requests.filter((request) => request.url.endsWith('/editMessageText')))
+      .toHaveLength(0);
+  });
+
+  it('retries a failed redraw the next hour, not the next midnight', async () => {
+    // A redraw that died after claiming its hour — a deploy evicting the
+    // isolate at the midnight tick — used to leave the countdown wrong until
+    // the next midnight.
+    const requests = captureTelegram();
+    await runMaintenance({
+      BOT_TOKEN: 'test', ALLOWED_CHATS: '-123',
+      DB: maintenanceDb({ boardDay: '2026-8-12~19' }),
+    }, cronNow);
+    expect(requests.filter((request) => request.url.endsWith('/editMessageText')))
+      .toHaveLength(1);
+
+    // Within the failed hour it stays quiet rather than retrying per minute.
+    requests.length = 0;
+    await runMaintenance({
+      BOT_TOKEN: 'test', ALLOWED_CHATS: '-123',
+      DB: maintenanceDb({ boardDay: '2026-8-12~20' }),
     }, cronNow);
     expect(requests.filter((request) => request.url.endsWith('/editMessageText')))
       .toHaveLength(0);

@@ -1072,22 +1072,30 @@ async function removeExpiredBookings(env, now) {
 }
 
 // "in 5 days" is only true on the day it was written. Nothing else touches a
-// board that nobody books or joins, so each one is redrawn once per local day,
-// stamped first so a board Telegram refuses to edit is retried tomorrow rather
-// than every minute.
+// board that nobody books or joins, so each one is redrawn once per local day.
+// The stamp is written before the redraw so a throw cannot turn into an
+// every-minute retry — but only the current hour is claimed, not the whole
+// day: a redraw that dies at the midnight tick (a deploy evicting the
+// isolate, a Telegram hiccup) used to leave the countdown wrong until the
+// next midnight, and one transient failure is not worth a day of lying.
+// Success trades the hour stamp for the day's, which ends the retrying.
 async function refreshStaleBoards(env, now) {
   for (const chatId of allowedChats(env)) {
     try {
       const tz = await getTimezone(env, chatId);
       const parts = localParts(now, tz);
       const today = `${parts.y}-${parts.mo}-${parts.d}`;
+      const attempt = `${today}~${parts.h}`;
       const setting = await env.DB.prepare(
         'SELECT board_message_id, board_day FROM settings WHERE chat_id = ?'
       ).bind(chatId).first();
-      if (!setting || !setting.board_message_id || setting.board_day === today) continue;
+      if (!setting || !setting.board_message_id) continue;
+      if (setting.board_day === today || setting.board_day === attempt) continue;
+      await env.DB.prepare('UPDATE settings SET board_day = ? WHERE chat_id = ?')
+        .bind(attempt, chatId).run();
+      await updateBoard(env, chatId);
       await env.DB.prepare('UPDATE settings SET board_day = ? WHERE chat_id = ?')
         .bind(today, chatId).run();
-      await updateBoard(env, chatId);
     } catch (error) {
       // One chat's dead board is its own problem; the others still redraw.
       console.log(`Daily board redraw for chat ${chatId} failed: ${error.stack || error}`);
