@@ -216,7 +216,7 @@ describe('public booking announcements', () => {
     );
     expect(result.status).toBe('cancelled');
     const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
-    // Alice may already hold her 8am reminder; the actor has their own toast.
+    // Alice may already hold her morning reminder; the actor has their own toast.
     expect(sent.map((request) => request.body.receiver_user_id)).toEqual([9]);
     expect(sent[0].body.text).toContain('Cancelled');
     expect(sent[0].body.text).toContain('Court 4');

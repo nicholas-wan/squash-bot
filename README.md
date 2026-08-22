@@ -138,7 +138,7 @@ quietly. Use `/book` for a booking that is never public at any point. The booker
 gets a private receipt with an **OK** button either way, so a new booking is
 discovered on the board rather than announced.
 
-Each player is reminded two hours before their court and again at 8am on the
+Each player is reminded two hours before their court and again at 10am on the
 day. Reminders and receipts clear themselves at the end of the day they are
 about. Telegram does not guarantee ephemeral delivery when the recipient is
 offline; if it refuses, the private copy is deleted and the whole roster is
