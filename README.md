@@ -74,6 +74,10 @@ having no tap to take their bearings from.
 Every booking seats `DEFAULT_PLAYERS` plus whoever booked it. Players are keyed
 on their Telegram username, so someone named in config is the same person who
 later taps a button; anyone without a username is keyed on their numeric id.
+A group admin can record somebody else as the booker from the confirm form —
+that person is seated and billed as the booker and may cancel the court, while
+the audit row still names the admin. Attribution is for the record: only the
+admin panel ever shows the name, never the board or the group.
 
 ## Money
 
