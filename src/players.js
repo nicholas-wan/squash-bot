@@ -171,12 +171,15 @@ async function addPlayer(env, chatId, bookingId, player, addedByUserId) {
 // and the one person who must never lose their seat is the one who made the
 // booking. chatId is the real chat the booking was made in, which is where those
 // players are reachable for reminders.
-export async function seedRoster(env, chatId, bookingId, from, capacity) {
+export async function seedRoster(env, chatId, bookingId, from, capacity, bookedFor = null) {
   const seats = [];
   const seat = (player) => {
     if (player && !seats.some((seated) => seated.slug === player.slug)) seats.push(player);
   };
-  if (from && from.id) seat(identity(from));
+  // Booked on behalf, the named booker takes the booker's seat — they may
+  // carry no numeric id yet, exactly like a config-seeded player.
+  const booker = bookedFor || (from && from.id ? identity(from) : null);
+  if (booker) seat(booker);
   seat(ownerIdentity(env));
   for (const player of defaultPlayers(env)) seat(player);
   for (const player of seats.slice(0, capacity)) {

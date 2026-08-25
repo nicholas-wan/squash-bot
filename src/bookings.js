@@ -90,7 +90,7 @@ async function confirmToBooker(env, chatId, bookingId, booking, capacity, from, 
 
 export async function addBooking(
   env, chatId, parsed, from, sourceText = null,
-  { allowConflict = false, callbackQueryId = null } = {}
+  { allowConflict = false, callbackQueryId = null, bookedFor = null } = {}
 ) {
   const now = Date.now();
   const preReminderAt = parsed.startsAt - 2 * 60 * 60 * 1000;
@@ -111,8 +111,12 @@ export async function addBooking(
      )`
   ).bind(
     dataChatId(env, chatId), parsed.court, parsed.startsAt, parsed.endsAt, parsed.reminderAt,
-    reminderSent, preReminderAt, preReminderSent, capacity, from && from.id || null,
-    actorName(from), sourceText, now, allowConflict ? 1 : 0,
+    reminderSent, preReminderAt, preReminderSent, capacity,
+    // An admin can record somebody else as the booker: that person owns the
+    // booking — seated first, billed the booker's share, allowed to cancel it
+    // — while the audit row still names the admin who typed it in.
+    bookedFor ? bookedFor.userId || null : from && from.id || null,
+    bookedFor ? bookedFor.name : actorName(from), sourceText, now, allowConflict ? 1 : 0,
     dataChatId(env, chatId), parsed.court, parsed.endsAt, parsed.startsAt
   ).run();
   if (!result.meta.changes) {
@@ -120,9 +124,14 @@ export async function addBooking(
   }
   const bookingId = result.meta.last_row_id;
   await recordAudit(env, bookingId, chatId, 'added', from, sourceText, null, parsed);
-  await seedRoster(env, chatId, bookingId, from, capacity);
+  await seedRoster(env, chatId, bookingId, from, capacity, bookedFor);
   await updateBoard(env, chatId);
-  await confirmToBooker(env, chatId, bookingId, parsed, capacity, from, callbackQueryId);
+  // Booked on behalf, the receipt is skipped: it would be an unprompted
+  // ephemeral to somebody who tapped nothing — the kind Telegram drops.
+  // The attribution is for the record, and the board carries the news.
+  if (!bookedFor) {
+    await confirmToBooker(env, chatId, bookingId, parsed, capacity, from, callbackQueryId);
+  }
   return bookingId;
 }
 
@@ -554,10 +563,14 @@ export async function bookingPanelView(env, chatId, bookingId) {
   // The board cannot name the roster without repeating the same handles on
   // every row, but this panel is private and about one court, so it is the
   // place to answer who is playing.
+  // The booker is named here and nowhere else visible: attribution is for
+  // admins keeping the record straight, not for the board or the group.
   return {
     html: `⚙️ <b>${escapeHtml(bookingLabel(booking, tz))}</b>\n`
-      + `👥 ${playerTags(roster)} · ${slotsLabel(roster, capacity)}\n\n`
-      + 'Only you can see this.',
+      + `👥 ${playerTags(roster)} · ${slotsLabel(roster, capacity)}\n`
+      + (booking.created_by_name
+        ? `📝 Booked by ${escapeHtml(booking.created_by_name)}\n` : '')
+      + '\nOnly you can see this.',
     replyMarkup: { inline_keyboard: rows },
   };
 }

@@ -73,7 +73,12 @@ function draftDb(state) {
             // bound value the guard reads.
             if (state.conflict && args[13] !== 1) return { meta: { changes: 0 } };
             state.inserted = true;
+            state.insertArgs = args;
             return { meta: { changes: 1, last_row_id: 9 } };
+          }
+          if (sql.startsWith('INSERT OR IGNORE INTO booking_players')) {
+            (state.seated = state.seated || []).push(args[3]);
+            return { meta: { changes: 1 } };
           }
           return { meta: { changes: 1 } };
         },
@@ -119,6 +124,49 @@ describe('booking wizard save', () => {
     // The claim is the whole defence: nothing may reach the bookings table.
     expect(state.inserted).toBe(false);
     expect(state.deleted).toBe(false);
+  });
+
+  it('lets an admin record somebody else as the booker', async () => {
+    const requests = captureTelegram();
+    const state = {
+      payload: completePayload(), pending: null,
+      conflict: false, inserted: false, deleted: false,
+    };
+    const env = {
+      BOT_TOKEN: 'test', OWNER_USER_ID: '7', DEFAULT_PLAYERS: '@alice',
+      DB: draftDb(state),
+    };
+
+    await handleBookingCallback(env, confirmTap('bw:1:x:b'));
+    expect(state.payload.choosingBooker).toBe(true);
+    const index = state.payload.bookerChoices
+      .findIndex((choice) => choice.slug === '@alice');
+    expect(index).toBeGreaterThanOrEqual(0);
+
+    await handleBookingCallback(env, confirmTap(`bw:1:b:${index}`));
+    expect(state.payload.booker).toMatchObject({ slug: '@alice' });
+
+    await handleBookingCallback(env, confirmTap('bw:1:y'));
+    // The named booker owns the record and takes the booker's seat, id or not.
+    expect(state.insertArgs[9]).toBe(null);
+    expect(state.insertArgs[10]).toBe('@alice');
+    expect(state.seated[0]).toBe('@alice');
+    // Record-keeping, not a notification: no receipt goes anywhere.
+    expect(requests.some((request) => request.url.endsWith('/sendMessage'))).toBe(false);
+  });
+
+  it('refuses the booker picker to a non-admin', async () => {
+    const requests = captureTelegram();
+    const state = {
+      payload: completePayload(), pending: null,
+      conflict: false, inserted: false, deleted: false,
+    };
+    await handleBookingCallback(
+      { BOT_TOKEN: 'test', DB: draftDb(state) }, confirmTap('bw:1:x:b')
+    );
+    const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+    expect(answer.body.text).toBe('Only group admins can book for someone else.');
+    expect(state.payload.choosingBooker).not.toBe(true);
   });
 
   it('surfaces a conflict for review, then saves on Add anyway', async () => {

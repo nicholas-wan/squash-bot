@@ -246,6 +246,14 @@ describe('public booking announcements', () => {
     expect(sent[0].body.text).toContain('Was: Court 4');
   });
 
+  it('names the booker on the admin panel only', async () => {
+    captureTelegram();
+    const view = await bookingPanelView(
+      { BOT_TOKEN: 'test', DB: rosteredDb(bookedByNick, []) }, -123, 3
+    );
+    expect(view.html).toContain('Booked by @nick');
+  });
+
   it('deletes a booking receipt Telegram could not keep private', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {

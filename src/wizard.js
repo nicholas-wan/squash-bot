@@ -2,7 +2,7 @@ import {
   addBooking, BookingConflictError, getTimezone, updateBooking,
 } from './bookings.js';
 import { courtName } from './format.js';
-import { openBooking } from './players.js';
+import { isChatAdmin, knownPlayers, openBooking } from './players.js';
 import {
   analyzeBooking, bookingFromDraft, BookingParseError, formatClock, parseField,
 } from './parser.js';
@@ -92,6 +92,23 @@ function chunk(items, size) {
 
 function wizardView(id, payload, now, tz) {
   const field = prepareChoices(payload, now, tz);
+  // Booked on behalf: a record-keeping picker, reachable only through the
+  // admin-gated button below. Whoever is chosen is seated and billed as the
+  // booker; the court is still paid to the organiser.
+  if (payload.choosingBooker) {
+    const rows = [[{ text: '🙋 Me', callback_data: `bw:${id}:b:me` }]];
+    (payload.bookerChoices || []).forEach((player, index) => {
+      rows.push([{ text: `👤 ${player.name}`, callback_data: `bw:${id}:b:${index}` }]);
+    });
+    rows.push([{ text: '✕ Cancel booking', callback_data: `bw:${id}:n` }]);
+    return {
+      html: '👤 <b>Who booked this court?</b>\n\n'
+        + 'For the record: they are seated and billed as the booker, and only '
+        + 'admins ever see the name. The court is still paid to the organiser.',
+      replyMarkup: { inline_keyboard: rows },
+      payload,
+    };
+  }
   const lines = [
     payload.operation === 'edit'
       ? '✏️ <b>Review booking changes</b>'
@@ -101,6 +118,9 @@ function wizardView(id, payload, now, tz) {
     `Court: ${payload.court ? `<b>Court ${escapeHtml(payload.court)}</b>` : '❓ Need your input'}`,
     `Time: ${payload.start ? `<b>${escapeHtml(timeLabel(payload))}</b>` : '❓ Need your input'}`,
   ];
+  if (payload.booker) {
+    lines.push(`Booked by: <b>${escapeHtml(payload.booker.name)}</b>`);
+  }
   if (payload.sourceText) lines.push('', `From: <code>${escapeHtml(payload.sourceText.slice(0, 180))}</code>`);
   if (payload.issues && payload.issues.length) {
     lines.push('', `⚠️ ${payload.issues.map(escapeHtml).join(' ')}`);
@@ -159,6 +179,16 @@ function wizardView(id, payload, now, tz) {
       ],
       [{ text: '🕐 Change time', callback_data: `bw:${id}:x:t` }],
     ];
+    // Attribution, not announcement: the name reaches the record and the
+    // admin panel, never the board. Same Admin: label as every gated button.
+    if (!editing) {
+      keyboard.push([{
+        text: payload.booker
+          ? `👤 Admin: booked by ${payload.booker.name} — change`
+          : '👤 Admin: booked for someone else',
+        callback_data: `bw:${id}:x:b`,
+      }]);
+    }
   }
   keyboard.push([{ text: '✕ Cancel', callback_data: `bw:${id}:n` }]);
   return { html: lines.join('\n'), replyMarkup: { inline_keyboard: keyboard }, payload };
@@ -336,7 +366,8 @@ async function requestTypedField(env, row, field, callbackId) {
 }
 
 export async function handleBookingCallback(env, callback) {
-  const match = String(callback.data || '').match(/^bw:(\d+):([dctuynxo])(?::([dct]|\d+))?$/);
+  const match = String(callback.data || '')
+    .match(/^bw:(\d+):([dctuynxob])(?::([dctb]|me|\d+))?$/);
   if (!match || !callback.message) return false;
   const id = Number(match[1]);
   const action = match[2];
@@ -372,6 +403,50 @@ export async function handleBookingCallback(env, callback) {
   if (action === 'u') {
     const field = { d: 'date', c: 'court', t: 'time' }[value];
     await requestTypedField(env, row, field, callback.id);
+    return true;
+  }
+  if (action === 'x' && value === 'b') {
+    // Attribution changes who is seated and billed, so it carries the same
+    // gate as seating somebody from the manage panel.
+    if (!(await isChatAdmin(env, chatId, callback.from))) {
+      await answerCallback(env, callback.id, 'Only group admins can book for someone else.', true);
+      return true;
+    }
+    payload.choosingBooker = true;
+    payload.bookerChoices = (await knownPlayers(env, chatId))
+      .sort((a, b) => a.name.localeCompare(b.name)).slice(0, 12)
+      .map((player) => ({ slug: player.slug, name: player.name }));
+    await saveAndRender(env, row, payload);
+    await answerCallback(env, callback.id);
+    return true;
+  }
+  if (action === 'b') {
+    if (!(await isChatAdmin(env, chatId, callback.from))) {
+      await answerCallback(env, callback.id, 'Only group admins can book for someone else.', true);
+      return true;
+    }
+    if (value === 'me') {
+      payload.booker = null;
+    } else {
+      const pick = (payload.bookerChoices || [])[Number(value)];
+      if (!pick) {
+        await answerCallback(env, callback.id, 'That option is no longer available.', true);
+        return true;
+      }
+      // Resolved fresh rather than trusted from the button, so a stale form
+      // cannot record somebody under an outdated name or id.
+      const player = (await knownPlayers(env, chatId))
+        .find((candidate) => candidate.slug === pick.slug);
+      if (!player) {
+        await answerCallback(env, callback.id, 'That player is no longer known.', true);
+        return true;
+      }
+      payload.booker = { userId: player.user_id || null, slug: player.slug, name: player.name };
+    }
+    payload.choosingBooker = false;
+    payload.bookerChoices = [];
+    await saveAndRender(env, row, payload);
+    await answerCallback(env, callback.id);
     return true;
   }
   if (action === 'x') {
@@ -440,7 +515,10 @@ export async function handleBookingCallback(env, callback) {
           env, chatId, booking, callback.from, payload.sourceText || null,
           // Telegram needs the tap to deliver a private message to someone it
           // has no other recent contact with.
-          { allowConflict: action === 'o', callbackQueryId: callback.id }
+          {
+            allowConflict: action === 'o', callbackQueryId: callback.id,
+            bookedFor: payload.booker || null,
+          }
         );
       }
     } catch (error) {
