@@ -1689,12 +1689,15 @@ describe('Telegram commands', () => {
   });
 
   describe('heartbeat', () => {
+    // The heartbeat read takes no parameters, so first() is called without
+    // bind() — the double supports both shapes, exactly as D1 does.
     function heartbeatDb(beatAt) {
       const ran = [];
       return {
         ran,
         prepare(sql) {
-          return { bind() { return {
+          const statement = {
+            bind() { return statement; },
             async first() {
               if (sql.includes('FROM heartbeat')) {
                 return beatAt == null ? null : { beat_at: beatAt };
@@ -1703,7 +1706,8 @@ describe('Telegram commands', () => {
             },
             async all() { return { results: [] }; },
             async run() { ran.push(sql); return { meta: { changes: 1 } }; },
-          }; } };
+          };
+          return statement;
         },
       };
     }
