@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
+    "predeploy": "vitest run",
     "deploy": "wrangler deploy",
     "db:init": "wrangler d1 execute squashbot-eu --remote --file=schema.sql",
     "db:migrate:002": "wrangler d1 execute squashbot-eu --remote --file=migrations/002-players-and-tab.sql",
