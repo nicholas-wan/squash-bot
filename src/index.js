@@ -808,6 +808,10 @@ export async function handleUpdate(env, update) {
 // where a plain ok and an HTTPS answer is the safer shape.
 const WEBHOOK_ANSWER_WAIT_MS = 2000;
 
+// How stale the maintenance heartbeat may read before the root URL answers
+// 500. Five minutes of missed every-minute ticks is an outage, not a blip.
+const HEARTBEAT_STALE_S = 5 * 60;
+
 function adminAuthorized(request, env) {
   if (!env.ADMIN_SECRET) return false;
   return request.headers.get('Authorization') === `Bearer ${env.ADMIN_SECRET}`
@@ -940,10 +944,37 @@ export default {
       });
     }
 
-    return new Response('squashbot is running');
+    // The root is a health check, not a greeting: the maintenance heartbeat
+    // is the one signal that proves the cron and the database both work, so
+    // a dumb uptime pinger watching this URL catches a dead bot in minutes.
+    // Fresh is generous — the cron fires every minute.
+    try {
+      const row = await env.DB.prepare('SELECT beat_at FROM heartbeat WHERE id = 1').first();
+      if (!row) {
+        return new Response('squashbot is running, but no maintenance tick is recorded yet',
+          { status: 500 });
+      }
+      const staleSeconds = Math.round((Date.now() - row.beat_at) / 1000);
+      if (staleSeconds > HEARTBEAT_STALE_S) {
+        return new Response(
+          `squashbot maintenance is stale — last tick ${staleSeconds}s ago`, { status: 500 }
+        );
+      }
+      return new Response(`squashbot is running — last maintenance tick ${staleSeconds}s ago`);
+    } catch (error) {
+      return new Response(`squashbot database check failed: ${error.message}`, { status: 500 });
+    }
   },
 
   async scheduled(_event, env, ctx) {
-    ctx.waitUntil(Promise.all([runMaintenance(env), pruneBookingDrafts(env)]));
+    ctx.waitUntil((async () => {
+      await Promise.all([runMaintenance(env), pruneBookingDrafts(env)]);
+      // Stamped only after a full pass, so staleness at the root measures the
+      // whole cron path — a sweep that hangs holds the beat back with it.
+      await env.DB.prepare(
+        `INSERT INTO heartbeat (id, beat_at) VALUES (1, ?)
+         ON CONFLICT(id) DO UPDATE SET beat_at = excluded.beat_at`
+      ).bind(Date.now()).run();
+    })());
   },
 };

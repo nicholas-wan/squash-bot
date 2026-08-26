@@ -90,6 +90,13 @@ CREATE TABLE IF NOT EXISTS sent_messages (
   created_at INTEGER NOT NULL
 );
 
+-- One row, stamped after each full maintenance pass. The root URL reports its
+-- staleness, so any dumb uptime pinger can tell a dead cron from a live bot.
+CREATE TABLE IF NOT EXISTS heartbeat (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  beat_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS booking_audit (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   booking_id INTEGER NOT NULL,

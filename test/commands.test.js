@@ -1687,4 +1687,54 @@ describe('Telegram commands', () => {
       expect(requests.some((request) => request.url.endsWith('/sendMessage'))).toBe(true);
     });
   });
+
+  describe('heartbeat', () => {
+    function heartbeatDb(beatAt) {
+      const ran = [];
+      return {
+        ran,
+        prepare(sql) {
+          return { bind() { return {
+            async first() {
+              if (sql.includes('FROM heartbeat')) {
+                return beatAt == null ? null : { beat_at: beatAt };
+              }
+              return null;
+            },
+            async all() { return { results: [] }; },
+            async run() { ran.push(sql); return { meta: { changes: 1 } }; },
+          }; } };
+        },
+      };
+    }
+
+    it('stamps the beat only after a full maintenance pass', async () => {
+      const db = heartbeatDb(null);
+      const tasks = [];
+      await worker.scheduled({}, { BOT_TOKEN: 'test', DB: db },
+        { waitUntil: (task) => tasks.push(task) });
+      await Promise.all(tasks);
+      expect(db.ran.some((sql) => sql.includes('INSERT INTO heartbeat'))).toBe(true);
+    });
+
+    it('answers 200 at the root while the beat is fresh', async () => {
+      const response = await worker.fetch(new Request('https://worker.example/'),
+        { BOT_TOKEN: 'test', DB: heartbeatDb(Date.now() - 30 * 1000) });
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain('squashbot is running');
+    });
+
+    it('answers 500 once the beat goes stale, so a dumb pinger alarms', async () => {
+      const response = await worker.fetch(new Request('https://worker.example/'),
+        { BOT_TOKEN: 'test', DB: heartbeatDb(Date.now() - 10 * 60 * 1000) });
+      expect(response.status).toBe(500);
+      expect(await response.text()).toContain('stale');
+    });
+
+    it('answers 500 while no beat has ever been recorded', async () => {
+      const response = await worker.fetch(new Request('https://worker.example/'),
+        { BOT_TOKEN: 'test', DB: heartbeatDb(null) });
+      expect(response.status).toBe(500);
+    });
+  });
 });

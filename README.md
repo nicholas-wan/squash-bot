@@ -240,6 +240,12 @@ response (Bot API, "Making requests when getting updates") instead of a
 separate round trip, and each tap logs its colo and duration — one line in
 `npx wrangler tail` — so "is it slow" is always answerable with a number.
 
+The root URL is a health check: 200 while the every-minute maintenance tick
+is fresh, 500 once it is five minutes stale or the database is unreachable —
+point any uptime pinger at it. `npm run deploy` refuses to ship a red test
+suite; every Telegram call is bounded at fifteen seconds so a stalled fetch
+fails loudly instead of dying silently with the isolate.
+
 ## Upgrading a live database
 
 `npm run db:init` runs `schema.sql`, which is entirely `IF NOT EXISTS`: safe on a
