@@ -4,6 +4,12 @@
 // every site shares this literal.
 export const OK_MARKUP = { inline_keyboard: [[{ text: '👍 OK', callback_data: 'sb:ok' }]] };
 
+// Bounded, because a fetch that never resolves is worse than one that fails:
+// it dies with the isolate's grace period, past every catch — no log, no
+// error reply, half-written state, and a person staring at a bot that said
+// nothing. Fifteen seconds is far beyond any healthy Telegram round trip.
+const TELEGRAM_TIMEOUT_MS = 15 * 1000;
+
 export async function telegram(env, method, body) {
   if (!env.BOT_TOKEN) return { ok: false, description: 'BOT_TOKEN is missing' };
   try {
@@ -11,6 +17,7 @@ export async function telegram(env, method, body) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
     });
     const data = await response.json();
     if (!data.ok) console.log(`Telegram ${method} failed: ${JSON.stringify(data)}`);
