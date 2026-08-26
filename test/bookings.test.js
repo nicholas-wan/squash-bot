@@ -762,7 +762,9 @@ describe('public booking announcements', () => {
   it('hands the roster reminders back when a booking moves to another date', async () => {
     captureTelegram();
     const db = auditedDb(storedBooking);
-    const moved = startsAt + 7 * 24 * 60 * 60 * 1000;
+    // Pinned in 2027: the reset only happens for reminder windows still ahead,
+    // so a relative date here starts failing the day it ages into the past.
+    const moved = Date.UTC(2027, 7, 19, 13, 0);
     await updateBooking({ BOT_TOKEN: 'test', DB: db }, -123, 3, {
       court: '4', startsAt: moved, endsAt: moved + 60 * 60 * 1000,
       reminderAt: moved - 13 * 60 * 60 * 1000,
