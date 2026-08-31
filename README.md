@@ -104,10 +104,11 @@ anything. It unpins itself once everyone is settled — `/tab` then answers with
 your own private breakdown instead, so history stays readable between rounds.
 Its 🧾 **My tab** button
 sends anyone their own private breakdown — every charge and payment since
-they last settled, with earlier history counted rather than replayed, because
-an append-only ledger rendered whole would outgrow a Telegram message within
-a year. Rows are matched by username or id so history under an old handle is
-still owned and shown. Group admins additionally get a row per open balance
+they last settled, and never less than the last two weeks, so settling up
+does not erase the recent record of who played what. Older settled history
+is counted rather than replayed, because an append-only ledger rendered
+whole would outgrow a Telegram message within a year. Rows are matched by
+username or id so history under an old handle is still owned and shown. Group admins additionally get a row per open balance
 under their own breakdown, each opening that person's tab, since collecting
 is their job; members can never see anyone else's. Clearing a balance sends
 the debtor a private receipt, and once a month — the first cron tick past 9am

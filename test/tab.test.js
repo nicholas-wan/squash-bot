@@ -363,6 +363,54 @@ describe('money tab', () => {
     expect(lines).not.toContain('Cleared by Nick');
   });
 
+  it('keeps the last two weeks visible even once settled', () => {
+    // The tab is also the record of who played what: settling up must not
+    // erase the recent story, only the old one.
+    const now = Date.now();
+    const rows = [
+      { amount_cents: 200, reason: 'Court 4 · long ago', created_at: now - 40 * 86400000 },
+      { amount_cents: -200, reason: 'Cleared by Nick', created_at: now - 39 * 86400000 },
+      { amount_cents: 300, reason: 'Court 4 · last week', created_at: now - 7 * 86400000 },
+      { amount_cents: -300, reason: 'Cleared by Nick again', created_at: now - 2 * 86400000 },
+    ];
+    const lines = breakdownLines(env, rows, 'Asia/Singapore').join('\n');
+    expect(lines).toContain('All settled.');
+    expect(lines).toContain('Court 4 · last week');
+    expect(lines).toContain('Cleared by Nick again');
+    expect(lines).not.toContain('long ago');
+    expect(lines).toContain('Earlier history — 2 settled entries not shown.');
+  });
+
+  it('keeps a settled player reachable from the admin tab for two weeks', async () => {
+    const db = {
+      prepare(sql) {
+        const statement = {
+          bind() { return statement; },
+          async first() {
+            return sql.includes('SELECT tz') ? { tz: 'Asia/Singapore' } : null;
+          },
+          async all() {
+            // Every balance is settled, so the open-balance list is empty…
+            if (sql.includes('HAVING')) return { results: [] };
+            // …but the ledger was touched inside the window.
+            if (sql.includes('l.created_at >')) {
+              return { results: [{ slug: 'u9', user_id: 9, name: '@alice' }] };
+            }
+            return { results: [] };
+          },
+          async run() { return { meta: { changes: 1 } }; },
+        };
+        return statement;
+      },
+    };
+    const view = await myTabView({ ...env, DB: db }, -123, { id: 5, username: 'nick' }, true);
+    const buttons = view.replyMarkup.inline_keyboard.flat();
+    const alice = buttons.find((button) => button.callback_data === 'tb:mine:u9');
+    expect(alice).toBeTruthy();
+    expect(alice.text).toContain('@alice');
+    expect(alice.text).toContain('$0.00');
+  });
+
   it('keeps a breakdown with nothing settled complete', () => {
     const rows = [
       { amount_cents: 200, reason: 'Court 4 · 1 Aug', created_at: 0 },
