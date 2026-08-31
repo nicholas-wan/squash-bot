@@ -95,16 +95,21 @@ export function tabMarkup(balances) {
 // Telegram's message limit within a year and start failing exactly where the
 // money is justified. The last time the running balance hit zero is the natural
 // cut: everything before it is a settled story, everything after it is why the
-// current balance is what it is. The totals agree because the dropped prefix
-// sums to nothing.
-function currentRows(rows) {
+// current balance is what it is — but the tab is also the record of who played
+// what, so the last two weeks stay visible even once they are settled. Two
+// weeks of one group's squash is bounded; a lifetime of it is not.
+const HISTORY_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
+
+function currentRows(rows, now = Date.now()) {
   let sum = 0;
   let lastZero = -1;
   rows.forEach((row, index) => {
     sum += row.amount_cents;
     if (sum === 0) lastZero = index;
   });
-  return { shown: rows.slice(lastZero + 1), settled: lastZero + 1 };
+  let start = lastZero + 1;
+  while (start > 0 && rows[start - 1].created_at > now - HISTORY_WINDOW_MS) start -= 1;
+  return { shown: rows.slice(start), settled: start };
 }
 
 // The balance line and the story behind it, shared by every breakdown view.
@@ -137,6 +142,26 @@ export function breakdownLines(env, rows, tz, { pricing = true } = {}) {
       + 'holidays, $3/hour otherwise, split across everyone who played.');
   }
   return lines;
+}
+
+// Who an admin can open from their own tab: every open balance, plus anyone
+// the ledger touched inside the history window — settling up must not make a
+// player unfindable while their recent story is still worth reading.
+async function adminTabEntries(env, chatId) {
+  const balances = await tabBalances(env, chatId);
+  const known = new Set(balances.map((entry) => entry.slug));
+  const { results: recent } = await env.DB.prepare(
+    `SELECT l.slug AS slug, MAX(l.user_id) AS user_id,
+            (SELECT name FROM ledger
+              WHERE chat_id = l.chat_id AND slug = l.slug
+              ORDER BY created_at DESC, id DESC LIMIT 1) AS name
+     FROM ledger AS l WHERE l.chat_id = ? AND l.created_at > ?
+     GROUP BY l.slug ORDER BY l.slug`
+  ).bind(dataChatId(env, chatId), Date.now() - HISTORY_WINDOW_MS).all();
+  for (const row of recent) {
+    if (!known.has(row.slug)) balances.push({ ...row, balance: 0 });
+  }
+  return balances;
 }
 
 // Why a balance is what it is: every ledger row for one person, charges and
@@ -172,7 +197,7 @@ export async function myTabView(env, chatId, from, isAdmin = false) {
   // where the answer is first needed. isChatAdmin never rejects.
   isAdmin = await isAdmin;
   if (isAdmin) {
-    const others = (await tabBalances(env, chatId))
+    const others = (await adminTabEntries(env, chatId))
       .filter((entry) => settleKey(entry.slug));
     if (others.length) {
       replyMarkup = { inline_keyboard: [
