@@ -117,6 +117,56 @@ describe('player identity', () => {
     expect(ownerIdentity({ OWNER_USER_ID: '7' }).slug).toBe('u7');
   });
 
+  it('pins the organiser’s handle to their numeric id', () => {
+    const owner = ownerIdentity({ ...env, OWNER_USER_ID: '246334575' });
+    // Still the handle the group knows them by, now with the id that outlives it.
+    expect(owner.slug).toBe('@nicholaswan');
+    expect(owner.name).toBe('@nicholaswan');
+    expect(owner.userId).toBe(246334575);
+    // An OWNER that already carries an id keeps it.
+    expect(ownerIdentity({ OWNER: '7:Nicholas', OWNER_USER_ID: '246334575' }))
+      .toEqual({ userId: 7, username: null, name: 'Nicholas', slug: 'u7' });
+  });
+
+  it('keeps the organiser an admin after they change their username', async () => {
+    // Nothing to ask Telegram: a fetch here would be the id check failing.
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('getChatMember should not be reached');
+    }));
+    const pinned = { ...env, OWNER_USER_ID: '246334575' };
+    const renamed = { id: 246334575, username: 'nickw' };
+    expect(await isChatAdmin(pinned, -123, renamed)).toBe(true);
+  });
+
+  it("does not hand admin to whoever claims the organiser's old handle", async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      requests.push(String(url));
+      return new Response(JSON.stringify({ ok: true, result: { status: 'member' } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const pinned = { ...env, OWNER_USER_ID: '246334575', BOT_TOKEN: 'test-token' };
+    // Same handle as OWNER, different account: the id decides, Telegram is asked.
+    expect(await isChatAdmin(pinned, -123, { id: 999, username: 'nicholaswan' })).toBe(false);
+    expect(requests.some((url) => url.endsWith('/getChatMember'))).toBe(true);
+  });
+
+  it('never reads two missing ids as the same person', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      requests.push(String(url));
+      return new Response(JSON.stringify({ ok: true, result: { status: 'member' } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    // An OWNER named in plain text carries no id, so the id comparison has
+    // nothing to match on and the answer has to come from Telegram.
+    const named = { OWNER: 'Nicholas', BOT_TOKEN: 'test-token' };
+    expect(await isChatAdmin(named, -123, { id: 42, username: 'alice' })).toBe(false);
+    expect(requests.some((url) => url.endsWith('/getChatMember'))).toBe(true);
+  });
+
   it('keeps the organiser and the default players off the tab', () => {
     const household = householdSlugs(env);
     expect(household.has('@nicholaswan')).toBe(true);

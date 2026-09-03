@@ -7,6 +7,10 @@ ALLOWED_CHATS = "-123456789"
 DEFAULT_TIMEZONE = "Asia/Singapore"
 # Whoever pays the courts. Always treated as an admin and never billed.
 OWNER = "@nicholaswan"
+# Recommended. The numeric id behind that handle. Telegram usernames can be
+# changed and reassigned, so without this a rename costs the owner their admin
+# rights and their free play, and hands both to whoever takes the old handle.
+# OWNER_USER_ID = "123456789"
 OWNER_NAME = "Nicholas"
 # Players added to every new booking. Usernames are the stable key: a player
 # named here is the same person who later taps join. "123:Name" also works for
