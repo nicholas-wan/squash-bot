@@ -173,8 +173,11 @@ considered and declined to keep the bot group-only.
 
 Booking ids are small sequential numbers, so editing or removing one — by command
 or from **⚙️ Manage** — is limited to whoever booked the court and to group
-admins. A court that has already been played cannot be cancelled at all; it has
-to reach the tab.
+admins. Once the court starts, only a group admin can change or cancel it: the
+tab is charged when the booking expires, so a cancellation during the hour of
+play — or a move to tomorrow and a cancellation there — would erase everyone's
+share of a court that was played. A court that has already been played cannot be
+cancelled at all, by anybody; it has to reach the tab.
 
 ## Configuration
 
@@ -309,3 +312,10 @@ Found by review, none of them load-bearing enough to hold a release:
   holds a slot; an admin can take it off from ⚙️ Manage.
 - An admin taking a player off tells only that player. The rest of the court
   hears about voluntary joins and leaves, but not about the slot a kick frees.
+- A reminder Telegram refuses for good — blocked, left the group, no such user —
+  counts as sent, because retrying it is one doomed call a minute until the
+  court starts. Somebody who unblocks the bot later that day still hears
+  nothing about the court they are already on.
+- A message the cleanup sweep cannot delete is retried on the next tick, but
+  given up on a day past its due time so one wedged row cannot starve the queue behind
+  it. That message then stays in the chat for good.
