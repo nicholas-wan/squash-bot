@@ -359,11 +359,13 @@ describe('Telegram commands', () => {
   it('always asks for confirmation before saving a complete message', async () => {
     const requests = [];
     const sqlSeen = [];
+    // Free text only books for a group admin now, so the sender is one.
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
       requests.push({ url: String(url), body: JSON.parse(init.body) });
-      return new Response(JSON.stringify({
-        ok: true, result: { ephemeral_message_id: 12 },
-      }), { headers: { 'Content-Type': 'application/json' } });
+      return new Response(JSON.stringify(String(url).endsWith('/getChatMember')
+        ? { ok: true, result: { status: 'creator' } }
+        : { ok: true, result: { ephemeral_message_id: 12 } }),
+      { headers: { 'Content-Type': 'application/json' } });
     }));
     const db = {
       prepare(sql) {
@@ -408,6 +410,11 @@ describe('Telegram commands', () => {
       // Telegram refusing the form used to leave the booking text in the group.
       const failed = String(url).endsWith('/sendMessage')
         && JSON.parse(init.body).text.includes('Confirm this squash booking');
+      if (String(url).endsWith('/getChatMember')) {
+        return new Response(JSON.stringify({ ok: true, result: { status: 'creator' } }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
       return new Response(JSON.stringify(failed
         ? { ok: false, description: 'Bad Request' }
         : { ok: true, result: { ephemeral_message_id: 12 } }), {
@@ -447,6 +454,11 @@ describe('Telegram commands', () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
       requests.push({ url: String(url), body: JSON.parse(init.body) });
+      if (String(url).endsWith('/getChatMember')) {
+        return new Response(JSON.stringify({ ok: true, result: { status: 'creator' } }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
       return new Response(JSON.stringify(String(url).endsWith('/deleteMessage')
         ? { ok: false, description: 'not enough rights' }
         : { ok: true, result: { ephemeral_message_id: 12 } }), {
@@ -481,6 +493,117 @@ describe('Telegram commands', () => {
     const warning = requests.find((request) => request.url.endsWith('/sendMessage')
       && request.body.text.includes('Delete Messages'));
     expect(warning.body.receiver_user_id).toBe(7);
+  });
+
+  // The intent gate is loose on purpose — "I booked 2 tickets" matches it — and
+  // it is the delete that made that expensive, clearing a member's ordinary
+  // chat out of the group. Free text books for group admins only now.
+  it('books from free text for an admin and ignores it from a member', async () => {
+    const run = async (status) => {
+      const requests = [];
+      vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+        requests.push({ url: String(url), body: JSON.parse(init.body) });
+        return new Response(JSON.stringify(String(url).endsWith('/getChatMember')
+          ? { ok: true, result: { status } }
+          : { ok: true, result: { ephemeral_message_id: 12 } }),
+        { headers: { 'Content-Type': 'application/json' } });
+      }));
+      const db = {
+        prepare(sql) {
+          return { bind() { return {
+            async first() {
+              return sql.includes('SELECT tz') ? { tz: 'Asia/Singapore' } : null;
+            },
+            async all() { return { results: [] }; },
+            async run() {
+              if (sql.includes('INSERT INTO booking_drafts')) {
+                return { meta: { changes: 1, last_row_id: 41 } };
+              }
+              return { meta: { changes: 1 } };
+            },
+          }; } };
+        },
+      };
+      await handleUpdate({
+        BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db,
+      }, {
+        message: {
+          message_id: 5,
+          chat: { id: -123456789 },
+          from: { id: 11, username: 'alice' },
+          text: '20 Aug 2027 Court 4 9pm',
+        },
+      });
+      vi.unstubAllGlobals();
+      // Same chat and same person in both runs, so the admin answer must not
+      // be carried over from the first.
+      clearAdminCache();
+      return requests;
+    };
+
+    // A member is left alone entirely: no form opened, and nothing deleted.
+    const member = await run('member');
+    expect(member.some((request) => request.url.endsWith('/deleteMessage'))).toBe(false);
+    expect(member.some((request) => request.url.endsWith('/sendMessage'))).toBe(false);
+
+    // An admin books exactly as before, and the group message the form repeats
+    // back is still cleared.
+    const admin = await run('administrator');
+    const form = admin.find((request) => request.url.endsWith('/sendMessage'));
+    expect(form.body.text).toContain('Confirm this squash booking');
+    expect(admin.find((request) => request.url.endsWith('/deleteMessage')).body.message_id)
+      .toBe(5);
+  });
+
+  // Telegram never checks callback data against the keyboard it drew, and the
+  // pinned board and tab wear no dismiss button — so a hand-sent sb:ok would
+  // otherwise let any member delete the group's own record.
+  it('refuses a dismiss tap aimed at a pinned message', async () => {
+    const run = async (messageId) => {
+      const requests = [];
+      vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+        requests.push({ url: String(url), body: JSON.parse(init.body) });
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }));
+      const db = {
+        prepare(sql) {
+          return { bind() { return {
+            async first() {
+              return sql.includes('board_message_id')
+                ? { board_message_id: 55, tab_message_id: 66 } : null;
+            },
+            async all() { return { results: [] }; },
+            async run() { return { meta: { changes: 1 } }; },
+          }; } };
+        },
+      };
+      await handleUpdate({
+        BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db,
+      }, {
+        callback_query: {
+          id: 'callback-1', data: 'sb:ok',
+          from: { id: 11, username: 'alice' },
+          message: { message_id: messageId, chat: { id: -123456789 } },
+        },
+      });
+      vi.unstubAllGlobals();
+      return requests;
+    };
+
+    for (const pinned of [55, 66]) {
+      const refused = await run(pinned);
+      expect(refused.some((request) => request.url.endsWith('/deleteMessage'))).toBe(false);
+      // The tap is still answered, or the button spins as though the bot died.
+      expect(refused.some((request) => request.url.endsWith('/answerCallbackQuery')))
+        .toBe(true);
+    }
+
+    // The bot's own receipt is what the button exists to clear, and still goes.
+    const receipt = await run(91);
+    expect(receipt.find((request) => request.url.endsWith('/deleteMessage')).body.message_id)
+      .toBe(91);
   });
 
   it('leaves nothing behind in the chat once a booking is saved', async () => {

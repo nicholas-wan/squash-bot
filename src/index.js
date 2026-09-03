@@ -85,6 +85,10 @@ async function helpBoardMarkup(env, chatId) {
 // non-admin member is deliberately not shown, so they carry the gate too;
 // sb:edit, sb:delete, and sb:cancel guard themselves through
 // authorizeBookingChange, whose booker-or-admin rule this table cannot express.
+// sb:ok and sb:close are open to everyone because the message they clear is
+// normally the tapper's own receipt — dismissMessage checks the pinned board
+// and tab ids itself, since a hand-sent sb:ok naming one would otherwise
+// delete the group's record from under it.
 const MANAGE_ADMIN = 'Only group admins can manage bookings.';
 const SEAT_ADMIN = 'Only group admins can add players.';
 const PLUS_ADMIN = 'Only group admins can change a +1.';
@@ -508,9 +512,22 @@ async function dismissMessage(env, callback) {
     await deleteEphemeralMessage(env, callback.message.chat.id, callback.from.id, ephemeralId);
     return;
   }
-  if (callback.message && callback.message.message_id) {
-    await deleteMessage(env, callback.message.chat.id, callback.message.message_id);
+  const messageId = callback.message && callback.message.message_id;
+  if (!messageId) return;
+  const chatId = callback.message.chat.id;
+  // The pinned board and the pinned tab wear no dismiss button, but Telegram
+  // never checks callback data against the keyboard it drew, so anyone can
+  // send sb:ok naming one of them and have the group's own record deleted.
+  // Their ids are read back and refused; every other non-ephemeral message
+  // this button lands on is a receipt the tapper is entitled to clear.
+  const pinned = await env.DB.prepare(
+    'SELECT board_message_id, tab_message_id FROM settings WHERE chat_id = ?'
+  ).bind(chatId).first();
+  if (pinned && (Number(pinned.board_message_id) === Number(messageId)
+    || Number(pinned.tab_message_id) === Number(messageId))) {
+    return;
   }
+  await deleteMessage(env, chatId, messageId);
 }
 
 // tb:mine carries no guard on purpose: anyone may read their own breakdown.
@@ -648,6 +665,15 @@ export async function handleUpdate(env, update) {
       // is read up front and the delete runs in a finally, because a form that
       // fails to open would otherwise leave the booking sitting in the chat.
       const isBooking = looksLikeBooking(text);
+      // The gate is deliberately loose — "I booked 2 tickets" reads as a
+      // booking — and it is the delete that makes that expensive: ordinary
+      // chat from a member was being cleared out of the group for looking
+      // like a court. The operator books every court and is a group admin,
+      // so anyone else's booking-shaped text is left exactly as it is: no
+      // form, nothing deleted, nothing said. The admin lookup is a Telegram
+      // round trip, which is why it hangs off isBooking rather than running
+      // on every message in the chat. /book stays open to everyone.
+      if (isBooking && !(await isChatAdmin(env, msg.chat.id, msg.from))) return;
       try {
         await beginBooking(env, msg, text);
       } finally {
