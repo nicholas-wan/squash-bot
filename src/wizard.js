@@ -1,5 +1,5 @@
 import {
-  addBooking, BookingConflictError, getTimezone, updateBooking,
+  addBooking, BOOKING_STARTED, BookingConflictError, getTimezone, updateBooking,
 } from './bookings.js';
 import { courtName } from './format.js';
 import { isChatAdmin, knownPlayers, openBooking } from './players.js';
@@ -535,6 +535,13 @@ export async function handleBookingCallback(env, callback) {
     }
     await env.DB.prepare('DELETE FROM booking_drafts WHERE id = ? AND user_id = ?')
       .bind(id, callback.from.id).run();
+    // The court came into play while this form was open: updateBooking says so
+    // rather than saving, because the charge is written when the booking
+    // expires and moving it off tonight would take the bill with it.
+    if (saved === 'started') {
+      await answerCallback(env, callback.id, BOOKING_STARTED, true);
+      return true;
+    }
     if (!saved) {
       await answerCallback(env, callback.id, 'That booking no longer exists.', true);
       return true;

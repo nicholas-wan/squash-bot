@@ -142,6 +142,12 @@ export async function updateBooking(
     .bind(id, dataChatId(env, chatId)).first();
   if (!before) return false;
   const now = Date.now();
+  // The form can be saved long after it was opened, so the start is checked
+  // here as well as when the form is opened: without it a court that came into
+  // play while somebody sat on the wizard could still be moved off the tab.
+  if (from && before.starts_at <= now && !(await isChatAdmin(env, chatId, from))) {
+    return 'started';
+  }
   const preReminderAt = parsed.startsAt - 2 * 60 * 60 * 1000;
   const result = await env.DB.prepare(
     `UPDATE bookings SET
@@ -192,11 +198,20 @@ export async function updateBooking(
 
 const BOOKING_GONE = 'That booking has already gone.';
 
+// The hour of play is when everybody on the court is committed to their share:
+// the charge is only written when the booking expires, so a booker who cancels
+// — or moves the court to tomorrow and cancels it there — during that hour
+// erases the whole roster's bill. An admin can still act, because a no-show or
+// a court nobody could get into is theirs to sort out.
+export const BOOKING_STARTED =
+  'That court has already started, so only a group admin can change it.';
+
 // Booking ids are small sequential numbers, so without this any member could
 // walk the whole group's history away. One rule for /cancel and for every button
-// that edits or deletes: whoever booked the court, or a group admin. A refusal
-// says nothing about the booking beyond who to ask. `from` is null only on the
-// automatic expiry sweep, which answers to the clock rather than to a person.
+// that edits or deletes: whoever booked the court, or a group admin, and only
+// until the court starts. A refusal says nothing about the booking beyond who to
+// ask. `from` is null only on the automatic expiry sweep, which answers to the
+// clock rather than to a person.
 export async function authorizeBookingChange(env, chatId, id, from, action = 'change') {
   const booking = await env.DB.prepare('SELECT * FROM bookings WHERE id = ? AND chat_id = ?')
     .bind(id, dataChatId(env, chatId)).first();
@@ -204,16 +219,23 @@ export async function authorizeBookingChange(env, chatId, id, from, action = 'ch
   if (!from) return { allowed: true, status: 'ok', message: '', booking };
   const booked = booking.created_by_user_id
     && Number(booking.created_by_user_id) === Number(from.id);
-  if (booked || await isChatAdmin(env, chatId, from)) {
-    return { allowed: true, status: 'ok', message: '', booking };
+  // Asked at most once and only when it is needed: the booker's own path costs
+  // no getChatMember round trip until their court has started.
+  let admin;
+  const isAdmin = () => (admin ??= isChatAdmin(env, chatId, from));
+  if (!booked && !(await isAdmin())) {
+    return {
+      allowed: false,
+      status: 'forbidden',
+      message: `Only ${booking.created_by_name || 'whoever booked it'} or a group admin ` +
+        `can ${action} that booking.`,
+      booking: null,
+    };
   }
-  return {
-    allowed: false,
-    status: 'forbidden',
-    message: `Only ${booking.created_by_name || 'whoever booked it'} or a group admin ` +
-      `can ${action} that booking.`,
-    booking: null,
-  };
+  if (booking.starts_at <= Date.now() && !(await isAdmin())) {
+    return { allowed: false, status: 'started', message: BOOKING_STARTED, booking: null };
+  }
+  return { allowed: true, status: 'ok', message: '', booking };
 }
 
 export async function cancelBooking(env, chatId, id, from = null, sourceText = null) {
@@ -805,12 +827,18 @@ export async function notifyRosterOfChange(
   };
 }
 
-export async function deletePanelView(env, chatId, bookingId) {
+export async function deletePanelView(env, chatId, bookingId, now = Date.now()) {
   const booking = await openBooking(env, chatId, bookingId);
   if (!booking) return null;
   const tz = await getTimezone(env, chatId);
+  // Only an admin reaches this panel once the court is in play, and the money
+  // is the part that is easy to miss: the charge is written when the booking
+  // expires, so deleting it now is deleting everybody's share of it.
   return {
-    html: `🗑 <b>Delete ${escapeHtml(bookingLabel(booking, tz))}?</b>`,
+    html: `🗑 <b>Delete ${escapeHtml(bookingLabel(booking, tz))}?</b>`
+      + (booking.starts_at <= now
+        ? '\n\n⚠️ This court is in progress. Deleting it means nobody is charged for it.'
+        : ''),
     replyMarkup: { inline_keyboard: [
       [{ text: '🗑 Confirm delete', callback_data: `sb:cancel:${booking.id}` }],
       [{ text: '← Keep booking', callback_data: `sb:pick:${booking.id}` }],
@@ -858,6 +886,12 @@ async function scheduleCleanup(env, chatId, sent, receiverUserId, deleteAfter) {
   if (statement) await statement.run();
 }
 
+// What Telegram says when a person is out of reach for good rather than for
+// now: blocked the bot, left the group, deleted the account, or was never
+// somebody this bot could write to. Everything else — a timeout, a 429, a 500
+// — is worth another go on the next tick.
+const PERMANENT_REFUSAL = /blocked|not found|not a member|not_participant|forbidden|deactivated/i;
+
 // Telegram falls back to an ordinary group message when it cannot deliver an
 // ephemeral one. Anything addressed to one person — a receipt with the roster on
 // it, a reminder, a removal notice — would then sit in the group instead, so the
@@ -866,10 +900,17 @@ async function scheduleCleanup(env, chatId, sent, receiverUserId, deleteAfter) {
 // A caller sending a burst can pass `cleanups`, an array the sent_messages row
 // is pushed into instead of written, to be committed in one env.DB.batch —
 // one subrequest for the burst rather than one INSERT per message.
+//
+// A refusal is told apart from a failure: 'failed' is worth retrying — a
+// timeout, a 429, a Telegram hiccup — while 'refused' is Telegram saying this
+// person cannot be reached at all, and retrying that is a request per minute
+// that will never land.
 async function sendPrivately(env, chatId, html, userId, deleteAfter, options = {}) {
   const { cleanups, ...sendOptions } = options;
   const sent = await sendMessage(env, chatId, html, { ...sendOptions, receiverUserId: userId });
-  if (!sent.ok) return 'failed';
+  if (!sent.ok) {
+    return PERMANENT_REFUSAL.test(String(sent.description || '')) ? 'refused' : 'failed';
+  }
   if (sent.result && sent.result.ephemeral_message_id) {
     const statement = cleanupStatement(env, chatId, sent.result, userId, deleteAfter);
     if (cleanups) cleanups.push(statement);
@@ -916,6 +957,18 @@ function chatScope(env, column) {
   return { sql: ` AND ${column} IN (${chats.map(() => '?').join(', ')})`, args: chats };
 }
 
+// Telegram refuses to delete a message that is already gone, which is the same
+// outcome as deleting it, so the row goes on either of these.
+const ALREADY_DELETED =
+  /not found|can't be deleted|MESSAGE_ID_INVALID|message to delete not found/i;
+
+// A row Telegram keeps failing on is kept and retried, but not forever: a day
+// past its due time it is dropped anyway. These messages are about one day,
+// so a call a minute for longer than that is not worth the message — and one
+// wedged row would otherwise hold a place in every LIMIT 100 window from then
+// on and starve the rows behind it.
+const PURGE_GIVE_UP_MS = 24 * 60 * 60 * 1000;
+
 async function purgeFinishedMessages(env, now) {
   const scope = chatScope(env, 'chat_id');
   const { results } = await env.DB.prepare(
@@ -924,14 +977,16 @@ async function purgeFinishedMessages(env, now) {
   ).bind(now, ...scope.args).all();
   for (const row of results) {
     try {
-      if (row.is_ephemeral) {
-        await deleteEphemeralMessage(env, row.chat_id, row.receiver_user_id, row.message_id);
-      } else {
-        await deleteMessage(env, row.chat_id, row.message_id);
+      // Forgetting the row on a timeout or a 429 leaves the message in the chat
+      // forever, so the row is only dropped once the message is actually gone.
+      const outcome = row.is_ephemeral
+        ? await deleteEphemeralMessage(env, row.chat_id, row.receiver_user_id, row.message_id)
+        : await deleteMessage(env, row.chat_id, row.message_id);
+      const gone = outcome.ok
+        || ALREADY_DELETED.test(String(outcome.description || ''));
+      if (gone || row.delete_after <= now - PURGE_GIVE_UP_MS) {
+        await env.DB.prepare('DELETE FROM sent_messages WHERE id = ?').bind(row.id).run();
       }
-      // Telegram refuses to delete a message that is already gone, which is the
-      // same outcome, so the row goes either way.
-      await env.DB.prepare('DELETE FROM sent_messages WHERE id = ?').bind(row.id).run();
     } catch (error) {
       console.log(`Reminder cleanup ${row.id} failed: ${error.stack || error}`);
     }
@@ -974,6 +1029,16 @@ async function sendClaimedReminders(env, now, column, headline) {
       );
 
       if (outcome === 'private') continue;
+      // Telegram will refuse this player every minute until the court starts,
+      // and a claim handed back sorts straight to the front of the next
+      // window's LIMIT. The claim stays spent: one line in the log is the whole
+      // record, and the rest of the roster still gets reminded.
+      if (outcome === 'refused') {
+        console.log(
+          `${column} reminder for player ${row.player_row_id} refused by Telegram; not retried`
+        );
+        continue;
+      }
       if (outcome === 'not-ephemeral') {
         // Claim the rest of this roster so the public fallback is sent once.
         await env.DB.prepare(
@@ -1025,8 +1090,13 @@ async function remindRosterlessBookings(env, now, column, headline) {
       if (outcome === 'not-ephemeral') {
         await remindPublicly(env, booking, roster, headline, tz);
       } else if (outcome === 'failed') {
+        // Only a transient failure is handed back. A refusal — blocked, gone,
+        // never reachable — would come back the same every minute, so the flag
+        // stays spent there, the same as on the roster path.
         await env.DB.prepare(`UPDATE bookings SET ${column}_sent = 0 WHERE id = ?`)
           .bind(booking.id).run();
+      } else if (outcome === 'refused') {
+        console.log(`${column} reminder ${booking.id} refused by Telegram; not retried`);
       }
     } catch (error) {
       console.log(`${column} reminder ${booking.id} failed: ${error.stack || error}`);

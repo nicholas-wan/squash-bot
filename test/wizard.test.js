@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { handleBookingCallback } from '../src/wizard.js';
+import { clearAdminCache } from '../src/players.js';
 
 // A complete draft one tap away from saving. Pinned in 2027 so the "already
 // passed" validation never starts failing as the wall clock moves.
@@ -29,6 +30,8 @@ function draftDb(state) {
       return { bind(...args) { return {
         async first() {
           if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+          // The booking an edit draft is about, when the test supplies one.
+          if (sql.includes('SELECT * FROM bookings WHERE id')) return state.booking || null;
           if (sql.includes('FROM booking_drafts')) {
             return state.deleted ? null : {
               id: 1, chat_id: -123, user_id: 7, user_name: 'Nick',
@@ -68,6 +71,10 @@ function draftDb(state) {
             state.deleted = true;
             return { meta: { changes: 1 } };
           }
+          if (sql.startsWith('UPDATE bookings SET')) {
+            state.updated = true;
+            return { meta: { changes: 1 } };
+          }
           if (sql.startsWith('INSERT INTO bookings')) {
             // The conflict guard rides inside the insert; the allow flag is the
             // bound value the guard reads.
@@ -96,7 +103,11 @@ function confirmTap(data) {
 }
 
 describe('booking wizard save', () => {
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    // The admin gate is cached per chat and user, and these tests share both.
+    clearAdminCache();
+  });
 
   function captureTelegram() {
     const requests = [];
@@ -167,6 +178,31 @@ describe('booking wizard save', () => {
     const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
     expect(answer.body.text).toBe('Only group admins can book for someone else.');
     expect(state.payload.choosingBooker).not.toBe(true);
+  });
+
+  it('refuses to save an edit to a court that started while the form was open', async () => {
+    const requests = captureTelegram();
+    const payload = {
+      ...completePayload(), operation: 'edit', bookingId: 3, editSourceText: 'date: tomorrow',
+    };
+    const state = {
+      payload, pending: null, conflict: false, updated: false, deleted: false,
+      // Started half an hour ago, still running: the hour everybody on it is
+      // billed for, and the charge is not written until it expires.
+      booking: {
+        id: 3, chat_id: -123, court: '4', created_by_user_id: 7,
+        starts_at: Date.now() - 30 * 60 * 1000,
+        ends_at: Date.now() + 30 * 60 * 1000,
+      },
+    };
+    await handleBookingCallback(
+      { BOT_TOKEN: 'test', DB: draftDb(state) }, confirmTap('bw:1:y')
+    );
+    const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+    expect(answer.body.text)
+      .toBe('That court has already started, so only a group admin can change it.');
+    // Moving it to another day and cancelling it there is how the bill was lost.
+    expect(state.updated).toBe(false);
   });
 
   it('surfaces a conflict for review, then saves on Add anyway', async () => {
