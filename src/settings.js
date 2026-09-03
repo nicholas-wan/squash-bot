@@ -5,6 +5,28 @@ const DEFAULT_TZ = 'Asia/Singapore';
 const SCHEMA_DEFAULT_TZ = 'Asia/Singapore';
 const PINNED_COLUMNS = new Set(['board_message_id', 'tab_message_id']);
 
+// Telegram's way of saying the pinned message is beyond editing: somebody
+// deleted it, or the bot was kicked and re-added and no longer owns it. Only
+// those answers justify sending a replacement, because a supergroup allows many
+// pins and nothing here unpins the old one — so a fresh send after a failure
+// that was merely transient (a 429, a 5xx, the fifteen-second timeout in
+// telegram(), which comes back as a description too) leaves a second board
+// pinned while the first stays up forever as a stale zombie nobody edits again.
+// Everything else is therefore thrown and left to the caller, which already
+// logs a sibling chat's failure and rethrows the acting chat's.
+const GONE_DESCRIPTIONS = [
+  'message to edit not found',
+  "message can't be edited",
+  'message can’t be edited',
+  'message not found',
+  'message_id_invalid',
+];
+
+function editTargetIsGone(description) {
+  const text = String(description || '').toLowerCase();
+  return GONE_DESCRIPTIONS.some((phrase) => text.includes(phrase));
+}
+
 // The timezone is a D1 query on nearly every code path, often several times per
 // update, and the answer changes approximately never — nothing writes tz today.
 // Cached per database handle rather than globally, so tests and local adapters
@@ -56,6 +78,11 @@ export async function updatePinnedMessage(env, chatId, column, html, replyMarkup
     const edited = await editMessage(env, chatId, existingId, html, replyMarkup);
     if (edited.ok || String(edited.description || '').includes('message is not modified')) {
       return existingId;
+    }
+    if (!editTargetIsGone(edited.description)) {
+      throw new Error(
+        `Could not update ${label}: ${edited.description || 'unknown Telegram error'}`
+      );
     }
   }
 
