@@ -52,9 +52,19 @@ function parsePlayer(entry) {
   return identity({ first_name: raw });
 }
 
+// OWNER names the organiser the way the group does, by handle. A handle is
+// mutable and can be claimed by somebody else once it is given up, so
+// OWNER_USER_ID pins that name to the one account: set both and the identity
+// keeps its slug but carries the id too, which is what survives a rename.
+// OWNER_USER_ID alone is still read as OWNER, the older spelling.
 export function ownerIdentity(env) {
   const raw = String((env && (env.OWNER || env.OWNER_USER_ID)) || '').trim();
-  return raw ? parsePlayer(raw) : null;
+  if (!raw) return null;
+  const owner = parsePlayer(raw);
+  // A bare id or "id:Name" already carries its own id; nothing to pin.
+  if (owner.userId) return owner;
+  const pinned = Number(String((env && env.OWNER_USER_ID) || '').trim());
+  return Number.isFinite(pinned) && pinned > 0 ? { ...owner, userId: pinned } : owner;
 }
 
 export function ownerName(env) {
@@ -87,6 +97,28 @@ export function householdSlugs(env) {
   return slugs;
 }
 
+// The same set read by numeric id, for whoever in config carries one.
+function householdUserIds(env) {
+  const ids = new Set();
+  for (const player of [ownerIdentity(env), ...defaultPlayers(env), ...unbilledPlayers(env)]) {
+    if (player && player.userId) ids.add(Number(player.userId));
+  }
+  return ids;
+}
+
+// Whether a roster row is one of the free players. The slug is the usual
+// answer, but a slug is a username and a username can change: rememberPlayer
+// re-keys that person's rows onto the new handle, and matching on the slug
+// alone would start billing the organiser for their own courts. The numeric id
+// is the second answer, and the one that cannot be taken over.
+export function isHouseholdPlayer(env, player) {
+  if (!player) return false;
+  if (householdSlugs(env).has(player.slug)) return true;
+  // Roster rows spell it user_id, config identities spell it userId.
+  const userId = Number(player.user_id || player.userId);
+  return Number.isFinite(userId) && userId > 0 && householdUserIds(env).has(userId);
+}
+
 export function defaultCapacity(env) {
   const configured = Number(String((env && env.DEFAULT_CAPACITY) || '').trim());
   return Number.isFinite(configured) && configured > 0
@@ -97,7 +129,13 @@ export async function isChatAdmin(env, chatId, from) {
   if (!from || !from.id) return false;
   const owner = ownerIdentity(env);
   const who = identity(from);
-  if (owner && (owner.slug === who.slug || owner.userId === who.userId)) return true;
+  // Once OWNER_USER_ID pins the organiser to an account, the handle stops
+  // counting: a username can be given up and claimed by somebody else, and
+  // matching on it would hand that person admin. Without the id, the handle
+  // is all there is to go on. Two missing ids are never a match.
+  if (owner && (owner.userId
+    ? owner.userId === who.userId
+    : owner.slug === who.slug)) return true;
   const key = `${chatId}:${from.id}`;
   const now = Date.now();
   const cached = adminCache.get(key);

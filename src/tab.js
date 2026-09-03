@@ -1,6 +1,6 @@
 import { courtName } from './format.js';
 import { courtCostCents, formatMoney, publicHolidays, shareCents } from './pricing.js';
-import { householdSlugs, identity, ownerName } from './players.js';
+import { identity, isHouseholdPlayer, ownerName } from './players.js';
 import { boardChats, dataChatId } from './scope.js';
 import { getTimezone, updatePinnedMessage } from './settings.js';
 import { escapeHtml, OK_MARKUP } from './telegram.js';
@@ -25,13 +25,14 @@ export async function chargeBooking(env, booking, roster) {
   const share = shareCents(
     totalCents, roster.reduce((total, player) => total + (player.heads || 1), 0)
   );
-  const household = householdSlugs(env);
   const reason = `${courtName(booking)} · ${shortDay(booking.starts_at, tz)}`;
 
   let charged = 0;
   if (share > 0) {
     for (const player of roster) {
-      if (household.has(player.slug)) continue;
+      // By slug or by numeric id: the organiser changing their handle re-keys
+      // their roster rows, and only the id still says the court is theirs.
+      if (isHouseholdPlayer(env, player)) continue;
       // One row per person however many heads they brought — the unique index
       // allows only one per booking anyway — so the reason carries the count,
       // which is the only place a doubled charge can explain itself.

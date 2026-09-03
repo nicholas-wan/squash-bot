@@ -184,7 +184,7 @@ to reach the tab.
 |---|---|
 | `ALLOWED_CHATS` | Group ids the bot answers in. Every other chat is ignored |
 | `DATA_CHAT_ID` | Optional. Makes every listed group share one set of bookings, rosters, history, and one tab. A storage key, not an address: it need not be a chat the bot is still in, and messages are never aimed at it unless it is also allowed |
-| `OWNER`, `OWNER_NAME` | Who pays the courts. Always an admin, never billed. `OWNER_USER_ID` is read as an alias when `OWNER` is unset |
+| `OWNER`, `OWNER_NAME` | Who pays the courts. Always an admin, never billed. Set `OWNER_USER_ID` to their numeric id alongside it: a Telegram handle can be changed and then claimed by somebody else, and the id is what keeps the owner an admin and off the tab across a rename. `OWNER_USER_ID` is read as an alias when `OWNER` is unset |
 | `DEFAULT_PLAYERS` | Seated on every new booking, never billed |
 | `UNBILLED_PLAYERS` | Never billed, but not seated automatically |
 | `DEFAULT_CAPACITY` | Players per court before an admin opens more (default 3) |

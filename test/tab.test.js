@@ -150,6 +150,20 @@ describe('money tab', () => {
     expect(inserts).toHaveLength(0);
   });
 
+  it('keeps the organiser off the tab after they change their username', async () => {
+    const inserts = [];
+    // rememberPlayer re-keys their rows onto the new handle, so the slug no
+    // longer says who this is. OWNER_USER_ID does.
+    const renamed = [
+      { slug: '@nickw', user_id: 246334575, name: '@nickw' },
+      { slug: 'u9', user_id: 9, name: 'Alice' },
+    ];
+    await chargeBooking(
+      { ...env, OWNER_USER_ID: '246334575', DB: ledgerDb(inserts) }, booking, renamed
+    );
+    expect(inserts.map((args) => args[1])).toEqual(['u9']);
+  });
+
   it('charges nothing when only the household played', async () => {
     const inserts = [];
     await chargeBooking({ ...env, DB: ledgerDb(inserts) }, booking, roster.slice(0, 2));
