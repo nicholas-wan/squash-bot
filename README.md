@@ -139,7 +139,11 @@ chat, seen by nobody else. Booking as ordinary text has the opposite shape: it
 is a real group message, delivered and notified before the bot is told it
 exists, and can only be deleted afterwards — which needs the **Delete Messages**
 admin right, and without it the bot says so privately rather than failing
-quietly. Use `/book` for a booking that is never public at any point. The booker
+quietly. That delete is why free text is only read as a booking from group
+admins: the intent gate is loose on purpose, and applied to everyone it cleared
+ordinary chat out of the group for looking like a court. Anybody else's
+booking-shaped message is ignored where it stands — no form, nothing removed —
+so members book with `/book`, which is never public at any point. The booker
 gets a private receipt with an **OK** button either way, so a new booking is
 discovered on the board rather than announced.
 
