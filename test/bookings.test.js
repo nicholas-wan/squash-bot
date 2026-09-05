@@ -63,7 +63,9 @@ describe('public booking announcements', () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
       requests.push({ url: String(url), body: JSON.parse(init.body) });
-      return new Response(JSON.stringify({ ok: true, result: true }), {
+      return new Response(JSON.stringify({
+        ok: true, result: { ephemeral_message_id: 55 },
+      }), {
         headers: { 'Content-Type': 'application/json' },
       });
     }));
@@ -208,6 +210,25 @@ describe('public booking announcements', () => {
       }, { id: 7, first_name: 'Nick' }, 'Edited with SquashBot'
     );
     expect(saved).toBe('started');
+    expect(db.ran.some((query) => query.sql.startsWith('UPDATE bookings SET'))).toBe(false);
+  });
+
+  it('refuses even an admin edit saved after the court has finished', async () => {
+    const played = {
+      ...bookedByNick,
+      starts_at: Date.now() - 2 * 60 * 60 * 1000,
+      ends_at: Date.now() - 60 * 60 * 1000,
+    };
+    const db = auditedDb(played);
+    const saved = await updateBooking(
+      { BOT_TOKEN: 'test', DB: db }, -123, 3, {
+        court: '4',
+        startsAt: Date.now() + 24 * 60 * 60 * 1000,
+        endsAt: Date.now() + 25 * 60 * 60 * 1000,
+        reminderAt: Date.now() + 12 * 60 * 60 * 1000,
+      }, { id: 11, username: 'admin' }, 'Stale edit form'
+    );
+    expect(saved).toBe('played');
     expect(db.ran.some((query) => query.sql.startsWith('UPDATE bookings SET'))).toBe(false);
   });
 
@@ -751,7 +772,7 @@ describe('public booking announcements', () => {
       }), { headers: { 'Content-Type': 'application/json' } });
     }));
     await runMaintenance(
-      { BOT_TOKEN: 'test', DB: reminderDb() }, startsAt - 2 * 60 * 60 * 1000
+      { BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: reminderDb() }, startsAt - 2 * 60 * 60 * 1000
     );
     const reminders = requests.filter((request) => request.url.endsWith('/sendMessage'));
     expect(reminders).toHaveLength(2);
@@ -828,7 +849,7 @@ describe('public booking announcements', () => {
   it('sends no roster reminder for a booking whose own flag is already spent', async () => {
     const requests = captureTelegram();
     await runMaintenance(
-      { BOT_TOKEN: 'test', DB: lateBookingDb() }, startsAt - 2 * 60 * 60 * 1000
+      { BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: lateBookingDb() }, startsAt - 2 * 60 * 60 * 1000
     );
     expect(requests.filter((request) => request.url.endsWith('/sendMessage'))).toHaveLength(0);
   });
@@ -847,7 +868,10 @@ describe('public booking announcements', () => {
       (query) => query.sql.startsWith('UPDATE booking_players SET reminder_sent')
     );
     // Everyone already reminded about the old date has to hear about the new one.
-    expect(reset.args).toEqual([0, 0, 3]);
+    expect(reset.args.slice(0, 3)).toEqual([0, 0, 3]);
+    // The reset is conditional on the booking carrying the newly committed
+    // state, so a rejected conflicting update cannot re-arm old reminders.
+    expect(reset.sql).toContain('EXISTS');
   });
 
   function strayChatDb(bookings) {
@@ -870,7 +894,7 @@ describe('public booking announcements', () => {
             async all() {
               if (sql.includes('ends_at <=')) {
                 return {
-                  results: sql.includes('chat_id IN')
+                  results: sql.includes('AND 1 = 0') ? [] : sql.includes('chat_id IN')
                     ? bookings.filter((booking) => args.includes(booking.chat_id)) : bookings,
                 };
               }
@@ -899,8 +923,8 @@ describe('public booking announcements', () => {
 
     requests.length = 0;
     await runMaintenance({ BOT_TOKEN: 'test', DB: strayChatDb([stray]) }, now);
-    // With no allow list configured the sweep stays unscoped, as it always was.
-    expect(requests.some((request) => request.body.chat_id === -999)).toBe(true);
+    // A missing allowlist fails closed just like interactive updates do.
+    expect(requests.some((request) => request.body.chat_id === -999)).toBe(false);
   });
 
   it('sweeps the shared data chat as well when DATA_CHAT_ID is set', async () => {
@@ -926,7 +950,7 @@ describe('public booking announcements', () => {
       });
     }));
     await runMaintenance(
-      { BOT_TOKEN: 'test', DB: reminderDb() }, startsAt - 2 * 60 * 60 * 1000
+      { BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: reminderDb() }, startsAt - 2 * 60 * 60 * 1000
     );
     const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
     const deleted = requests.filter((request) => request.url.endsWith('/deleteMessage'));
@@ -960,7 +984,7 @@ describe('public booking announcements', () => {
     refusingTelegram('Forbidden: bot was blocked by the user');
     const db = reminderDb();
     await runMaintenance(
-      { BOT_TOKEN: 'test', DB: db }, startsAt - 2 * 60 * 60 * 1000
+      { BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: db }, startsAt - 2 * 60 * 60 * 1000
     );
     // Handing the claim back would retry the same refusal every minute until
     // the court starts, and sort that player to the front of the next window.
@@ -972,7 +996,7 @@ describe('public booking announcements', () => {
     refusingTelegram('Bad Gateway');
     const db = reminderDb();
     await runMaintenance(
-      { BOT_TOKEN: 'test', DB: db }, startsAt - 2 * 60 * 60 * 1000
+      { BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: db }, startsAt - 2 * 60 * 60 * 1000
     );
     const reset = db.ran.find((query) => query.sql.includes('SET pre_reminder_sent = 0'));
     expect(reset).toBeTruthy();
@@ -1017,22 +1041,43 @@ describe('public booking announcements', () => {
     // for good. It waits for the next tick instead.
     deleteAnswer({ ok: false, error_code: 429, description: 'Too Many Requests: retry after 5' });
     const busy = purgeDb(row);
-    await runMaintenance({ BOT_TOKEN: 'test', DB: busy }, now);
+    await runMaintenance({ BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: busy }, now);
     expect(busy.ran.some((query) => query.sql.startsWith('DELETE FROM sent_messages')))
       .toBe(false);
 
     // Already gone is the same outcome as deleting it.
     deleteAnswer({ ok: false, error_code: 400, description: 'Bad Request: message to delete not found' });
     const missing = purgeDb(row);
-    await runMaintenance({ BOT_TOKEN: 'test', DB: missing }, now);
+    await runMaintenance({ BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: missing }, now);
     expect(missing.ran.some((query) => query.sql.startsWith('DELETE FROM sent_messages')))
       .toBe(true);
 
     deleteAnswer({ ok: true, result: true });
     const deleted = purgeDb(row);
-    await runMaintenance({ BOT_TOKEN: 'test', DB: deleted }, now);
+    await runMaintenance({ BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: deleted }, now);
     expect(deleted.ran.some((query) => query.sql.startsWith('DELETE FROM sent_messages')))
       .toBe(true);
+  });
+
+  it('drops an ephemeral cleanup row Telegram reports as MESSAGE_NOT_FOUND', async () => {
+    const now = Date.now();
+    // Live wording for an ephemeral message that has already expired. The
+    // underscore kept it from reading as "not found", so the row was retried
+    // every minute for a day and withheld the heartbeat the whole time.
+    vi.stubGlobal('fetch', vi.fn(async (url) => new Response(
+      JSON.stringify(String(url).endsWith('/deleteEphemeralMessage')
+        ? { ok: false, error_code: 400, description: 'Bad Request: MESSAGE_NOT_FOUND' }
+        : { ok: true, result: { message_id: 1 } }),
+      { headers: { 'Content-Type': 'application/json' } }
+    )));
+    const expired = purgeDb({
+      id: 4, chat_id: -123, receiver_user_id: 42, message_id: 77,
+      is_ephemeral: 1, delete_after: now - 60 * 1000,
+    });
+    const outcome = await runMaintenance({ BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: expired }, now);
+    expect(expired.ran.some((query) => query.sql.startsWith('DELETE FROM sent_messages')))
+      .toBe(true);
+    expect(outcome.ok).toBe(true);
   });
 
   it('gives up on a cleanup row that has been failing for a week', async () => {
@@ -1044,7 +1089,7 @@ describe('public booking announcements', () => {
       id: 4, chat_id: -123, receiver_user_id: null, message_id: 77,
       is_ephemeral: 0, delete_after: now - 8 * 24 * 60 * 60 * 1000,
     });
-    await runMaintenance({ BOT_TOKEN: 'test', DB: stuck }, now);
+    await runMaintenance({ BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: stuck }, now);
     expect(stuck.ran.some((query) => query.sql.startsWith('DELETE FROM sent_messages')))
       .toBe(true);
   });
@@ -1167,8 +1212,12 @@ describe('public booking announcements', () => {
     expect(sent[0].body.text).toContain('• Court 4 · 15 Aug — $2.00');
     expect(sent[0].body.text).not.toContain('$6/hour');
     expect(sent[0].body.text).not.toContain('My tab');
-    expect(db.seen.find((query) => query.sql.includes('nudged_month) VALUES')).args)
-      .toEqual([-999, '2026-8']);
+    // The month is not stamped complete while a debtor still has no numeric id;
+    // if they post later this month, their own notice remains deliverable.
+    expect(db.seen.find((query) => query.sql.includes('nudged_month) VALUES')))
+      .toBeUndefined();
+    expect(db.seen.find((query) => query.sql.includes('SET status = ?')).args)
+      .toEqual(['delivered', cronNow, -999, '2026-8', 'u9']);
 
     // Already stamped for this month: quiet.
     requests.length = 0;
@@ -1203,6 +1252,8 @@ describe('public booking announcements', () => {
     }, -123)).resolves.toBe(55);
     const edited = requests.filter((request) => request.url.endsWith('/editMessageText'));
     expect(edited.some((request) => request.body.chat_id === -123)).toBe(true);
+    expect(db.seen.some((query) => query.sql.includes('INSERT INTO pending_refreshes')
+      && query.args[0] === -999)).toBe(true);
 
     // Acting from the kicked chat itself, the failure still surfaces.
     await expect(updateBoard({

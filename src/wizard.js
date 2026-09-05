@@ -542,6 +542,11 @@ export async function handleBookingCallback(env, callback) {
       await answerCallback(env, callback.id, BOOKING_STARTED, true);
       return true;
     }
+    if (saved === 'played') {
+      await answerCallback(env, callback.id,
+        'That court has already finished, so it can no longer be edited.', true);
+      return true;
+    }
     if (!saved) {
       await answerCallback(env, callback.id, 'That booking no longer exists.', true);
       return true;

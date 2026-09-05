@@ -1814,7 +1814,7 @@ describe('Telegram commands', () => {
   describe('heartbeat', () => {
     // The heartbeat read takes no parameters, so first() is called without
     // bind() — the double supports both shapes, exactly as D1 does.
-    function heartbeatDb(beatAt) {
+    function heartbeatDb(beatAt, { failMaintenance = false } = {}) {
       const ran = [];
       return {
         ran,
@@ -1827,7 +1827,12 @@ describe('Telegram commands', () => {
               }
               return null;
             },
-            async all() { return { results: [] }; },
+            async all() {
+              if (failMaintenance && sql.includes('FROM booking_players AS p')) {
+                throw new Error('reminder query failed');
+              }
+              return { results: [] };
+            },
             async run() { ran.push(sql); return { meta: { changes: 1 } }; },
           };
           return statement;
@@ -1842,6 +1847,15 @@ describe('Telegram commands', () => {
         { waitUntil: (task) => tasks.push(task) });
       await Promise.all(tasks);
       expect(db.ran.some((sql) => sql.includes('INSERT INTO heartbeat'))).toBe(true);
+    });
+
+    it('withholds the success heartbeat when a maintenance stage fails', async () => {
+      const db = heartbeatDb(null, { failMaintenance: true });
+      const tasks = [];
+      await worker.scheduled({}, { BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: db },
+        { waitUntil: (task) => tasks.push(task) });
+      await Promise.all(tasks);
+      expect(db.ran.some((sql) => sql.includes('INSERT INTO heartbeat'))).toBe(false);
     });
 
     it('answers 200 at the root while the beat is fresh', async () => {

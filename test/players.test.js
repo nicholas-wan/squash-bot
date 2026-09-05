@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { joinPickerView } from '../src/bookings.js';
 import {
   adminAddPlayer, clearAdminCache, defaultCapacity, defaultPlayers, householdSlugs,
-  identity, isChatAdmin, ownerIdentity, rememberPlayer, seedRoster,
+  identity, isChatAdmin, matchesPlayer, ownerIdentity, rememberPlayer, seedRoster,
 } from '../src/players.js';
 
 afterEach(() => {
@@ -109,12 +109,27 @@ describe('player identity', () => {
     });
   });
 
+  it('does not hand a bound roster row to whoever claims its old username', () => {
+    const alice = { slug: '@alice', user_id: 42, name: '@alice' };
+    expect(matchesPlayer(alice, { id: 42, username: 'newalice' })).toBe(true);
+    expect(matchesPlayer(alice, { id: 99, username: 'alice' })).toBe(false);
+    // A config-seeded row has no stronger identity until that player appears.
+    expect(matchesPlayer({ ...alice, user_id: null }, { id: 42, username: 'alice' }))
+      .toBe(true);
+  });
+
   it('still reads the older id:Name and bare-id config forms', () => {
     expect(defaultPlayers({ DEFAULT_PLAYERS: '7:Nicholas,99' })).toEqual([
       { userId: 7, username: null, name: 'Nicholas', slug: 'u7' },
       { userId: 99, username: null, name: 'Player', slug: 'u99' },
     ]);
     expect(ownerIdentity({ OWNER_USER_ID: '7' }).slug).toBe('u7');
+  });
+
+  it('reads id:@handle as one live Telegram identity', () => {
+    expect(defaultPlayers({ DEFAULT_PLAYERS: '7:@Nicholas' })[0]).toEqual({
+      userId: 7, username: 'nicholas', name: '@Nicholas', slug: '@nicholas',
+    });
   });
 
   it('pins the organiser’s handle to their numeric id', () => {
@@ -294,6 +309,18 @@ describe('rosters', () => {
     await seedRoster({ ...env, DB: capturingDb(inserts) }, -123, 3,
       { id: 5, username: 'nicholaswan' }, 3);
     expect(inserts.map((args) => args[4])).toEqual(['@nicholaswan', '@dodgerblueee']);
+  });
+
+  it('does not count an id:@handle default as a second organiser seat', async () => {
+    const inserts = [];
+    const configured = {
+      OWNER: '@nicholaswan', OWNER_USER_ID: '246334575',
+      DEFAULT_PLAYERS: '246334575:@nicholaswan,174640019:@Dodgerblueee',
+      DB: capturingDb(inserts),
+    };
+    await seedRoster(configured, -123, 3,
+      { id: 246334575, username: 'nicholaswan' }, 3);
+    expect(inserts.map((args) => args[4])).toEqual(['@nicholaswan', '@Dodgerblueee']);
   });
 
   it('seats the organiser even when they are not in DEFAULT_PLAYERS', async () => {

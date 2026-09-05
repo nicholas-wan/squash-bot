@@ -238,14 +238,35 @@ describe('money tab', () => {
       };
     } }; } };
     const view = await myTabView({ ...env, DB: db }, -123, { id: 42, username: 'thadduu' });
-    // Slug or id, so history under an old username is still owned and shown.
+    // The immutable id owns linked history under both old and current handles;
+    // only an unclaimed legacy row may fall back to the current slug.
     const ledgerQuery = queries.find((query) => query.sql.includes('FROM ledger'));
-    expect(ledgerQuery.args).toEqual([-123, '@thadduu', 42]);
+    expect(ledgerQuery.args).toEqual([-123, 42, '@thadduu']);
     expect(view.html).toContain('Owed to Nicholas: <b>$3.00</b>');
     expect(view.html).toContain('• Squash · 30 Apr — $2.00');
     expect(view.html).toContain('• Court 4 · 11 May — $3.00');
     expect(view.html).toContain('• Cleared by Nicholas · 20 May — −$2.00');
     expect(view.html).toContain('Only you can see this.');
+  });
+
+  it('does not reveal history to a different account holding the old username', async () => {
+    const rows = [{
+      slug: '@alice', user_id: 42, name: '@alice', amount_cents: 200,
+      booking_id: 3, reason: 'Court 4 · 19 Aug', created_at: Date.now(),
+    }];
+    const db = { prepare(sql) { return { bind(...args) { return {
+      async first() { return sql.includes('SELECT tz') ? { tz: 'Asia/Singapore' } : null; },
+      async all() {
+        if (!sql.includes('FROM ledger')) return { results: [] };
+        return { results: rows.filter((row) => row.user_id === args[1]
+          || (row.user_id == null && row.slug === args[2])) };
+      },
+    }; } }; } };
+    const view = await myTabView(
+      { ...env, DB: db }, -123, { id: 99, username: 'alice' }
+    );
+    expect(view.html).toContain('never been charged');
+    expect(view.html).not.toContain('Court 4');
   });
 
   it('tells someone with no history that nothing is owed', async () => {

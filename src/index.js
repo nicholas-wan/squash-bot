@@ -276,6 +276,10 @@ async function moveSlot(env, callback, match) {
   else result = await leaveBooking(env, chatId, bookingId, callback.from);
   const replies = {
     already: ['You are already on that court.', true],
+    'identity-conflict': [
+      'That username is already tied to another player on this court. Ask an admin to update the roster.',
+      true,
+    ],
     absent: ['You were not on that court.', true],
     full: ['That court is full. A group admin can open another slot.', true],
     started: ['That court has already started, so the roster is locked.', true],
@@ -994,7 +998,11 @@ export default {
 
   async scheduled(_event, env, ctx) {
     ctx.waitUntil((async () => {
-      await Promise.all([runMaintenance(env), pruneBookingDrafts(env)]);
+      const [maintenance] = await Promise.all([runMaintenance(env), pruneBookingDrafts(env)]);
+      if (!maintenance.ok) {
+        console.log(`Maintenance heartbeat withheld: ${maintenance.failures.join('; ')}`);
+        return;
+      }
       // Stamped only after a full pass, so staleness at the root measures the
       // whole cron path — a sweep that hangs holds the beat back with it.
       await env.DB.prepare(

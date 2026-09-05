@@ -4,6 +4,7 @@ import { identity, isHouseholdPlayer, ownerName } from './players.js';
 import { boardChats, dataChatId } from './scope.js';
 import { getTimezone, updatePinnedMessage } from './settings.js';
 import { escapeHtml, OK_MARKUP } from './telegram.js';
+import { queuePinnedRefresh } from './refresh-queue.js';
 
 function shortDay(epochMs, tz) {
   return new Intl.DateTimeFormat('en-SG', {
@@ -37,12 +38,16 @@ export async function chargeBooking(env, booking, roster) {
       // allows only one per booking anyway — so the reason carries the count,
       // which is the only place a doubled charge can explain itself.
       const heads = player.heads || 1;
+      // New ledger rows are keyed on Telegram's immutable numeric id whenever
+      // one is known. A mutable username here would merge unrelated people when
+      // a renamed handle is claimed by somebody else.
+      const ledgerSlug = player.user_id ? `u${player.user_id}` : player.slug;
       const inserted = await env.DB.prepare(
         `INSERT OR IGNORE INTO ledger
           (chat_id, slug, user_id, name, amount_cents, booking_id, reason, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       ).bind(
-        booking.chat_id, player.slug, player.user_id || null, player.name,
+        booking.chat_id, ledgerSlug, player.user_id || null, player.name,
         share * heads, booking.id, heads > 1 ? `${reason} · for ${heads}` : reason, Date.now()
       ).run();
       charged += inserted.meta.changes ? 1 : 0;
@@ -177,9 +182,12 @@ export async function myTabView(env, chatId, from, isAdmin = false) {
   // split across two spellings explainable.
   const { results } = await env.DB.prepare(
     `SELECT * FROM ledger
-     WHERE chat_id = ? AND (slug = ? OR (user_id IS NOT NULL AND user_id = ?))
+     WHERE chat_id = ? AND (
+       (user_id IS NOT NULL AND user_id = ?)
+       OR (user_id IS NULL AND slug = ?)
+     )
      ORDER BY created_at, id`
-  ).bind(dataChatId(env, chatId), who.slug, who.userId || 0).all();
+  ).bind(dataChatId(env, chatId), who.userId || 0, who.slug).all();
 
   const lines = ['🧾 <b>Your squash tab</b>'];
   if (!results.length) {
@@ -271,6 +279,13 @@ export async function updateTab(env, chatId) {
       return { chat, error };
     }
   }));
+  for (const outcome of outcomes.filter((item) => item.error)) {
+    try {
+      await queuePinnedRefresh(env, outcome.chat, 'tab');
+    } catch (queueError) {
+      console.log(`Could not queue tab refresh for chat ${outcome.chat}: ${queueError.stack || queueError}`);
+    }
+  }
   for (const outcome of outcomes) {
     if (!outcome.error || outcome.chat === chatId) continue;
     console.log(

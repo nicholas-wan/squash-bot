@@ -1,12 +1,13 @@
 import {
   clearRoster, defaultCapacity, DEFAULT_CAPACITY, identity, isChatAdmin,
-  knownPlayers, MAX_CAPACITY, openBooking, rosterFor, rostersFor, seedRoster,
+  knownPlayers, matchesPlayer, MAX_CAPACITY, openBooking, rosterFor, rostersFor, seedRoster,
 } from './players.js';
 import { courtName, shortCourtName } from './format.js';
 import { allowedChats, boardChats, dataChatId, reachableChat, sharingData } from './scope.js';
 import { getTimezone, updatePinnedMessage } from './settings.js';
 import { breakdownLines, chargeBooking, tabBalances, updateTab } from './tab.js';
 import { formatDate, formatTime, localParts, zonedEpoch } from './time.js';
+import { queuePinnedRefresh } from './refresh-queue.js';
 import {
   deleteEphemeralMessage, deleteMessage, editReplyMarkup, escapeHtml, mentionHtml,
   OK_MARKUP, sendMessage,
@@ -32,16 +33,47 @@ function bookingSnapshot(booking) {
 async function recordAudit(
   env, bookingId, chatId, action, from, sourceText, before = null, after = null
 ) {
-  await env.DB.prepare(
-    `INSERT INTO booking_audit
-      (booking_id, chat_id, action, actor_user_id, actor_name, source_text,
-       before_json, after_json, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).bind(
+  await auditStatement(env, bookingId, chatId, action, from, sourceText, before, after).run();
+}
+
+function auditStatement(
+  env, bookingId, chatId, action, from, sourceText, before = null, after = null,
+  { requireBooking = false, requireState = null } = {}
+) {
+  const sql = requireState
+    ? `INSERT INTO booking_audit
+        (booking_id, chat_id, action, actor_user_id, actor_name, source_text,
+         before_json, after_json, created_at)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+       WHERE EXISTS (
+         SELECT 1 FROM bookings
+         WHERE id = ? AND chat_id = ? AND court = ?
+           AND starts_at = ? AND ends_at = ? AND reminder_at = ?
+       )`
+    : requireBooking
+    ? `INSERT INTO booking_audit
+        (booking_id, chat_id, action, actor_user_id, actor_name, source_text,
+         before_json, after_json, created_at)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+       WHERE EXISTS (SELECT 1 FROM bookings WHERE id = ? AND chat_id = ?)`
+    : `INSERT INTO booking_audit
+        (booking_id, chat_id, action, actor_user_id, actor_name, source_text,
+         before_json, after_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+  const args = [
     bookingId, dataChatId(env, chatId), action, from && from.id || null, actorName(from),
     sourceText || null, before ? JSON.stringify(bookingSnapshot(before)) : null,
-    after ? JSON.stringify(bookingSnapshot(after)) : null, Date.now()
-  ).run();
+    after ? JSON.stringify(bookingSnapshot(after)) : null, Date.now(),
+  ];
+  if (requireState) {
+    args.push(
+      bookingId, dataChatId(env, chatId), String(requireState.court),
+      requireState.startsAt, requireState.endsAt, requireState.reminderAt
+    );
+  } else if (requireBooking) {
+    args.push(bookingId, dataChatId(env, chatId));
+  }
+  return env.DB.prepare(sql).bind(...args);
 }
 
 export class BookingConflictError extends Error {
@@ -123,14 +155,45 @@ export async function addBooking(
     throw new BookingConflictError(await findBookingConflicts(env, chatId, parsed));
   }
   const bookingId = result.meta.last_row_id;
-  await recordAudit(env, bookingId, chatId, 'added', from, sourceText, null, parsed);
-  await seedRoster(env, chatId, bookingId, from, capacity, bookedFor);
-  await updateBoard(env, chatId);
+  try {
+    await recordAudit(env, bookingId, chatId, 'added', from, sourceText, null, parsed);
+    await seedRoster(env, chatId, bookingId, from, capacity, bookedFor);
+  } catch (error) {
+    // The booking insert has already committed. Compensate all of its internal
+    // rows so a transient audit/roster failure cannot leave a half-booking.
+    const cleanup = [
+      env.DB.prepare('DELETE FROM booking_players WHERE booking_id = ?').bind(bookingId),
+      env.DB.prepare("DELETE FROM booking_audit WHERE booking_id = ? AND action = 'added'").bind(bookingId),
+      env.DB.prepare('DELETE FROM bookings WHERE id = ? AND chat_id = ?')
+        .bind(bookingId, dataChatId(env, chatId)),
+    ];
+    for (const statement of cleanup) {
+      try {
+        await statement.run();
+      } catch (cleanupError) {
+        // Keep going: an unavailable audit table, for example, must not prevent
+        // the booking itself from being removed by the final statement.
+        console.log(`Compensation for booking ${bookingId} failed: ${cleanupError.stack || cleanupError}`);
+      }
+    }
+    throw error;
+  }
+  try {
+    await updateBoard(env, chatId);
+  } catch (error) {
+    // The booking is committed. Reporting the whole operation as failed invites
+    // a duplicate retry; updateBoard has queued a maintenance retry.
+    console.log(`Board refresh after adding booking ${bookingId} failed: ${error.stack || error}`);
+  }
   // Booked on behalf, the receipt is skipped: it would be an unprompted
   // ephemeral to somebody who tapped nothing — the kind Telegram drops.
   // The attribution is for the record, and the board carries the news.
   if (!bookedFor) {
-    await confirmToBooker(env, chatId, bookingId, parsed, capacity, from, callbackQueryId);
+    try {
+      await confirmToBooker(env, chatId, bookingId, parsed, capacity, from, callbackQueryId);
+    } catch (error) {
+      console.log(`Receipt for booking ${bookingId} failed: ${error.stack || error}`);
+    }
   }
   return bookingId;
 }
@@ -142,6 +205,10 @@ export async function updateBooking(
     .bind(id, dataChatId(env, chatId)).first();
   if (!before) return false;
   const now = Date.now();
+  // A stale form must not move a court after it has finished. In particular,
+  // an admin can open an edit during play and leave it on screen past the end;
+  // without this unconditional guard the already-played court escapes charging.
+  if (before.ends_at <= now) return 'played';
   // The form can be saved long after it was opened, so the start is checked
   // here as well as when the form is opened: without it a court that came into
   // play while somebody sat on the wizard could still be moved off the tab.
@@ -149,11 +216,11 @@ export async function updateBooking(
     return 'started';
   }
   const preReminderAt = parsed.startsAt - 2 * 60 * 60 * 1000;
-  const result = await env.DB.prepare(
+  const updateStatement = env.DB.prepare(
     `UPDATE bookings SET
        court = ?, starts_at = ?, ends_at = ?, reminder_at = ?,
        reminder_sent = ?, pre_reminder_at = ?, pre_reminder_sent = ?
-     WHERE id = ? AND chat_id = ? AND (
+     WHERE id = ? AND chat_id = ? AND ends_at > ? AND (
        ? = 1 OR NOT EXISTS (
          SELECT 1 FROM bookings AS other
          WHERE other.chat_id = ?
@@ -164,35 +231,67 @@ export async function updateBooking(
   ).bind(
     parsed.court, parsed.startsAt, parsed.endsAt, parsed.reminderAt,
     parsed.reminderAt <= now ? 1 : 0, preReminderAt,
-    preReminderAt <= now ? 1 : 0, id, dataChatId(env, chatId), allowConflict ? 1 : 0,
+    preReminderAt <= now ? 1 : 0, id, dataChatId(env, chatId), now, allowConflict ? 1 : 0,
     dataChatId(env, chatId), parsed.court, parsed.endsAt, parsed.startsAt, id
-  ).run();
+  );
+  const resetReminders = env.DB.prepare(
+    `UPDATE booking_players SET reminder_sent = ?, pre_reminder_sent = ?
+     WHERE booking_id = ? AND EXISTS (
+       SELECT 1 FROM bookings
+       WHERE id = ? AND chat_id = ? AND court = ?
+         AND starts_at = ? AND ends_at = ? AND reminder_at = ?
+     )`
+  ).bind(
+    parsed.reminderAt <= now ? 1 : 0, preReminderAt <= now ? 1 : 0,
+    id, id, dataChatId(env, chatId), String(parsed.court),
+    parsed.startsAt, parsed.endsAt, parsed.reminderAt
+  );
+  let result;
+  if (typeof env.DB.batch === 'function') {
+    const outcomes = await env.DB.batch([
+      updateStatement,
+      resetReminders,
+      auditStatement(env, id, chatId, 'edited', from, sourceText, before, parsed,
+        { requireState: parsed }),
+    ]);
+    result = outcomes[0];
+  } else {
+    result = await updateStatement.run();
+  }
   if (!result.meta.changes) {
+    const current = await env.DB.prepare(
+      'SELECT ends_at FROM bookings WHERE id = ? AND chat_id = ?'
+    ).bind(id, dataChatId(env, chatId)).first();
+    if (current && current.ends_at <= Date.now()) return 'played';
     const conflicts = await findBookingConflicts(env, chatId, parsed, id);
     if (conflicts.length) throw new BookingConflictError(conflicts);
     return false;
   }
   // The roster claims its own reminders, so a booking moved to another day has
   // to hand them back or everyone already told hears nothing about the new one.
-  await env.DB.prepare(
-    'UPDATE booking_players SET reminder_sent = ?, pre_reminder_sent = ? WHERE booking_id = ?'
-  ).bind(parsed.reminderAt <= now ? 1 : 0, preReminderAt <= now ? 1 : 0, id).run();
-  await recordAudit(env, id, chatId, 'edited', from, sourceText, before, parsed);
+  if (typeof env.DB.batch !== 'function') {
+    await resetReminders.run();
+    await recordAudit(env, id, chatId, 'edited', from, sourceText, before, parsed);
+  }
   // A moved court is news to everyone on it: the re-armed reminders would say
   // so eventually, but not before somebody plans their evening around the old
   // time. Old details ride along so the change reads as a change.
   const roster = await rosterFor(env, id);
-  if (roster.length) {
-    const tz = await getTimezone(env, chatId);
-    await notifyRosterDirectly(env, chatId, roster,
-      `✏️ <b>Booking changed</b> by <b>${escapeHtml(actorName(from) || 'an admin')}</b>\n` +
-      `Now: ${escapeHtml(courtName(parsed))} · ${formatDate(parsed.startsAt, tz)} · ` +
-      `${compactTimeRange(parsed.startsAt, parsed.endsAt, tz)}\n` +
-      `Was: ${escapeHtml(courtName(before))} · ${formatDate(before.starts_at, tz)} · ` +
-      `${compactTimeRange(before.starts_at, before.ends_at, tz)}`,
-      endOfLocalDay(parsed.startsAt, tz), from && from.id);
+  try {
+    if (roster.length) {
+      const tz = await getTimezone(env, chatId);
+      await notifyRosterDirectly(env, chatId, roster,
+        `✏️ <b>Booking changed</b> by <b>${escapeHtml(actorName(from) || 'an admin')}</b>\n` +
+        `Now: ${escapeHtml(courtName(parsed))} · ${formatDate(parsed.startsAt, tz)} · ` +
+        `${compactTimeRange(parsed.startsAt, parsed.endsAt, tz)}\n` +
+        `Was: ${escapeHtml(courtName(before))} · ${formatDate(before.starts_at, tz)} · ` +
+        `${compactTimeRange(before.starts_at, before.ends_at, tz)}`,
+        endOfLocalDay(parsed.startsAt, tz), from && from.id);
+    }
+    await updateBoard(env, chatId);
+  } catch (error) {
+    console.log(`Post-commit work for edited booking ${id} failed: ${error.stack || error}`);
   }
-  await updateBoard(env, chatId);
   return true;
 }
 
@@ -255,28 +354,46 @@ export async function cancelBooking(env, chatId, id, from = null, sourceText = n
   // Read before the delete: clearRoster is about to take the only record of
   // who needs to hear that this court is gone.
   const roster = await rosterFor(env, id);
-  const result = await env.DB.prepare('DELETE FROM bookings WHERE id = ? AND chat_id = ?')
-    .bind(id, dataChatId(env, chatId)).run();
+  const deleteBooking = env.DB.prepare('DELETE FROM bookings WHERE id = ? AND chat_id = ?')
+    .bind(id, dataChatId(env, chatId));
+  let result;
+  if (typeof env.DB.batch === 'function') {
+    const outcomes = await env.DB.batch([
+      auditStatement(env, id, chatId, 'deleted', from, sourceText, booking, null,
+        { requireBooking: true }),
+      env.DB.prepare('DELETE FROM booking_players WHERE booking_id = ?').bind(id),
+      deleteBooking,
+    ]);
+    result = outcomes[2];
+  } else {
+    result = await deleteBooking.run();
+  }
   if (!result.meta.changes) {
     return { allowed: false, status: 'gone', message: BOOKING_GONE, booking: null };
   }
   // A cancelled booking is never played, so it never reaches the tab.
-  await clearRoster(env, id);
-  await recordAudit(env, id, chatId, 'deleted', from, sourceText, booking, null);
+  if (typeof env.DB.batch !== 'function') {
+    await clearRoster(env, id);
+    await recordAudit(env, id, chatId, 'deleted', from, sourceText, booking, null);
+  }
   // The roster hears before the board is touched, for the same reason a join
   // notice does: a board Telegram refuses to edit must not swallow the one
   // message that stops somebody showing up to a cancelled court. Their morning
   // reminder may already be in hand; silence here is how no-shows happen.
-  if (roster.length) {
-    const tz = await getTimezone(env, chatId);
-    await notifyRosterDirectly(env, chatId, roster,
-      `🗑 <b>Cancelled</b> — ${escapeHtml(courtName(booking))}\n` +
-      `${formatDate(booking.starts_at, tz)} · ` +
-      `${compactTimeRange(booking.starts_at, booking.ends_at, tz)}` +
-      (from ? `\nCancelled by <b>${escapeHtml(actorName(from))}</b>.` : ''),
-      endOfLocalDay(booking.starts_at, tz), from && from.id);
+  try {
+    if (roster.length) {
+      const tz = await getTimezone(env, chatId);
+      await notifyRosterDirectly(env, chatId, roster,
+        `🗑 <b>Cancelled</b> — ${escapeHtml(courtName(booking))}\n` +
+        `${formatDate(booking.starts_at, tz)} · ` +
+        `${compactTimeRange(booking.starts_at, booking.ends_at, tz)}` +
+        (from ? `\nCancelled by <b>${escapeHtml(actorName(from))}</b>.` : ''),
+        endOfLocalDay(booking.starts_at, tz), from && from.id);
+    }
+    await updateBoard(env, chatId);
+  } catch (error) {
+    console.log(`Post-commit work for cancelled booking ${id} failed: ${error.stack || error}`);
   }
-  await updateBoard(env, chatId);
   return { allowed: true, status: 'cancelled', message: '', booking };
 }
 
@@ -391,8 +508,6 @@ export async function joinPickerView(env, chatId, from, isAdmin = false, now = D
   // round trip it hides costs no extra wall clock. isChatAdmin never rejects,
   // which is what makes the early return above safe to leave it unawaited.
   isAdmin = await isAdmin;
-  const mySlug = identity(from).slug;
-
   const rows = [];
   // Every court the board lists appears here too, full ones marked rather than
   // hidden: a court you can see pinned and then cannot find in this list reads
@@ -407,7 +522,7 @@ export async function joinPickerView(env, chatId, from, isAdmin = false, now = D
       `${compactTimeRange(booking.starts_at, booking.ends_at, tz)} · ` +
       `${shortCourtName(booking)}`;
     const free = Math.max(0, capacity - rosterHeads(roster));
-    if (roster.some((player) => player.slug === mySlug)) {
+    if (roster.some((player) => matchesPlayer(player, from))) {
       rows.push([{ text: `🚪 Leave ${label}`, callback_data: `sb:leave:${booking.id}` }]);
     } else if (free) {
       rows.push([{
@@ -435,7 +550,7 @@ export async function joinPickerView(env, chatId, from, isAdmin = false, now = D
   // board names nobody, so this is the only place either of them can read it.
   for (const booking of bookings.slice(0, MAX_JOIN_BUTTONS)) {
     const roster = rosters.get(booking.id) || [];
-    if (!isAdmin && !roster.some((player) => player.slug === mySlug)) continue;
+    if (!isAdmin && !roster.some((player) => matchesPlayer(player, from))) continue;
     lines.push('');
     lines.push(`${shortDate(booking.starts_at, tz)} · ` +
       `${shortClock(booking.starts_at, tz)} · <b>${escapeHtml(courtName(booking))}</b>`);
@@ -505,6 +620,13 @@ export async function updateBoard(env, chatId, now = Date.now()) {
       return { chat, error };
     }
   }));
+  for (const outcome of outcomes.filter((item) => item.error)) {
+    try {
+      await queuePinnedRefresh(env, outcome.chat, 'board');
+    } catch (queueError) {
+      console.log(`Could not queue board refresh for chat ${outcome.chat}: ${queueError.stack || queueError}`);
+    }
+  }
   for (const outcome of outcomes) {
     if (!outcome.error || outcome.chat === chatId) continue;
     console.log(
@@ -706,7 +828,10 @@ async function notifyRosterDirectly(env, chatId, roster, html, deleteAfter, excl
     return sendPrivately(env, chatId, html, player.user_id, deleteAfter,
       { replyMarkup: OK_MARKUP, cleanups });
   }));
-  if (cleanups.length) await env.DB.batch(cleanups);
+  if (cleanups.length) {
+    if (typeof env.DB.batch === 'function') await env.DB.batch(cleanups);
+    else for (const statement of cleanups) await statement.run();
+  }
 }
 
 // The person taken off is told privately. Deliberately narrower than the
@@ -818,7 +943,10 @@ export async function notifyRosterOfChange(
         callbackQueryId: send.isActor ? send.callbackQueryId : null,
       }),
   })));
-  if (cleanups.length) await env.DB.batch(cleanups);
+  if (cleanups.length) {
+    if (typeof env.DB.batch === 'function') await env.DB.batch(cleanups);
+    else for (const statement of cleanups) await statement.run();
+  }
   // Admin actions report whether their subject and the rest of the court were
   // actually reached rather than claiming success for a refused private send.
   return {
@@ -942,25 +1070,26 @@ async function remindPublicly(env, booking, roster, headline, tz) {
 
 // Maintenance has no incoming update to tell it which chat it is running for, so
 // each sweep is scoped the way handleUpdate is. Sharing mode files rows under
-// DATA_CHAT_ID, which need not be one of the allowed chats itself. With
-// ALLOWED_CHATS unset the sweep stays unscoped, as it has always been.
+// DATA_CHAT_ID, which need not be one of the allowed chats itself. An empty or
+// malformed allowlist must fail closed: interactive updates already refuse it,
+// and maintenance must not keep charging historical chats behind their back.
 function maintenanceChats(env) {
   const allowed = allowedChats(env);
-  if (!allowed.length) return null;
+  if (!allowed.length) return [];
   const shared = sharingData(env);
   return shared ? [...new Set([shared, ...allowed])] : allowed;
 }
 
 function chatScope(env, column) {
   const chats = maintenanceChats(env);
-  if (!chats) return { sql: '', args: [] };
+  if (!chats.length) return { sql: ' AND 1 = 0', args: [] };
   return { sql: ` AND ${column} IN (${chats.map(() => '?').join(', ')})`, args: chats };
 }
 
 // Telegram refuses to delete a message that is already gone, which is the same
 // outcome as deleting it, so the row goes on either of these.
 const ALREADY_DELETED =
-  /not found|can't be deleted|MESSAGE_ID_INVALID|message to delete not found/i;
+  /not found|MESSAGE_NOT_FOUND|can't be deleted|MESSAGE_ID_INVALID|message to delete not found/i;
 
 // A row Telegram keeps failing on is kept and retried, but not forever: a day
 // past its due time it is dropped anyway. These messages are about one day,
@@ -970,6 +1099,7 @@ const ALREADY_DELETED =
 const PURGE_GIVE_UP_MS = 24 * 60 * 60 * 1000;
 
 async function purgeFinishedMessages(env, now) {
+  let failures = 0;
   const scope = chatScope(env, 'chat_id');
   const { results } = await env.DB.prepare(
     `SELECT * FROM sent_messages WHERE delete_after <= ?${scope.sql}
@@ -986,11 +1116,15 @@ async function purgeFinishedMessages(env, now) {
         || ALREADY_DELETED.test(String(outcome.description || ''));
       if (gone || row.delete_after <= now - PURGE_GIVE_UP_MS) {
         await env.DB.prepare('DELETE FROM sent_messages WHERE id = ?').bind(row.id).run();
+      } else {
+        failures += 1;
       }
     } catch (error) {
+      failures += 1;
       console.log(`Reminder cleanup ${row.id} failed: ${error.stack || error}`);
     }
   }
+  return failures;
 }
 
 // One claim per player, so someone who joins after the first reminder has gone
@@ -1010,6 +1144,7 @@ async function sendClaimedReminders(env, now, column, headline) {
   ).bind(now, now, ...scope.args).all();
 
   const rosters = new Map();
+  let failures = 0;
   for (const row of results) {
     try {
       const claim = await env.DB.prepare(
@@ -1048,16 +1183,20 @@ async function sendClaimedReminders(env, now, column, headline) {
           await env.DB.prepare(
             `UPDATE booking_players SET ${column}_sent = 0 WHERE booking_id = ?`
           ).bind(row.id).run();
+          failures += 1;
         }
         continue;
       }
       await env.DB.prepare(
         `UPDATE booking_players SET ${column}_sent = 0 WHERE id = ?`
       ).bind(row.player_row_id).run();
+      failures += 1;
     } catch (error) {
+      failures += 1;
       console.log(`${column} reminder for player ${row.player_row_id} failed: ${error.stack || error}`);
     }
   }
+  return failures;
 }
 
 // Bookings made before rosters existed have nobody to remind individually, so
@@ -1071,6 +1210,7 @@ async function remindRosterlessBookings(env, now, column, headline) {
      ORDER BY b.${column}_at LIMIT 100`
   ).bind(now, now, ...scope.args).all();
 
+  let failures = 0;
   for (const booking of results) {
     try {
       const claim = await env.DB.prepare(
@@ -1088,25 +1228,32 @@ async function remindRosterlessBookings(env, now, column, headline) {
         endOfLocalDay(booking.starts_at, tz), { replyMarkup: OK_MARKUP }
       );
       if (outcome === 'not-ephemeral') {
-        await remindPublicly(env, booking, roster, headline, tz);
+        if (!(await remindPublicly(env, booking, roster, headline, tz))) {
+          await env.DB.prepare(`UPDATE bookings SET ${column}_sent = 0 WHERE id = ?`)
+            .bind(booking.id).run();
+          failures += 1;
+        }
       } else if (outcome === 'failed') {
         // Only a transient failure is handed back. A refusal — blocked, gone,
         // never reachable — would come back the same every minute, so the flag
         // stays spent there, the same as on the roster path.
         await env.DB.prepare(`UPDATE bookings SET ${column}_sent = 0 WHERE id = ?`)
           .bind(booking.id).run();
+        failures += 1;
       } else if (outcome === 'refused') {
         console.log(`${column} reminder ${booking.id} refused by Telegram; not retried`);
       }
     } catch (error) {
+      failures += 1;
       console.log(`${column} reminder ${booking.id} failed: ${error.stack || error}`);
     }
   }
+  return failures;
 }
 
 async function sendReminders(env, now, column, headline) {
-  await sendClaimedReminders(env, now, column, headline);
-  await remindRosterlessBookings(env, now, column, headline);
+  return (await sendClaimedReminders(env, now, column, headline))
+    + (await remindRosterlessBookings(env, now, column, headline));
 }
 
 function sendDueReminders(env, now) {
@@ -1123,6 +1270,7 @@ async function removeExpiredBookings(env, now) {
     `SELECT * FROM bookings WHERE ends_at <= ?${scope.sql} ORDER BY chat_id, id`
   ).bind(now, ...scope.args).all();
   const chatIds = [...new Set(expired.map((booking) => booking.chat_id))];
+  let failures = 0;
   for (const chatId of chatIds) {
     // The money comes first and in its own scope. A board that cannot be pinned
     // — deleted message, revoked permission — used to throw here and silently
@@ -1142,6 +1290,7 @@ async function removeExpiredBookings(env, now) {
           );
         }
       } catch (error) {
+        failures += 1;
         console.log(`Cleanup of booking ${booking.id} failed: ${error.stack || error}`);
       }
     }
@@ -1149,9 +1298,11 @@ async function removeExpiredBookings(env, now) {
       await updateBoard(env, chatId, now);
       if (charged) await updateTab(env, chatId);
     } catch (error) {
+      failures += 1;
       console.log(`Pinned message refresh for chat ${chatId} failed: ${error.stack || error}`);
     }
   }
+  return failures;
 }
 
 // "in 5 days" is only true on the day it was written. Nothing else touches a
@@ -1163,6 +1314,7 @@ async function removeExpiredBookings(env, now) {
 // next midnight, and one transient failure is not worth a day of lying.
 // Success trades the hour stamp for the day's, which ends the retrying.
 async function refreshStaleBoards(env, now) {
+  let failures = 0;
   for (const chatId of allowedChats(env)) {
     try {
       const tz = await getTimezone(env, chatId);
@@ -1180,33 +1332,61 @@ async function refreshStaleBoards(env, now) {
       await env.DB.prepare('UPDATE settings SET board_day = ? WHERE chat_id = ?')
         .bind(today, chatId).run();
     } catch (error) {
+      failures += 1;
       // One chat's dead board is its own problem; the others still redraw.
       console.log(`Daily board redraw for chat ${chatId} failed: ${error.stack || error}`);
     }
   }
+  return failures;
+}
+
+async function flushPendingRefreshes(env) {
+  const chats = allowedChats(env);
+  if (!chats.length) return 0;
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM pending_refreshes
+     WHERE chat_id IN (${chats.map(() => '?').join(', ')})
+     ORDER BY updated_at LIMIT 50`
+  ).bind(...chats).all();
+  let failures = 0;
+  for (const row of results) {
+    try {
+      if (row.board) await updateBoard(env, row.chat_id);
+      if (row.tab) await updateTab(env, row.chat_id);
+      await env.DB.prepare('DELETE FROM pending_refreshes WHERE chat_id = ?')
+        .bind(row.chat_id).run();
+    } catch (error) {
+      failures += 1;
+      console.log(`Queued pinned refresh for chat ${row.chat_id} failed: ${error.stack || error}`);
+    }
+  }
+  return failures;
 }
 
 // Once a month, everyone still owing hears their own total — in the group, as
 // an ephemeral message only they can see, the same as every other private
 // note. The bot doing the asking is the point: nobody has to be the naggy one.
-// The month is stamped before sending so a retried cron cannot ask twice, and
-// nothing goes out before 9am local.
+// Delivery is claimed per debtor, so retries do not duplicate copies which
+// already arrived. Nothing goes out before 9am local.
 async function sendMonthlyTabNotices(env, now) {
   const chats = allowedChats(env);
-  if (!chats.length) return;
+  if (!chats.length) return 0;
   // One pass per set of books: the single shared ledger under DATA_CHAT_ID, or
   // each chat's own when nothing is shared. The old shape served only
   // chats[0], which silently skipped every other unshared chat's debtors.
   const dataChats = [...new Set(chats.map((chat) => dataChatId(env, chat)))];
+  let failures = 0;
   for (const chatId of dataChats) {
     try {
-      await sendMonthlyTabNoticesFor(
+      failures += Number(await sendMonthlyTabNoticesFor(
         env, now, chatId, chats.includes(chatId) ? chatId : chats[0]
-      );
+      )) || 0;
     } catch (error) {
+      failures += 1;
       console.log(`Monthly tab notices for chat ${chatId} failed: ${error.stack || error}`);
     }
   }
+  return failures;
 }
 
 async function sendMonthlyTabNoticesFor(env, now, chatId, fallbackChat) {
@@ -1218,18 +1398,39 @@ async function sendMonthlyTabNoticesFor(env, now, chatId, fallbackChat) {
     'SELECT nudged_month FROM settings WHERE chat_id = ?'
   ).bind(chatId).first();
   if (setting && setting.nudged_month === month) return;
-  await env.DB.prepare(
-    `INSERT INTO settings (chat_id, nudged_month) VALUES (?, ?)
-     ON CONFLICT(chat_id) DO UPDATE SET nudged_month = excluded.nudged_month`
-  ).bind(chatId, month).run();
   const monthName = new Intl.DateTimeFormat('en-SG', {
     timeZone: tz, month: 'long', year: 'numeric',
   }).format(new Date(now));
   const deleteAfter = endOfLocalDay(now, tz);
+  let failures = 0;
+  let pending = false;
   for (const entry of await tabBalances(env, chatId)) {
     // A row without a numeric id cannot be reached until that player posts
     // once; the pinned tab still names them.
-    if (entry.balance <= 0 || !entry.user_id) continue;
+    if (entry.balance <= 0) continue;
+    if (!entry.user_id) {
+      pending = true;
+      continue;
+    }
+    // A cron overlap, deploy, or timeout may leave a row in "sending". Five
+    // minutes later it is claimable again; delivered/refused rows are terminal.
+    const claim = await env.DB.prepare(
+      `INSERT INTO monthly_notice_deliveries
+        (chat_id, month, slug, status, last_attempt_at, delivered_at, last_error)
+       VALUES (?, ?, ?, 'sending', ?, NULL, NULL)
+       ON CONFLICT(chat_id, month, slug) DO UPDATE SET
+         status = 'sending', last_attempt_at = excluded.last_attempt_at, last_error = NULL
+       WHERE monthly_notice_deliveries.status NOT IN ('delivered', 'refused')
+         AND monthly_notice_deliveries.last_attempt_at <= ?`
+    ).bind(chatId, month, entry.slug, now, now - 5 * 60 * 1000).run();
+    if (!claim.meta.changes) {
+      const delivery = await env.DB.prepare(
+        `SELECT status FROM monthly_notice_deliveries
+         WHERE chat_id = ? AND month = ? AND slug = ?`
+      ).bind(chatId, month, entry.slug).first();
+      if (!delivery || !['delivered', 'refused'].includes(delivery.status)) pending = true;
+      continue;
+    }
     // The ask arrives with its reasons: the same line-by-line story 🧾 My tab
     // tells, minus the rate card, so paying needs no second tap to trust.
     const { results: rows } = await env.DB.prepare(
@@ -1246,42 +1447,58 @@ async function sendMonthlyTabNoticesFor(env, now, chatId, fallbackChat) {
       'SELECT chat_id FROM booking_players WHERE user_id = ? ORDER BY id DESC LIMIT 1'
     ).bind(entry.user_id).first();
     const target = reachableChat(env, { chat_id: seat && seat.chat_id }, fallbackChat);
-    await sendPrivately(env, target, lines.join('\n'),
+    const outcome = await sendPrivately(env, target, lines.join('\n'),
       entry.user_id, deleteAfter, { replyMarkup: OK_MARKUP });
+    if (outcome === 'private' || outcome === 'refused') {
+      await env.DB.prepare(
+        `UPDATE monthly_notice_deliveries
+         SET status = ?, delivered_at = ?, last_error = NULL
+         WHERE chat_id = ? AND month = ? AND slug = ?`
+      ).bind(
+        outcome === 'private' ? 'delivered' : 'refused',
+        outcome === 'private' ? now : null,
+        chatId, month, entry.slug
+      ).run();
+      continue;
+    }
+    pending = true;
+    failures += 1;
+    await env.DB.prepare(
+      `UPDATE monthly_notice_deliveries
+       SET status = 'pending', last_error = ?
+       WHERE chat_id = ? AND month = ? AND slug = ?`
+    ).bind(`Telegram delivery ${outcome}`, chatId, month, entry.slug).run();
   }
+  if (!pending) {
+    await env.DB.prepare(
+      `INSERT INTO settings (chat_id, nudged_month) VALUES (?, ?)
+       ON CONFLICT(chat_id) DO UPDATE SET nudged_month = excluded.nudged_month`
+    ).bind(chatId, month).run();
+  }
+  return failures;
 }
 
 export async function runMaintenance(env, now = Date.now()) {
-  try {
-    await sendPreReminders(env, now);
-  } catch (error) {
-    console.log(`Two-hour reminder maintenance failed: ${error.stack || error}`);
+  const stages = [
+    ['two-hour reminders', () => sendPreReminders(env, now)],
+    ['queued pinned refreshes', () => flushPendingRefreshes(env)],
+    ['board refresh', () => refreshStaleBoards(env, now)],
+    ['monthly tab notices', () => sendMonthlyTabNotices(env, now)],
+    ['day reminders', () => sendDueReminders(env, now)],
+    ['message cleanup', () => purgeFinishedMessages(env, now)],
+    ['booking cleanup', () => removeExpiredBookings(env, now)],
+  ];
+  const failures = [];
+  for (const [name, run] of stages) {
+    try {
+      const count = Number(await run()) || 0;
+      if (count) failures.push(`${name}: ${count} failed item${count === 1 ? '' : 's'}`);
+    } catch (error) {
+      failures.push(`${name}: ${error.message || error}`);
+      console.log(`${name} maintenance failed: ${error.stack || error}`);
+    }
   }
-  try {
-    await refreshStaleBoards(env, now);
-  } catch (error) {
-    console.log(`Board refresh maintenance failed: ${error.stack || error}`);
-  }
-  try {
-    await sendMonthlyTabNotices(env, now);
-  } catch (error) {
-    console.log(`Monthly tab notice maintenance failed: ${error.stack || error}`);
-  }
-  try {
-    await sendDueReminders(env, now);
-  } catch (error) {
-    console.log(`Reminder maintenance failed: ${error.stack || error}`);
-  }
-  try {
-    await purgeFinishedMessages(env, now);
-  } catch (error) {
-    console.log(`Reminder cleanup failed: ${error.stack || error}`);
-  }
-  try {
-    await removeExpiredBookings(env, now);
-  } catch (error) {
-    console.log(`Cleanup maintenance failed: ${error.stack || error}`);
-  }
+  return { ok: failures.length === 0, failures };
 }
 
 export function isSameLocalDay(a, b, tz) {

@@ -97,6 +97,26 @@ CREATE TABLE IF NOT EXISTS heartbeat (
   beat_at INTEGER NOT NULL
 );
 
+-- Per-debtor delivery state makes monthly notices retryable without sending a
+-- second copy to people whose first copy already arrived.
+CREATE TABLE IF NOT EXISTS monthly_notice_deliveries (
+  chat_id INTEGER NOT NULL,
+  month TEXT NOT NULL,
+  slug TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('sending', 'pending', 'delivered', 'refused')),
+  last_attempt_at INTEGER NOT NULL,
+  delivered_at INTEGER,
+  last_error TEXT,
+  PRIMARY KEY (chat_id, month, slug)
+);
+
+CREATE TABLE IF NOT EXISTS pending_refreshes (
+  chat_id INTEGER PRIMARY KEY,
+  board INTEGER NOT NULL DEFAULT 0,
+  tab INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS booking_audit (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   booking_id INTEGER NOT NULL,
@@ -145,7 +165,17 @@ CREATE INDEX IF NOT EXISTS idx_ledger_chat
 CREATE INDEX IF NOT EXISTS idx_sent_messages_due
   ON sent_messages (delete_after);
 
+CREATE INDEX IF NOT EXISTS idx_monthly_notice_pending
+  ON monthly_notice_deliveries (chat_id, month, status, last_attempt_at);
+
 -- One charge per player per booking, so a retried cleanup cannot double bill.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_booking_slug
   ON ledger (booking_id, slug)
   WHERE booking_id IS NOT NULL;
+
+CREATE TRIGGER IF NOT EXISTS trg_bookings_delete_dependants
+AFTER DELETE ON bookings
+BEGIN
+  DELETE FROM booking_players WHERE booking_id = OLD.id;
+  DELETE FROM booking_drafts WHERE booking_id = OLD.id;
+END;
