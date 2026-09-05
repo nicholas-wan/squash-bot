@@ -37,6 +37,20 @@ export function playerName(from) {
   return identity(from).name;
 }
 
+// Usernames are mutable and may be reassigned by Telegram. Once a stored row
+// carries a numeric id, only that id proves ownership; matching the current
+// username as well would let the next holder of an old handle inherit a roster.
+// A slug is used only for legacy/config-seeded rows which have never been tied
+// to an account.
+export function matchesPlayer(player, from) {
+  if (!player || !from) return false;
+  const who = identity(from);
+  if (player.user_id) {
+    return Boolean(who.userId && Number(player.user_id) === Number(who.userId));
+  }
+  return player.slug === who.slug;
+}
+
 // Accepts "@username", a numeric id, "id:Name", or a bare name.
 function parsePlayer(entry) {
   const raw = String(entry).trim();
@@ -44,9 +58,16 @@ function parsePlayer(entry) {
   if (/^\d+$/.test(raw)) return identity({ id: Number(raw) });
   const separator = raw.indexOf(':');
   if (separator !== -1 && /^\d+$/.test(raw.slice(0, separator).trim())) {
+    const userId = Number(raw.slice(0, separator).trim());
+    const label = raw.slice(separator + 1).trim();
+    // `id:@handle` carries both halves of the same Telegram identity. Keep the
+    // handle as the slug used by live Telegram updates and retain the numeric
+    // id as the authoritative ownership check. A plain `id:Name` remains the
+    // legacy no-username form below.
+    if (label.startsWith('@')) return identity({ id: userId, username: label });
     return identity({
-      id: Number(raw.slice(0, separator).trim()),
-      first_name: raw.slice(separator + 1).trim() || 'Player',
+      id: userId,
+      first_name: label || 'Player',
     });
   }
   return identity({ first_name: raw });
@@ -212,7 +233,10 @@ async function addPlayer(env, chatId, bookingId, player, addedByUserId) {
 export async function seedRoster(env, chatId, bookingId, from, capacity, bookedFor = null) {
   const seats = [];
   const seat = (player) => {
-    if (player && !seats.some((seated) => seated.slug === player.slug)) seats.push(player);
+    if (player && !seats.some((seated) =>
+      seated.slug === player.slug ||
+      (seated.userId && player.userId && Number(seated.userId) === Number(player.userId))
+    )) seats.push(player);
   };
   // Booked on behalf, the named booker takes the booker's seat — they may
   // carry no numeric id yet, exactly like a config-seeded player.
@@ -283,9 +307,14 @@ export async function joinBooking(env, chatId, bookingId, from) {
   ).run();
   if (joined.meta.changes) return { status: 'joined', booking };
   const existing = await env.DB.prepare(
-    'SELECT id FROM booking_players WHERE booking_id = ? AND slug = ?'
+    'SELECT id, slug, user_id FROM booking_players WHERE booking_id = ? AND slug = ?'
   ).bind(bookingId, who.slug).first();
-  return { status: existing ? 'already' : 'full', booking };
+  return {
+    status: existing
+      ? (matchesPlayer(existing, from) ? 'already' : 'identity-conflict')
+      : 'full',
+    booking,
+  };
 }
 
 // One shared button per court, doing opposite things to the two kinds of person
@@ -294,7 +323,7 @@ export async function toggleBooking(env, chatId, bookingId, from) {
   const booking = await openBooking(env, chatId, bookingId);
   if (!booking) return { status: 'gone', left: false };
   const roster = await rosterFor(env, bookingId);
-  const onIt = roster.some((player) => player.slug === identity(from).slug);
+  const onIt = roster.some((player) => matchesPlayer(player, from));
   return onIt
     ? leaveBooking(env, chatId, bookingId, from)
     : joinBooking(env, chatId, bookingId, from);
@@ -305,8 +334,11 @@ export async function leaveBooking(env, chatId, bookingId, from) {
   if (!booking) return { status: 'gone' };
   if (booking.starts_at <= Date.now()) return { status: 'started', booking };
   const removed = await env.DB.prepare(
-    'DELETE FROM booking_players WHERE booking_id = ? AND slug = ?'
-  ).bind(bookingId, identity(from).slug).run();
+    `DELETE FROM booking_players
+     WHERE booking_id = ? AND (
+       (user_id IS NULL AND slug = ?) OR user_id = ?
+     )`
+  ).bind(bookingId, identity(from).slug, from && from.id || 0).run();
   return { status: removed.meta.changes ? 'left' : 'absent', booking };
 }
 

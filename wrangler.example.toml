@@ -12,13 +12,13 @@ OWNER = "@nicholaswan"
 # rights and their free play, and hands both to whoever takes the old handle.
 # OWNER_USER_ID = "123456789"
 OWNER_NAME = "Nicholas"
-# Players added to every new booking. Usernames are the stable key: a player
-# named here is the same person who later taps join. "123:Name" also works for
-# anyone without a username.
-DEFAULT_PLAYERS = "@nicholaswan,@Dodgerblueee"
+# Players added to every new booking. Use the numeric Telegram id as the stable
+# key and keep the handle after the colon as its display name.
+# Numeric ids make these identities safe across username changes or reuse.
+DEFAULT_PLAYERS = "123456789:@nicholaswan,987654321:@Dodgerblueee"
 # Optional. Plays for free but is not added to every booking. Anyone left out of
 # here and DEFAULT_PLAYERS is billed their share of every court they play.
-# UNBILLED_PLAYERS = "@gabrielwann"
+# UNBILLED_PLAYERS = "456789123:@gabrielwann"
 # Players per court before a group admin opens more slots.
 DEFAULT_CAPACITY = "3"
 # Optional. Set this to one of the ALLOWED_CHATS ids to make every listed group

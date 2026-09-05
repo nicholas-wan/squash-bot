@@ -71,9 +71,12 @@ land in whichever group that member was first seen in. The cost is that somebody
 who is only in the other group hears nothing. Reminders still follow the row,
 having no tap to take their bearings from.
 
-Every booking seats `DEFAULT_PLAYERS` plus whoever booked it. Players are keyed
-on their Telegram username, so someone named in config is the same person who
-later taps a button; anyone without a username is keyed on their numeric id.
+Every booking seats `DEFAULT_PLAYERS` plus whoever booked it. A numeric Telegram
+id is authoritative once it is known: a later holder of the same username cannot
+inherit that player's roster or private tab. Username-only config entries remain
+provisional until that person first posts, so use `id:Name` entries for every
+seeded or unbilled player when identity reuse must be prevented. New ledger charges use numeric identities;
+usernames are display names rather than ownership proof.
 A group admin can record somebody else as the booker from the confirm form —
 that person is seated and billed as the booker and may cancel the court, while
 the audit row still names the admin. Attribution is for the record: only the
@@ -107,15 +110,17 @@ sends anyone their own private breakdown — every charge and payment since
 they last settled, and never less than the last two weeks, so settling up
 does not erase the recent record of who played what. Older settled history
 is counted rather than replayed, because an append-only ledger rendered
-whole would outgrow a Telegram message within a year. Rows are matched by
-username or id so history under an old handle is still owned and shown. Group admins additionally get a row per open balance
+whole would outgrow a Telegram message within a year. Rows tied to an account are
+matched by numeric id, so history under an old handle is still owned without
+exposing it to a new holder of that handle. Group admins additionally get a row per open balance
 under their own breakdown, each opening that person's tab, since collecting
 is their job; members can never see anyone else's. Clearing a balance sends
 the debtor a private receipt, and once a month — the first cron tick past 9am
 local — everyone still owing gets their itemised balance the same private way,
 so the bot does the asking rather than a person, and the ask arrives with its
-reasons. Both need the debtor's numeric
-id, so a config-seeded player hears nothing until they post once.
+reasons. Delivery is tracked per debtor: transient failures are retried without
+resending notices that already arrived. Both need the debtor's numeric id, so a
+config-seeded player hears nothing until they post once.
 
 The 2026 holiday list in `src/pricing.js` should be checked against mom.gov.sg
 each December. `PUBLIC_HOLIDAYS` replaces that list rather than adding to it, so
@@ -177,7 +182,7 @@ admins. Once the court starts, only a group admin can change or cancel it: the
 tab is charged when the booking expires, so a cancellation during the hour of
 play — or a move to tomorrow and a cancellation there — would erase everyone's
 share of a court that was played. A court that has already been played cannot be
-cancelled at all, by anybody; it has to reach the tab.
+edited or cancelled at all, by anybody; it has to reach the tab.
 
 ## Configuration
 
@@ -185,11 +190,11 @@ cancelled at all, by anybody; it has to reach the tab.
 
 | Var | Meaning |
 |---|---|
-| `ALLOWED_CHATS` | Group ids the bot answers in. Every other chat is ignored |
+| `ALLOWED_CHATS` | Group ids the bot answers in. Every other chat is ignored. Empty or invalid configuration also stops maintenance; it never falls back to sweeping every stored chat |
 | `DATA_CHAT_ID` | Optional. Makes every listed group share one set of bookings, rosters, history, and one tab. A storage key, not an address: it need not be a chat the bot is still in, and messages are never aimed at it unless it is also allowed |
 | `OWNER`, `OWNER_NAME` | Who pays the courts. Always an admin, never billed. Set `OWNER_USER_ID` to their numeric id alongside it: a Telegram handle can be changed and then claimed by somebody else, and the id is what keeps the owner an admin and off the tab across a rename. `OWNER_USER_ID` is read as an alias when `OWNER` is unset |
-| `DEFAULT_PLAYERS` | Seated on every new booking, never billed |
-| `UNBILLED_PLAYERS` | Never billed, but not seated automatically |
+| `DEFAULT_PLAYERS` | Seated on every new booking, never billed. Use `123456789:@handle` for takeover-resistant identity; a username alone is provisional until first contact |
+| `UNBILLED_PLAYERS` | Never billed, but not seated automatically. Use the same numeric-id form |
 | `DEFAULT_CAPACITY` | Players per court before an admin opens more (default 3) |
 | `PUBLIC_HOLIDAYS` | Optional `YYYY-MM-DD` list replacing the built-in one |
 | `DEFAULT_TIMEZONE` | Defaults to `Asia/Singapore` |
@@ -248,8 +253,10 @@ response (Bot API, "Making requests when getting updates") instead of a
 separate round trip, and each tap logs its colo and duration — one line in
 `npx wrangler tail` — so "is it slow" is always answerable with a number.
 
-The root URL is a health check: 200 while the every-minute maintenance tick
-is fresh, 500 once it is five minutes stale or the database is unreachable —
+The root URL is a health check: 200 while a fully successful every-minute
+maintenance tick is fresh. A failed reminder, board, notice, cleanup, charging,
+or database stage withholds the success heartbeat; the URL turns 500 once the
+last successful pass is five minutes old —
 point any uptime pinger at it. `npm run deploy` refuses to ship a red test
 suite; every Telegram call is bounded at fifteen seconds so a stalled fetch
 fails loudly instead of dying silently with the isolate.
@@ -268,12 +275,15 @@ npm run db:migrate:003
 npm run db:migrate:004
 npm run db:migrate:005
 npm run db:migrate:006
+npm run db:migrate:007
+npm run db:migrate:008
+npm run db:migrate:009
 npm run db:verify
 ```
 
 Run them in that order. Everything the migrations used to create now lives in
-`schema.sql`, leaving 002, 003, 005, and 006 as `ALTER TABLE` alone and 004 as a
-no-op,
+`schema.sql`, leaving 002, 003, 005, and 006 as `ALTER TABLE` alone, 004 as a
+no-op, and 007–009 as idempotent table/index/trigger migrations,
 because `wrangler d1 execute --file` is atomic: one failed statement rolls the
 whole file back, so a `CREATE` sharing a file with an `ALTER` would be skipped on
 a re-run rather than applied. That is what makes a re-run harmless — an already
@@ -289,9 +299,9 @@ same atomicity can leave a hand-patched database short: a file whose first
 
 Found by review, none of them load-bearing enough to hold a release:
 
-- A username change re-keys a player's roster rows but not their `ledger`
-  history, so someone who played before setting a username can appear on the tab
-  as two entries. Both are real and both settle; the totals are right.
+- Legacy ledger rows created under username slugs are not rewritten. The private
+  breakdown follows their numeric id safely, but the shared tab can show an old
+  username and the newer numeric-keyed balance as two entries until both settle.
 - `getTimezone` reads a `tz` of `Asia/Singapore` as "never set" so
   `DEFAULT_TIMEZONE` stays reachable. Nothing writes `tz` today, but a future
   per-chat override set to Singapore would be ignored.
@@ -301,15 +311,14 @@ Found by review, none of them load-bearing enough to hold a release:
   because a bare hour range does not count as a clock time.
 - A receipt or a removal notice that Telegram will not deliver privately is
   deleted rather than posted, so it can end up sent to nobody.
-- A board or tab in a chat the bot cannot post to is logged and skipped, never
-  retried in place: it catches up on the next natural refresh after the bot is
-  re-added. Only the chat a tap came from fails loudly.
+- A board or tab in a chat the bot cannot post to is logged and queued for a
+  maintenance retry. A permanently removed chat keeps that retry pending until
+  it is removed from `ALLOWED_CHATS` or the bot is re-added.
 - A chat dropped from `ALLOWED_CHATS` keeps its rows: they stop being charged and
   its old messages stop being purged.
-- Leaving deletes roster rows by current username, so a row seeded from a handle
-  its owner has since changed — carrying no numeric id to merge on — survives
-  their Leave. The confirmation says they are off while the ghost row still
-  holds a slot; an admin can take it off from ⚙️ Manage.
+- A username-only roster row whose owner changes handle before ever posting has
+  no numeric identity to reconnect it. Leave now reports that the player was not
+  found instead of claiming success; an admin can remove the provisional row.
 - An admin taking a player off tells only that player. The rest of the court
   hears about voluntary joins and leaves, but not about the slot a kick frees.
 - A reminder Telegram refuses for good — blocked, left the group, no such user —
