@@ -85,6 +85,7 @@ function draftDb(state) {
           }
           if (sql.startsWith('INSERT OR IGNORE INTO booking_players')) {
             (state.seated = state.seated || []).push(args[3]);
+            (state.roster = state.roster || []).push({ slug: args[3], heads: args[6] });
             return { meta: { changes: 1 } };
           }
           return { meta: { changes: 1 } };
@@ -164,6 +165,18 @@ describe('booking wizard save', () => {
     expect(state.seated[0]).toBe('@alice');
     // Record-keeping, not a notification: no receipt goes anywhere.
     expect(requests.some((request) => request.url.endsWith('/sendMessage'))).toBe(false);
+  });
+
+  it.each([
+    [{ players: [{ slug: '@alice', name: '@alice', userId: null }] },
+      [{ slug: 'u7', heads: 1 }, { slug: '@alice', heads: 1 }]],
+    [{ plusOne: true }, [{ slug: 'u7', heads: 2 }]],
+  ])('saves companions from the confirmation draft', async (companions, expected) => {
+    captureTelegram();
+    const state = { payload: { ...completePayload(), companions }, pending: null };
+    await handleBookingCallback({ BOT_TOKEN: 'test', DB: draftDb(state) }, confirmTap('bw:1:y'));
+    expect(state.roster).toEqual(expected);
+    expect(state.deleted).toBe(true);
   });
 
   it('refuses the booker picker to a non-admin', async () => {

@@ -41,13 +41,17 @@ export async function chargeBooking(env, booking, roster) {
       // New ledger rows are keyed on Telegram's immutable numeric id whenever
       // one is known. A mutable username here would merge unrelated people when
       // a renamed handle is claimed by somebody else.
-      const ledgerSlug = player.user_id ? `u${player.user_id}` : player.slug;
+      const linked = !player.user_id ? await env.DB.prepare(
+        'SELECT user_id FROM ledger_identity_aliases WHERE chat_id = ? AND slug = ?'
+      ).bind(booking.chat_id, player.slug).first() : null;
+      const ledgerUserId = player.user_id || linked?.user_id || null;
+      const ledgerSlug = ledgerUserId ? `u${ledgerUserId}` : player.slug;
       const inserted = await env.DB.prepare(
         `INSERT OR IGNORE INTO ledger
           (chat_id, slug, user_id, name, amount_cents, booking_id, reason, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       ).bind(
-        booking.chat_id, ledgerSlug, player.user_id || null, player.name,
+        booking.chat_id, ledgerSlug, ledgerUserId, player.name,
         share * heads, booking.id, heads > 1 ? `${reason} · for ${heads}` : reason, Date.now()
       ).run();
       charged += inserted.meta.changes ? 1 : 0;
@@ -184,7 +188,10 @@ export async function myTabView(env, chatId, from, isAdmin = false) {
     `SELECT * FROM ledger
      WHERE chat_id = ? AND (
        (user_id IS NOT NULL AND user_id = ?)
-       OR (user_id IS NULL AND slug = ?)
+       OR (user_id IS NULL AND slug = ? AND NOT EXISTS (
+         SELECT 1 FROM ledger_identity_aliases a
+         WHERE a.chat_id = ledger.chat_id AND a.slug = ledger.slug
+       ))
      )
      ORDER BY created_at, id`
   ).bind(dataChatId(env, chatId), who.userId || 0, who.slug).all();
@@ -221,9 +228,8 @@ export async function myTabView(env, chatId, from, isAdmin = false) {
   return { html: lines.join('\n'), replyMarkup };
 }
 
-// One person's breakdown for an admin's eyes, keyed by slug exactly as the
-// pinned tab is — a total split across two spellings shows as two entries
-// there, and this view explains each entry as itself.
+// The admin breakdown uses the same canonical account key as the pinned tab,
+// payment controls and monthly notices. Unlinked legacy accounts retain a slug.
 export async function theirTabView(env, chatId, slug) {
   const { results } = await env.DB.prepare(
     `SELECT * FROM ledger WHERE chat_id = ? AND slug = ?

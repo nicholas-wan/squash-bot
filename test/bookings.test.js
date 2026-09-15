@@ -664,8 +664,22 @@ describe('public booking announcements', () => {
       { DB: bookingDb([storedBooking], full) }, -123, Date.UTC(2026, 7, 12, 12, 0)
     );
     // A court missing from the board would read as a court nobody booked —
-    // it stays listed, struck through, so open slots pop at a glance.
-    expect(html).toContain('in 7 days · Wed 19 Aug\n<s>9pm · <b>Court 4</b> · full</s>');
+    // it stays listed, struck through, so open slots pop at a glance — and,
+    // being the one court nobody can join, it names who took it.
+    expect(html).toContain(
+      'in 7 days · Wed 19 Aug\n<s>9pm · <b>Court 4</b> · full</s>\n👥 u7, @dodgerblueee, @alice'
+    );
+  });
+
+  it('names nobody on the board for a court with room', async () => {
+    const two = ['u7', '@dodgerblueee'].map((slug, index) => ({
+      id: index + 1, booking_id: 3, user_id: null, slug, name: slug,
+    }));
+    const html = await boardHtml(
+      { DB: bookingDb([storedBooking], two) }, -123, Date.UTC(2026, 7, 12, 12, 0)
+    );
+    expect(html).toContain('9pm · <b>Court 4</b> · 1 slot · 2/3');
+    expect(html).not.toContain('👥');
   });
 
   it('rejects an overlapping court booking in the insert itself', async () => {

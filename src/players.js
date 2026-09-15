@@ -3,6 +3,7 @@ import { telegram } from './telegram.js';
 
 export const DEFAULT_CAPACITY = 3;
 export const MAX_CAPACITY = 12;
+export class RosterCapacityError extends Error {}
 
 const ADMIN_CACHE_TTL_MS = 3 * 60 * 1000;
 const MAX_ADMIN_CACHE_ENTRIES = 512;
@@ -221,7 +222,7 @@ async function addPlayer(env, chatId, bookingId, player, addedByUserId) {
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     bookingId, chatId, player.userId || null, player.slug, player.name,
-    addedByUserId || null, 1, Date.now()
+    addedByUserId || null, player.heads || 1, Date.now()
   ).run();
 }
 
@@ -230,7 +231,7 @@ async function addPlayer(env, chatId, bookingId, player, addedByUserId) {
 // and the one person who must never lose their seat is the one who made the
 // booking. chatId is the real chat the booking was made in, which is where those
 // players are reachable for reminders.
-export async function seedRoster(env, chatId, bookingId, from, capacity, bookedFor = null) {
+export async function seedRoster(env, chatId, bookingId, from, capacity, bookedFor = null, companions = {}) {
   const seats = [];
   const seat = (player) => {
     if (player && !seats.some((seated) =>
@@ -242,10 +243,24 @@ export async function seedRoster(env, chatId, bookingId, from, capacity, bookedF
   // carry no numeric id yet, exactly like a config-seeded player.
   const booker = bookedFor || (from && from.id ? identity(from) : null);
   if (booker) seat(booker);
+  if (companions.plusOne && from?.id) {
+    const actor = identity(from);
+    seat(actor);
+    const seated = seats.find(p => p.slug === actor.slug || p.userId === actor.userId);
+    seated.heads = 2;
+  }
+  for (const player of companions.players || []) seat(player);
+  if (seats.reduce((sum, player) => sum + (player.heads || 1), 0) > capacity) {
+    throw new RosterCapacityError('The requested players and guest exceed the court capacity. Start /book again with fewer players.');
+  }
   seat(ownerIdentity(env));
   for (const player of defaultPlayers(env)) seat(player);
-  for (const player of seats.slice(0, capacity)) {
+  let remaining = capacity;
+  for (const player of seats) {
+    const heads = player.heads || 1;
+    if (heads > remaining) continue;
     await addPlayer(env, chatId, bookingId, player, from && from.id);
+    remaining -= heads;
   }
 }
 
