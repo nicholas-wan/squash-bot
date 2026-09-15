@@ -23,6 +23,22 @@ edit, and delete keeps an audit snapshot with the actor and the original text.
 
 ## The board
 
+Each group sharing the board also carries one **Next available court** message:
+a silent post (Telegram's native `disable_notification: true`, a notification
+without sound) for the earliest upcoming court with a free slot, with a
+**🙋 Join** button that joins that court. There is only ever one, so the bot's
+latest message is always the most upcoming open court. Joins, +1s, and edits to
+that court's time or court number change the message in place. When a different
+court becomes the one to point at — a nearer court is booked, the current one
+fills, starts, or is cancelled — the old message is deleted and a fresh one is
+posted at the bottom of the chat; when no open court remains, it is deleted
+and nothing replaces it. A batch of new bookings therefore produces one message
+for the nearest of them, not one each, and a court further out is never
+announced until it is next. Maintenance posts the message if a refresh failed
+and moves it on at the start time. Telegram only permits deletion within 48
+hours of sending: if it refuses an older message, the bot marks it closed and
+removes its Join button instead.
+
 ```text
 in 5 days · Mon 17 Aug
 9pm · Court 4 · 1 slot · 2/3
@@ -32,10 +48,12 @@ Two short lines and a gap, because a phone wraps much past thirty characters and
 a wrapped court number reads as a wall. Every active court is listed, booked-out
 ones included and marked `full`: the board answers "what is booked", and a court
 missing from it would read as a court nobody took. An open court carries its
-head count too — `1 slot · 2/3` is one seat free, two of three taken. The roster is not on the
-board — with `DEFAULT_PLAYERS` seating the same people every time it was the
-same handles on every row, and one shared pinned message cannot answer "am I on
-this?" per person anyway. Who is playing is named on the court's own panel
+head count too — `1 slot · 2/3` is one seat free, two of three taken. An open
+court's roster is not on the board — with `DEFAULT_PLAYERS` seating the same
+people every time it was the same handles on every row, and one shared pinned
+message cannot answer "am I on this?" per person anyway. A full court is the
+exception: nobody can join it, so the board names who took it on a line
+underneath. For an open court, who is playing is named on the court's own panel
 behind ⚙️ Manage, which is private.
 
 The board carries a single **🙋 Join** button. A keyboard belongs to the message,
@@ -45,8 +63,9 @@ and can therefore differ per person.
 
 That list holds up to twelve courts: Join for the ones you are not on, Leave for
 the ones you are, `🔒 Full` for the rest, and **➕ Add booking**. Each court you
-are on is named underneath with who you are playing alongside — the board names
-nobody, so this is where you read it, and only for your own courts. Group admins
+are on is named underneath with who you are playing alongside — the board only
+names the players on full courts, so this is where you read it for the rest,
+and only for your own courts. Group admins
 get **⚙️ Manage bookings** and every roster, since keeping the household
 straight is their job. Manage names who is playing and how
 many slots are left, edits the date, court, or time, deletes a booking, and lets
@@ -83,6 +102,15 @@ the audit row still names the admin. Attribution is for the record: only the
 admin panel ever shows the name, never the board or the group.
 
 ## Money
+
+Known accounts always use `u<Telegram ID>` as their ledger key, enforced by
+database triggers as well as the charging code. Usernames are permanent aliases,
+not account keys: an authenticated Telegram sender can link provisional history
+on first contact, and renaming does not split their balance. An alias already
+owned by another ID is never reassigned. Display names do not link accounts.
+Legacy aliases associated with multiple IDs are reserved for manual review.
+Balances, settlements, private breakdowns and monthly notices use the same
+canonical rows, preserving every original charge and payment.
 
 | When | Rate |
 |---|---|
@@ -131,8 +159,8 @@ list in force never reaches charges it off-peak and logs a warning that
 
 ## Privacy
 
-Three things SquashBot sends are addressed to the group: the pinned board, the
-pinned tab, and the reminder fallback below. Everything else it sends — forms,
+The pinned board, pinned tab, availability announcements, and reminder fallback
+below are addressed to the group. Everything else it sends — forms,
 receipts, reminders, errors, and every reply to a command — is ephemeral: only
 the recipient and the bot see them.
 
@@ -149,8 +177,8 @@ admins: the intent gate is loose on purpose, and applied to everyone it cleared
 ordinary chat out of the group for looking like a court. Anybody else's
 booking-shaped message is ignored where it stands — no form, nothing removed —
 so members book with `/book`, which is never public at any point. The booker
-gets a private receipt with an **OK** button either way, so a new booking is
-discovered on the board rather than announced.
+gets a private receipt with an **OK** button either way. The separate availability
+announcement shows the court, time and free slots, without naming its booker or roster.
 
 Each player is reminded two hours before their court and again at 10am on the
 day. Reminders and receipts clear themselves at the end of the day they are
@@ -169,7 +197,7 @@ considered and declined to keep the bot group-only.
 ## Commands
 
 ```text
-/book [details]  Add a booking or open a blank form
+/book [details] [@player or +1]  Add a booking; tag a player or bring a guest
 /courts          Refresh the pinned board
 /tab             Refresh the pinned money tab
 /cancel ID       Remove a booking you made
@@ -248,6 +276,16 @@ curl.exe -X POST -H "Authorization: Bearer YOUR_ADMIN_SECRET" `
 
 `POST /refresh` rebuilds the board and tab in every allowed chat.
 
+The every-minute cron first reads one persisted next-due timestamp. Idle ticks
+skip the maintenance sweep and draft cleanup, while still updating the health
+heartbeat. Due times come from existing court reminders, starts and ends,
+message/draft cleanup, and retries. Midnight refreshes relative date labels;
+9am checks monthly notices. Database triggers invalidate the cached deadline
+when bookings, rosters or other scheduled work change, so edits cannot leave a
+stale wake-up time. Changes during a sweep get a follow-up pass the next minute;
+failures also retry then. Interactive Join and booking actions still update
+their messages immediately. This reduces database work, not cron invocations.
+
 The first answer to every button tap rides back on the webhook's own HTTP
 response (Bot API, "Making requests when getting updates") instead of a
 separate round trip, and each tap logs its colo and duration — one line in
@@ -278,12 +316,21 @@ npm run db:migrate:006
 npm run db:migrate:007
 npm run db:migrate:008
 npm run db:migrate:009
+npm run db:migrate:010
+npm run db:migrate:011
+npm run db:migrate:012
+npm run db:migrate:013
+npm run db:migrate:014
 npm run db:verify
 ```
 
 Run them in that order. Everything the migrations used to create now lives in
 `schema.sql`, leaving 002, 003, 005, and 006 as `ALTER TABLE` alone, 004 as a
-no-op, and 007–009 as idempotent table/index/trigger migrations,
+no-op, and 007–013 as idempotent table/index/trigger migrations. 014 replaces
+the per-booking announcement tables with the one-per-group notice: it hands any
+message the old tables still track to the message cleanup sweep, then drops
+them, so on a database past 014 the 010 and 011 files would recreate empty
+tables and must not be re-run. The split exists
 because `wrangler d1 execute --file` is atomic: one failed statement rolls the
 whole file back, so a `CREATE` sharing a file with an `ALTER` would be skipped on
 a re-run rather than applied. That is what makes a re-run harmless — an already

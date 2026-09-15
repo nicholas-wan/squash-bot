@@ -1,3 +1,5 @@
+import { runScheduledMaintenance } from './maintenance-schedule.js';
+import { rememberLedgerIdentity } from './ledger-identity.js';
 import {
   addPlayerView, authorizeBookingChange, bookingPanelView, cancelBooking, deletePanelView,
   managerView, notifyRemovedPlayer, notifyRosterOfChange, plusOneView, removePlayerView,
@@ -55,7 +57,7 @@ function helpHtml(env) {
     '/courts — refresh the pinned board\n' +
     '/tab — refresh the pinned money tab\n' +
     '/cancel ID — remove a booking\n' +
-    '/book — open a blank booking form';
+    '/book [details] [@player or +1] — book with a player or guest';
 }
 
 async function helpBoardMarkup(env, chatId) {
@@ -638,6 +640,7 @@ export async function handleUpdate(env, update) {
     if (!chatAllowed(env, callback.message.chat)) return;
     try {
       await rememberPlayer(env, callback.from);
+      await rememberLedgerIdentity(env, callback.message.chat.id, callback.from);
       if (await handleBoardCallback(env, callback)) return;
       if (await handleTabCallback(env, callback)) return;
       await handleBookingCallback(env, callback);
@@ -662,6 +665,7 @@ export async function handleUpdate(env, update) {
 
   try {
     await rememberPlayer(env, msg.from);
+    await rememberLedgerIdentity(env, msg.chat.id, msg.from);
     if (await handleBookingReply(env, msg)) return;
     if (!text.startsWith('/')) {
       // The booking form repeats the text back, and the pinned board is the
@@ -998,7 +1002,7 @@ export default {
 
   async scheduled(_event, env, ctx) {
     ctx.waitUntil((async () => {
-      const [maintenance] = await Promise.all([runMaintenance(env), pruneBookingDrafts(env)]);
+      const maintenance = await runScheduledMaintenance(env, runMaintenance, pruneBookingDrafts);
       if (!maintenance.ok) {
         console.log(`Maintenance heartbeat withheld: ${maintenance.failures.join('; ')}`);
         return;

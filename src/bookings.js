@@ -2,12 +2,14 @@ import {
   clearRoster, defaultCapacity, DEFAULT_CAPACITY, identity, isChatAdmin,
   knownPlayers, matchesPlayer, MAX_CAPACITY, openBooking, rosterFor, rostersFor, seedRoster,
 } from './players.js';
-import { courtName, shortCourtName } from './format.js';
+import { compactTimeRange, courtName, formatCountdown, shortClock, shortCourtName, shortDate } from './format.js';
+export { formatCountdown } from './format.js';
 import { allowedChats, boardChats, dataChatId, reachableChat, sharingData } from './scope.js';
 import { getTimezone, updatePinnedMessage } from './settings.js';
 import { breakdownLines, chargeBooking, tabBalances, updateTab } from './tab.js';
 import { formatDate, formatTime, localParts, zonedEpoch } from './time.js';
 import { queuePinnedRefresh } from './refresh-queue.js';
+import { maintainAnnouncements, syncAnnouncements } from './announcements.js';
 import {
   deleteEphemeralMessage, deleteMessage, editReplyMarkup, escapeHtml, mentionHtml,
   OK_MARKUP, sendMessage,
@@ -100,8 +102,7 @@ export async function findBookingConflicts(
   return (await env.DB.prepare(query).bind(...args).all()).results;
 }
 
-// Nothing about a booking is posted to the group. The person who booked gets a
-// private receipt they can dismiss, and the pinned board carries the news.
+// The booker's receipt stays private; availability has its own group message.
 async function confirmToBooker(env, chatId, bookingId, booking, capacity, from, callbackQueryId) {
   if (!from || !from.id) return;
   const tz = await getTimezone(env, chatId);
@@ -122,7 +123,7 @@ async function confirmToBooker(env, chatId, bookingId, booking, capacity, from, 
 
 export async function addBooking(
   env, chatId, parsed, from, sourceText = null,
-  { allowConflict = false, callbackQueryId = null, bookedFor = null } = {}
+  { allowConflict = false, callbackQueryId = null, bookedFor = null, companions = {} } = {}
 ) {
   const now = Date.now();
   const preReminderAt = parsed.startsAt - 2 * 60 * 60 * 1000;
@@ -157,7 +158,7 @@ export async function addBooking(
   const bookingId = result.meta.last_row_id;
   try {
     await recordAudit(env, bookingId, chatId, 'added', from, sourceText, null, parsed);
-    await seedRoster(env, chatId, bookingId, from, capacity, bookedFor);
+    await seedRoster(env, chatId, bookingId, from, capacity, bookedFor, companions);
   } catch (error) {
     // The booking insert has already committed. Compensate all of its internal
     // rows so a transient audit/roster failure cannot leave a half-booking.
@@ -398,35 +399,6 @@ export async function cancelBooking(env, chatId, id, from = null, sourceText = n
 }
 
 // "9pm", or "9:30pm" when there are minutes to show.
-function shortClock(epochMs, tz) {
-  const parts = localParts(epochMs, tz);
-  const suffix = parts.h >= 12 ? 'pm' : 'am';
-  const hour = parts.h % 12 || 12;
-  return `${hour}${parts.mi ? `:${String(parts.mi).padStart(2, '0')}` : ''}${suffix}`;
-}
-
-export function formatCountdown(epochMs, tz, now = Date.now()) {
-  const target = localParts(epochMs, tz);
-  const current = localParts(now, tz);
-  const days = Math.round((
-    Date.UTC(target.y, target.mo - 1, target.d)
-    - Date.UTC(current.y, current.mo - 1, current.d)
-  ) / 86400000);
-  const date = shortDate(epochMs, tz);
-  if (days <= 0) return `today · ${date}`;
-  if (days === 1) return `tomorrow · ${date}`;
-  return `in ${days} days · ${date}`;
-}
-
-const ONE_HOUR_MS = 60 * 60 * 1000;
-
-// An hour is the standard slot, so its end time says nothing worth the space.
-function compactTimeRange(startsAt, endsAt, tz) {
-  const start = shortClock(startsAt, tz);
-  if (endsAt - startsAt === ONE_HOUR_MS) return start;
-  return `${start}–${shortClock(endsAt, tz)}`;
-}
-
 async function activeBookings(env, chatId, now = Date.now()) {
   return (await env.DB.prepare(
     'SELECT * FROM bookings WHERE chat_id = ? AND ends_at > ? ORDER BY starts_at, court, id'
@@ -440,12 +412,6 @@ const MAX_JOIN_BUTTONS = 12;
 
 // The comma Intl puts after the weekday is dropped: these read alongside “·”
 // separators, and on a phone every character counts against wrapping.
-function shortDate(epochMs, tz) {
-  return new Intl.DateTimeFormat('en-SG', {
-    timeZone: tz, weekday: 'short', day: 'numeric', month: 'short',
-  }).format(new Date(epochMs)).replace(',', '');
-}
-
 // Slots one roster row holds: two when an admin seated that member with a
 // friend. A row written before the column existed carries no heads at all, and
 // stands for the one person it always did.
@@ -571,9 +537,11 @@ async function renderBoard(env, chatId, now) {
 
   // Two short lines and a gap per booking. A phone wraps anything much past
   // thirty characters, and a wrapped “Court 4” or “1 slot” is what made the
-  // board read as a wall. The roster is dropped because DEFAULT_PLAYERS puts
-  // the same handles on every row; who is playing lives behind 🙋 Join, which
-  // can answer it per person as the shared board never could.
+  // board read as a wall. An open court's roster is dropped because
+  // DEFAULT_PLAYERS puts the same handles on every row; who is playing lives
+  // behind 🙋 Join, which can answer it per person as the shared board never
+  // could. A full court is the exception: nobody can join it, so the one
+  // question left about it is who took it, and that is answered underneath.
   // Every court is listed, full ones included: the board is the answer to "what
   // is booked", and a court missing from it reads as a court nobody took. The
   // slot count carries the difference.
@@ -588,6 +556,7 @@ async function renderBoard(env, chatId, now) {
     // A full court stays listed — dropping it would read as a court nobody
     // took — but struck through, so the open slots pop at a glance.
     lines.push(slots === 'full' ? `<s>${line}</s>` : line);
+    if (slots === 'full' && roster.length) lines.push(`👥 ${playerTags(roster)}`);
   }
   return {
     html: lines.join('\n'),
@@ -612,6 +581,9 @@ export async function updateBoard(env, chatId, now = Date.now()) {
   // acting chat still decides whether the operation itself succeeds.
   const outcomes = await Promise.all(boardChats(env, chatId).map(async (chat) => {
     try {
+      // Announcement errors are retried by maintenance and do not block the board.
+      try { await syncAnnouncements(env, chat, now); }
+      catch (error) { console.log(`Announcement refresh failed: ${error.message || error}`); }
       const id = await updatePinnedMessage(
         env, chat, 'board_message_id', board.html, board.replyMarkup, 'court board'
       );
@@ -848,8 +820,8 @@ export async function notifyRemovedPlayer(env, chatId, player, booking) {
     player.user_id, endOfLocalDay(booking.starts_at, tz), { replyMarkup: OK_MARKUP });
 }
 
-// The board no longer names who is on a court, so the whole roster hears when a
-// slot changes hands: the others that it happened, and whoever tapped as a
+// The board names who is on a court only once it is full, so the whole roster
+// hears when a slot changes hands: the others that it happened, and whoever tapped as a
 // confirmation they can read after the toast has gone. Leaving is told the same
 // way as joining — a freed slot is news to the people still on the court, and
 // silence would read as the tap not having worked.
@@ -1480,6 +1452,7 @@ async function sendMonthlyTabNoticesFor(env, now, chatId, fallbackChat) {
 
 export async function runMaintenance(env, now = Date.now()) {
   const stages = [
+    ['availability announcements', () => maintainAnnouncements(env, now)],
     ['two-hour reminders', () => sendPreReminders(env, now)],
     ['queued pinned refreshes', () => flushPendingRefreshes(env)],
     ['board refresh', () => refreshStaleBoards(env, now)],

@@ -2,7 +2,8 @@ import {
   addBooking, BOOKING_STARTED, BookingConflictError, getTimezone, updateBooking,
 } from './bookings.js';
 import { courtName } from './format.js';
-import { isChatAdmin, knownPlayers, openBooking } from './players.js';
+import { parseBookingCompanions } from './booking-companions.js';
+import { isChatAdmin, knownPlayers, openBooking, RosterCapacityError } from './players.js';
 import {
   analyzeBooking, bookingFromDraft, BookingParseError, formatClock, parseField,
 } from './parser.js';
@@ -121,6 +122,10 @@ function wizardView(id, payload, now, tz) {
   if (payload.booker) {
     lines.push(`Booked by: <b>${escapeHtml(payload.booker.name)}</b>`);
   }
+  if (payload.companions?.players.length) {
+    lines.push(`Also playing: <b>${payload.companions.players.map(p => escapeHtml(p.name)).join(', ')}</b>`);
+  }
+  if (payload.companions?.plusOne) lines.push('Guest: <b>+1 for you</b>');
   if (payload.sourceText) lines.push('', `From: <code>${escapeHtml(payload.sourceText.slice(0, 180))}</code>`);
   if (payload.issues && payload.issues.length) {
     lines.push('', `⚠️ ${payload.issues.map(escapeHtml).join(' ')}`);
@@ -300,8 +305,11 @@ export async function beginBooking(env, msg, text, {
 } = {}) {
   const now = Date.now();
   const tz = await getTimezone(env, msg.chat.id);
-  const payload = analyzeBooking(text, now, tz, { forceIntent });
+  const { details, companions } = parseBookingCompanions(text, msg);
+  const payload = analyzeBooking(details, now, tz, { forceIntent });
   if (!payload) return false;
+  payload.companions = companions;
+  payload.sourceText = text;
   payload.operation = 'add';
   payload.bookingId = null;
   payload.conflicts = [];
@@ -518,6 +526,7 @@ export async function handleBookingCallback(env, callback) {
           {
             allowConflict: action === 'o', callbackQueryId: callback.id,
             bookedFor: payload.booker || null,
+            companions: payload.companions,
           }
         );
       }
@@ -531,6 +540,10 @@ export async function handleBookingCallback(env, callback) {
       }
       await env.DB.prepare('UPDATE booking_drafts SET pending_field = NULL WHERE id = ?')
         .bind(id).run();
+      if (error instanceof RosterCapacityError) {
+        await answerCallback(env, callback.id, error.message, true);
+        return true;
+      }
       throw error;
     }
     await env.DB.prepare('DELETE FROM booking_drafts WHERE id = ? AND user_id = ?')
