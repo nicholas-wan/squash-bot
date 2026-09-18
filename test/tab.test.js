@@ -156,11 +156,11 @@ describe('money tab', () => {
     // rememberPlayer re-keys their rows onto the new handle, so the slug no
     // longer says who this is. OWNER_USER_ID does.
     const renamed = [
-      { slug: '@nickw', user_id: 246334575, name: '@nickw' },
+      { slug: '@nickw', user_id: 111111111, name: '@nickw' },
       { slug: 'u9', user_id: 9, name: 'Alice' },
     ];
     await chargeBooking(
-      { ...env, OWNER_USER_ID: '246334575', DB: ledgerDb(inserts) }, booking, renamed
+      { ...env, OWNER_USER_ID: '111111111', DB: ledgerDb(inserts) }, booking, renamed
     );
     expect(inserts.map((args) => args[1])).toEqual(['u9']);
   });
@@ -521,6 +521,12 @@ describe('hand-written debt entries', () => {
     // Free text must never mint a ledger account, the same rule that keeps a
     // display name from claiming financial history.
     expect(matchAccount(players, 'bob').error).toBe('unknown');
+    // The synthetic keys all start with the same letter, so a stray "u" or
+    // "u9x" must not read as a prefix of whichever account is keyed by id.
+    expect(matchAccount(players, 'u').error).toBe('unknown');
+    expect(matchAccount(players, 'u9x').error).toBe('unknown');
+    expect(matchAccount([{ slug: 'nsam', name: 'Sam', user_id: null }], 'n').error)
+      .toBe('unknown');
   });
 
   it('counts one person listed two ways as one match, not an ambiguity', () => {

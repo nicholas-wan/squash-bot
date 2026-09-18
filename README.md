@@ -216,7 +216,10 @@ ordinary ledger row, so it appears in that person's own 🧾 breakdown beside th
 courts they played, carrying the reason, the name of whoever typed it, and its
 date. They are sent a private note with the same reason, exactly as a settlement
 sends its receipt — which needs their numeric id, so a config-seeded player
-hears nothing until they have posted once.
+hears nothing until they have posted once. A note Telegram can only deliver to
+the group is taken down rather than left there, and either way the admin's
+confirmation says whether the player was told, so nobody finds a charge on
+their tab that nobody mentioned.
 
 ```text
 /debt +2 jared mcdonalds ice cream
@@ -229,8 +232,11 @@ already knows — from config, from the ledger, or from a current roster — can
 charged: admin-entered free text must never mint a ledger account, the same rule
 that keeps a display name from claiming financial history. A word two people
 answer to is refused rather than guessed at, since guessing bills the wrong
-person and nothing downstream can tell. The ledger is append-only, so an entry
-that turns out to be wrong is undone by its opposite rather than by deletion.
+person and nothing downstream can tell. The organiser and the household play
+for free and are refused outright: a row for them would list the organiser as
+owing themselves. The ledger is append-only, so an entry that turns out to be
+wrong is undone by its opposite rather than by deletion; an update Telegram
+delivers twice is handled once, so a redelivered `/debt` is not a second entry.
 
 Booking ids are small sequential numbers, so editing or removing one — by command
 or from **⚙️ Manage** — is limited to whoever booked the court and to group
@@ -349,12 +355,16 @@ npm run db:migrate:011
 npm run db:migrate:012
 npm run db:migrate:013
 npm run db:migrate:014
+npm run db:migrate:015
 npm run db:verify
 ```
 
 Run them in that order. Everything the migrations used to create now lives in
 `schema.sql`, leaving 002, 003, 005, and 006 as `ALTER TABLE` alone, 004 as a
-no-op, and 007–013 as idempotent table/index/trigger migrations. 014 replaces
+no-op, and 007–013 and 015 as idempotent table/index/trigger migrations. 015
+adds the table that records every Telegram update id once, so an update
+Telegram redelivers is answered and dropped rather than handled twice — the
+guard that keeps a redelivered `/debt` from writing a second row. 014 replaces
 the per-booking announcement tables with the one-per-group notice: it hands any
 message the old tables still track to the message cleanup sweep, then drops
 them, so on a database past 014 the 010 and 011 files would recreate empty

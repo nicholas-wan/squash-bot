@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import worker, { handleUpdate } from '../src/index.js';
 import { clearAdminCache } from '../src/players.js';
+import { clearBotUsernameCache } from '../src/telegram.js';
 
 function emptyDb() {
   return {
@@ -23,6 +24,34 @@ describe('Telegram commands', () => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
     clearAdminCache();
+    clearBotUsernameCache();
+  });
+
+  it('ignores a known command aimed at another bot once it knows its own name', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      const result = String(url).endsWith('/getMe')
+        ? { username: 'squash_book_bot' } : { message_id: 1 };
+      return new Response(JSON.stringify({ ok: true, result }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const env = { BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: emptyDb() };
+    const command = (text) => ({
+      message: {
+        message_id: 5, chat: { id: -123456789 },
+        from: { id: 7, first_name: 'Nick' }, text,
+      },
+    });
+    // Another bot's /cancel is not this bot's to answer, and not its to delete.
+    await handleUpdate(env, command('/cancel@other_bot 3'));
+    expect(requests.some((request) => request.url.endsWith('/sendMessage'))).toBe(false);
+    expect(requests.some((request) => request.url.endsWith('/deleteMessage'))).toBe(false);
+    // Its own name, in any case, is answered — and getMe was asked only once.
+    await handleUpdate(env, command('/help@Squash_Book_Bot'));
+    expect(requests.some((request) => request.url.endsWith('/sendMessage'))).toBe(true);
+    expect(requests.filter((request) => request.url.endsWith('/getMe'))).toHaveLength(1);
   });
 
   it('responds to /help addressed to the bot username', async () => {
@@ -260,17 +289,17 @@ describe('Telegram commands', () => {
         return { bind() { return { async first() { return { board_message_id: 20 }; } }; } };
       },
     };
-    await handleUpdate({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-1004418632524', DB: db }, {
+    await handleUpdate({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-1001111111111', DB: db }, {
       message: {
         ephemeral_message_id: 8,
-        chat: { id: -1004418632524 },
+        chat: { id: -1001111111111 },
         from: { id: 7, first_name: 'Nick' },
         text: '/help',
       },
     });
     const send = requests.find((request) => request.url.endsWith('/sendMessage'));
     expect(send.body.reply_markup.inline_keyboard[0][0].url)
-      .toBe('https://t.me/c/4418632524/20');
+      .toBe('https://t.me/c/1111111111/20');
   });
 
   it('reads a command punctuated like a sentence', async () => {
@@ -593,6 +622,56 @@ describe('Telegram commands', () => {
     };
 
     for (const pinned of [55, 66]) {
+      const refused = await run(pinned);
+      expect(refused.some((request) => request.url.endsWith('/deleteMessage'))).toBe(false);
+      // The tap is still answered, or the button spins as though the bot died.
+      expect(refused.some((request) => request.url.endsWith('/answerCallbackQuery')))
+        .toBe(true);
+    }
+
+    // The bot's own receipt is what the button exists to clear, and still goes.
+    const receipt = await run(91);
+    expect(receipt.find((request) => request.url.endsWith('/deleteMessage')).body.message_id)
+      .toBe(91);
+  });
+
+  // The availability announcement is the third shared message: a group post
+  // with a Join button, so a hand-sent sb:ok naming it is just as possible.
+  it('refuses a dismiss tap aimed at the availability announcement', async () => {
+    const run = async (messageId) => {
+      const requests = [];
+      vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+        requests.push({ url: String(url), body: JSON.parse(init.body) });
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }));
+      const db = {
+        prepare(sql) {
+          return { bind() { return {
+            async first() {
+              if (sql.includes('FROM availability_notices')) return { message_id: 77 };
+              return null;
+            },
+            async all() { return { results: [] }; },
+            async run() { return { meta: { changes: 1 } }; },
+          }; } };
+        },
+      };
+      await handleUpdate({
+        BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db,
+      }, {
+        callback_query: {
+          id: 'callback-1', data: 'sb:ok',
+          from: { id: 11, username: 'alice' },
+          message: { message_id: messageId, chat: { id: -123456789 } },
+        },
+      });
+      vi.unstubAllGlobals();
+      return requests;
+    };
+
+    for (const pinned of [77]) {
       const refused = await run(pinned);
       expect(refused.some((request) => request.url.endsWith('/deleteMessage'))).toBe(false);
       // The tap is still answered, or the button spins as though the bot died.
@@ -1109,6 +1188,12 @@ describe('Telegram commands', () => {
     expect(receipt.body.reply_markup.inline_keyboard[0][0].text).toBe('👍 OK');
     const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
     expect(answer.body.text).toContain('cleared');
+    // Telegram answered with a plain message_id: the receipt fell back to the
+    // group, where it named a balance, so the public copy is taken down and
+    // the admin's toast says the debtor was not reached.
+    expect(requests.find((request) => request.url.endsWith('/deleteMessage')).body.message_id)
+      .toBe(1);
+    expect(answer.body.text).toContain('could not be told privately');
   });
 
   it('refuses extra slots and tab settlement to members who are not admins', async () => {
@@ -1789,6 +1874,54 @@ describe('Telegram commands', () => {
       await Promise.all(tasks);
     });
 
+    // Telegram redelivers an update until the webhook answers 2xx, and a
+    // redelivered /debt would be a second row on somebody's tab. The id is
+    // recorded before handling; a repeat is answered ok and dropped.
+    it('handles each update id once, however many times Telegram delivers it', async () => {
+      const requests = [];
+      vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+        requests.push({ url: String(url), body: JSON.parse(init.body) });
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }));
+      const seen = new Set();
+      const db = {
+        prepare(sql) {
+          return { bind(...args) { return {
+            async first() { return null; },
+            async all() { return { results: [] }; },
+            async run() {
+              if (sql.includes('INSERT OR IGNORE INTO processed_updates')) {
+                const fresh = !seen.has(args[0]);
+                seen.add(args[0]);
+                return { meta: { changes: fresh ? 1 : 0 } };
+              }
+              return { meta: { changes: 0 } };
+            },
+          }; } };
+        },
+      };
+      const update = {
+        update_id: 900001,
+        message: {
+          message_id: 5, ephemeral_message_id: 88,
+          chat: { id: -123456789 },
+          from: { id: 7, first_name: 'Nick' },
+          text: '/help',
+        },
+      };
+      for (let delivery = 0; delivery < 2; delivery += 1) {
+        const tasks = [];
+        const response = await worker.fetch(webhookRequest(update), webhookEnv(db),
+          { waitUntil: (task) => tasks.push(task) });
+        expect(await response.text()).toBe('ok');
+        await Promise.all(tasks);
+      }
+      expect(requests.filter((request) => request.url.endsWith('/sendMessage')))
+        .toHaveLength(1);
+    });
+
     it('keeps answering message updates with a plain ok', async () => {
       const requests = [];
       vi.stubGlobal('fetch', vi.fn(async (url, init) => {
@@ -1954,6 +2087,82 @@ describe('Telegram commands', () => {
     const confirmation = sends.find((send) => send.body.receiver_user_id === 7);
     expect(confirmation.body.text).toContain("$2.00 added to Jared's tab");
     expect(confirmation.body.text).toContain('Jared now owes <b>$7.00</b>.');
+    // Telegram answered every send with a plain message_id — the receipt fell
+    // back to the group, naming a balance and a reason — so the public copy
+    // was taken down and the admin was told to pass the word on themselves.
+    const removed = requests.filter((request) => request.url.endsWith('/deleteMessage'));
+    expect(removed.map((request) => request.body.message_id)).toContain(12);
+    expect(confirmation.body.text).toContain('could not be told privately');
+  });
+
+  it('tells the admin when the receipt landed, and when the player is unreachable', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify({ ok: true, result: { ephemeral_message_id: 12 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const inserts = [];
+    await handleUpdate(debtEnv(inserts), debtMessage('/debt +2 jared ice cream'));
+    let confirmation = requests.filter((request) => request.url.endsWith('/sendMessage'))
+      .find((send) => send.body.receiver_user_id === 7);
+    expect(confirmation.body.text).not.toContain('could not be told');
+    // The only delete is the command itself being cleared; the ephemeral
+    // receipt had no public copy to take down.
+    expect(requests.filter((request) => request.url.endsWith('/deleteMessage'))
+      .map((request) => request.body.message_id)).toEqual([5]);
+
+    // A player known only by handle has no id to reach: the entry is still
+    // written, and the admin hears that nobody else was told.
+    requests.length = 0;
+    const env = debtEnv(inserts);
+    env.DB = {
+      prepare(sql) {
+        return { bind(...args) { return {
+          async first() {
+            if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+            if (sql.includes('COALESCE(SUM(amount_cents)')) return { balance: 200 };
+            return null;
+          },
+          async all() {
+            if (sql.includes('FROM booking_players')) {
+              return { results: [{ slug: '@sam', user_id: null, name: '@sam' }] };
+            }
+            return { results: [] };
+          },
+          async run() {
+            if (sql.includes('INSERT INTO ledger')) inserts.push(args);
+            return { meta: { changes: 0 } };
+          },
+        }; } };
+      },
+    };
+    await handleUpdate(env, debtMessage('/debt +2 sam new ball'));
+    expect(inserts).toHaveLength(2);
+    expect(inserts[1][1]).toBe('@sam');
+    const sends = requests.filter((request) => request.url.endsWith('/sendMessage'));
+    expect(sends).toHaveLength(1);
+    confirmation = sends[0];
+    expect(confirmation.body.receiver_user_id).toBe(7);
+    expect(confirmation.body.text).toContain('never posted here, so they were not told');
+  });
+
+  it('refuses to put the organiser or the household on the tab', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify({ ok: true, result: { ephemeral_message_id: 12 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const inserts = [];
+    // OWNER is @nick: a row for them would list the organiser as owing
+    // themselves, which is no entry at all.
+    await handleUpdate(debtEnv(inserts), debtMessage('/debt +2 nick lost a bet'));
+    expect(inserts).toHaveLength(0);
+    const refusal = requests.find((request) => request.url.endsWith('/sendMessage'));
+    expect(refusal.body.text).toContain('plays for free and is never on the tab');
   });
 
   it('takes money off a tab when /debt is given a minus', async () => {

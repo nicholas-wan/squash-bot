@@ -161,6 +161,29 @@ export function answerCallback(env, callbackId, text = '', showAlert = false) {
   });
 }
 
+// The bot's own @username, for telling "/tab@squashbot" apart from a command
+// aimed at some other bot in the same group. getMe never changes for a token,
+// so one answer is kept per isolate. A failed lookup answers null, and the
+// caller then answers the command anyway — the behaviour before this existed,
+// and the safer side of the two: a bot that ignores its own commands reads as
+// dead, one that answers a stranger's is merely noisy.
+const botUsernames = new Map();
+
+export async function botUsername(env) {
+  const token = env.BOT_TOKEN ? env.BOT_TOKEN.trim() : '';
+  if (!token) return null;
+  if (botUsernames.has(token)) return botUsernames.get(token);
+  const me = await telegram(env, 'getMe', {});
+  const username = me.ok && me.result && me.result.username
+    ? String(me.result.username).toLowerCase() : null;
+  if (username) botUsernames.set(token, username);
+  return username;
+}
+
+export function clearBotUsernameCache() {
+  botUsernames.clear();
+}
+
 export function escapeHtml(value) {
   return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
