@@ -109,8 +109,9 @@ not account keys: an authenticated Telegram sender can link provisional history
 on first contact, and renaming does not split their balance. An alias already
 owned by another ID is never reassigned. Display names do not link accounts.
 Legacy aliases associated with multiple IDs are reserved for manual review.
-Balances, settlements, private breakdowns and monthly notices use the same
-canonical rows, preserving every original charge and payment.
+Balances, settlements, private breakdowns, monthly notices and hand-written
+`/debt` entries use the same canonical rows, preserving every original charge
+and payment.
 
 | When | Rate |
 |---|---|
@@ -200,9 +201,36 @@ considered and declined to keep the bot group-only.
 /book [details] [@player or +1]  Add a booking; tag a player or bring a guest
 /courts          Refresh the pinned board
 /tab             Refresh the pinned money tab
+/debt +2 player reason   Admins: add to or take off what someone owes
 /cancel ID       Remove a booking you made
 /help, /start    Show examples
 ```
+
+`/debt` writes the one entry the courts cannot produce for themselves — a ball
+somebody replaced, cash handed over outside the tab, half an hour of a court
+somebody missed. A plus adds to what they owe and a minus takes it off, matching
+the direction the ledger already counts in, and the reason is required because
+it is the whole entry: everything else on a tab is calculated and can be
+re-derived, while this line can only ever explain itself. It is written as an
+ordinary ledger row, so it appears in that person's own 🧾 breakdown beside the
+courts they played, carrying the reason, the name of whoever typed it, and its
+date. They are sent a private note with the same reason, exactly as a settlement
+sends its receipt — which needs their numeric id, so a config-seeded player
+hears nothing until they have posted once.
+
+```text
+/debt +2 jared mcdonalds ice cream
+/debt -1 jared played only 30 mins last time
+```
+
+Admins only, like every other route that moves money. The player may be named by
+first name, display name, @handle, or numeric id, but only somebody the bot
+already knows — from config, from the ledger, or from a current roster — can be
+charged: admin-entered free text must never mint a ledger account, the same rule
+that keeps a display name from claiming financial history. A word two people
+answer to is refused rather than guessed at, since guessing bills the wrong
+person and nothing downstream can tell. The ledger is append-only, so an entry
+that turns out to be wrong is undone by its opposite rather than by deletion.
 
 Booking ids are small sequential numbers, so editing or removing one — by command
 or from **⚙️ Manage** — is limited to whoever booked the court and to group

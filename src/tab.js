@@ -12,6 +12,19 @@ function shortDay(epochMs, tz) {
   }).format(new Date(epochMs));
 }
 
+// Where a new ledger row lands. Telegram's immutable numeric id is the account
+// key whenever one is known — a mutable username would merge unrelated people
+// once a renamed handle is claimed by somebody else — and an alias row supplies
+// that id for a player first seen without one. The reserved ambiguous alias is
+// user_id 0, which is falsy and so deliberately falls back to the slug.
+export async function ledgerAccount(env, dataChat, player) {
+  const linked = !player.user_id ? await env.DB.prepare(
+    'SELECT user_id FROM ledger_identity_aliases WHERE chat_id = ? AND slug = ?'
+  ).bind(dataChat, player.slug).first() : null;
+  const userId = player.user_id || linked?.user_id || null;
+  return { userId, slug: userId ? `u${userId}` : player.slug };
+}
+
 // Charges land only after a booking has been played, so cancelled slots and
 // people who left in time are never billed. The unique index on
 // (booking_id, slug) keeps a retried cron run from double charging.
@@ -38,20 +51,13 @@ export async function chargeBooking(env, booking, roster) {
       // allows only one per booking anyway — so the reason carries the count,
       // which is the only place a doubled charge can explain itself.
       const heads = player.heads || 1;
-      // New ledger rows are keyed on Telegram's immutable numeric id whenever
-      // one is known. A mutable username here would merge unrelated people when
-      // a renamed handle is claimed by somebody else.
-      const linked = !player.user_id ? await env.DB.prepare(
-        'SELECT user_id FROM ledger_identity_aliases WHERE chat_id = ? AND slug = ?'
-      ).bind(booking.chat_id, player.slug).first() : null;
-      const ledgerUserId = player.user_id || linked?.user_id || null;
-      const ledgerSlug = ledgerUserId ? `u${ledgerUserId}` : player.slug;
+      const account = await ledgerAccount(env, booking.chat_id, player);
       const inserted = await env.DB.prepare(
         `INSERT OR IGNORE INTO ledger
           (chat_id, slug, user_id, name, amount_cents, booking_id, reason, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       ).bind(
-        booking.chat_id, ledgerSlug, ledgerUserId, player.name,
+        booking.chat_id, account.slug, account.userId, player.name,
         share * heads, booking.id, heads > 1 ? `${reason} · for ${heads}` : reason, Date.now()
       ).run();
       charged += inserted.meta.changes ? 1 : 0;
@@ -354,4 +360,120 @@ export async function settleUser(env, chatId, slug, actor) {
   if (!result.meta.changes) return null;
   await updateTab(env, chatId);
   return entry;
+}
+
+// A charge or a credit the courts did not produce: a ball somebody replaced,
+// cash handed over outside the tab, half an hour of a court somebody missed.
+// Every other entry on the tab is calculated and can be re-derived; this is the
+// one that can only ever explain itself, which is why the reason is mandatory
+// and why the row carries the name of whoever typed it.
+const MAX_REASON_LENGTH = 120;
+// A court is a few dollars, so a four-figure entry is a typo far more often
+// than a decision. Refusing costs a retype; writing it costs a second entry to
+// undo it and an argument in between.
+const MAX_ADJUSTMENT_CENTS = 100000;
+const MONEY = /^([+-]?)\$?(\d+(?:\.\d{1,2})?)$/;
+
+// "+2 jared ice cream". A plus adds to what they owe and a minus takes it off,
+// which is the direction the ledger already counts in: a debt is stored
+// positive, so the sign someone types is the sign that gets written. An
+// unsigned number reads as a charge, the only kind of entry a court ever makes.
+//
+// "jared +2 ice cream" is the same sentence with the same words in the other
+// order, and refusing it would cost a retype to no purpose, so whichever of the
+// first two words reads as money is the amount and the other is the player.
+export function parseDebtAdjustment(args) {
+  const parts = String(args || '').trim().split(/\s+/).filter(Boolean);
+  if (parts.length < 3) return { error: 'usage' };
+  const at = parts.findIndex((part, index) => index < 2 && MONEY.test(part));
+  if (at === -1) return { error: 'amount' };
+  const [, sign, amount] = parts[at].match(MONEY);
+  const cents = Math.round(Number(amount) * 100) * (sign === '-' ? -1 : 1);
+  // Zero is a line on somebody's tab that moves nothing, which is noise in the
+  // one place noise is expensive.
+  if (!cents) return { error: 'amount' };
+  if (Math.abs(cents) > MAX_ADJUSTMENT_CENTS) return { error: 'huge' };
+  const reason = parts.slice(2).join(' ');
+  return reason.length > MAX_REASON_LENGTH
+    ? { error: 'long' }
+    : { target: parts[at === 0 ? 1 : 0], cents, reason };
+}
+
+// Who may be charged: only somebody the bot already knows, from config, from
+// the ledger, or from a current roster. Admin-entered free text must never mint
+// a ledger account — the same rule that keeps a display name from claiming
+// financial history — so an unrecognised word is refused rather than billed.
+//
+// Tried in order, because the group types first names: an account key, then a
+// display name, then a name only one person's begins with. A word two people
+// answer to is refused at every step rather than guessed at, since guessing
+// here bills the wrong person and the bot cannot know it did. Two people means
+// two accounts, not two rows: knownPlayers lists a config `id:@handle` player
+// under the handle and again under the numeric key their charges are filed
+// by, and those resolve to the same ledger account.
+export function matchAccount(players, target) {
+  const wanted = String(target).replace(/^@/, '').toLowerCase();
+  if (!wanted) return { error: 'unknown' };
+  const key = /^\d+$/.test(wanted) ? `u${wanted}` : `@${wanted}`;
+  const slugOf = (player) => String(player.slug).toLowerCase();
+  const nameOf = (player) => String(player.name).replace(/^@/, '').toLowerCase();
+  // An account key is unique by construction, so the first hit is the only one.
+  const keyed = players.find((player) => [wanted, key].includes(slugOf(player)));
+  if (keyed) return { player: keyed };
+  const accounts = (found) => new Set(
+    found.map((player) => (player.user_id ? `u${player.user_id}` : player.slug))
+  ).size;
+  for (const found of [
+    players.filter((player) => nameOf(player) === wanted),
+    players.filter((player) => [slugOf(player).replace(/^@/, ''), nameOf(player)]
+      .some((spelling) => spelling.startsWith(wanted))),
+  ]) {
+    if (!found.length) continue;
+    return accounts(found) === 1 ? { player: found[0] } : { error: 'ambiguous' };
+  }
+  return { error: 'unknown' };
+}
+
+// Appended, never edited: the tab is the record of what happened, so an entry
+// that turns out to be wrong is undone by its opposite rather than by deletion.
+// The breakdown stamps a date on payments only — a court charge already
+// carries its own in the reason — so a charge written here carries one too,
+// and both kinds of row end up reading the same way.
+export async function adjustBalance(env, chatId, player, cents, reason, actor) {
+  const dataChat = dataChatId(env, chatId);
+  const [account, tz] = await Promise.all([
+    ledgerAccount(env, dataChat, player), getTimezone(env, chatId),
+  ]);
+  const now = Date.now();
+  const note = `${reason} · by ${identity(actor).name}`;
+  await env.DB.prepare(
+    `INSERT INTO ledger
+      (chat_id, slug, user_id, name, amount_cents, booking_id, reason, created_at)
+     VALUES (?, ?, ?, ?, ?, NULL, ?, ?)`
+  ).bind(
+    dataChat, account.slug, account.userId, player.name, cents,
+    cents > 0 ? `${note} · ${shortDay(now, tz)}` : note, now
+  ).run();
+  // Read back rather than added to a balance fetched earlier: the point of the
+  // reply is to say where the person stands now, and a court that expired
+  // mid-command would make an arithmetic answer quietly wrong.
+  const total = await env.DB.prepare(
+    'SELECT COALESCE(SUM(amount_cents), 0) AS balance FROM ledger WHERE chat_id = ? AND slug = ?'
+  ).bind(dataChat, account.slug).first();
+  // The row is written and the pinned tab is only a rendering of it. Throwing
+  // past this point would tell the admin something went wrong after the money
+  // had moved, and the natural response — typing it again — is a second
+  // entry. updateTab has already queued a refresh for any chat it could not
+  // reach, so the failure is logged and the reply still says what happened.
+  try {
+    await updateTab(env, chatId);
+  } catch (error) {
+    console.log(`Tab refresh after a /debt entry failed: ${error.stack || error}`);
+  }
+  return {
+    name: player.name,
+    userId: account.userId,
+    cents,
+    balance: (total && total.balance) || 0,
+  };
 }

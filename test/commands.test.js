@@ -1266,16 +1266,18 @@ describe('Telegram commands', () => {
     expect(response.status).toBe(200);
     const menus = requests.filter((request) => request.url.endsWith('/setMyCommands'));
     expect(menus).toHaveLength(3);
-    // The default menu carries everything; the group menu drops /cancel —
-    // parameterised and rarely a member's to run — and group admins get it back.
+    // The default menu carries everything; the group menu drops /cancel and
+    // /debt — parameterised, and the money one is admin-only outright — and
+    // group admins get both back.
     const byScope = new Map(menus.map((request) => [
       request.body.scope ? request.body.scope.type : 'default',
       request.body.commands.map((command) => command.command),
     ]));
-    expect(byScope.get('default')).toEqual(['book', 'courts', 'tab', 'help', 'cancel']);
+    expect(byScope.get('default'))
+      .toEqual(['book', 'courts', 'tab', 'help', 'cancel', 'debt']);
     expect(byScope.get('all_group_chats')).toEqual(['book', 'courts', 'tab', 'help']);
     expect(byScope.get('all_chat_administrators'))
-      .toEqual(['book', 'courts', 'tab', 'help', 'cancel']);
+      .toEqual(['book', 'courts', 'tab', 'help', 'cancel', 'debt']);
     // Never a group message, not even for the moment before a delete. The cost
     // is that it cannot be cleared from the sender's own chat afterwards.
     for (const menu of menus) {
@@ -1877,5 +1879,141 @@ describe('Telegram commands', () => {
         { BOT_TOKEN: 'test', DB: heartbeatDb(null) });
       expect(response.status).toBe(500);
     });
+  });
+
+  // The ledger row is what makes /debt worth having: it is the same kind of row
+  // a court writes, so it lands in that person's own breakdown with its reason.
+  function debtDb(inserts) {
+    return {
+      prepare(sql) {
+        return {
+          bind(...args) {
+            return {
+              async first() {
+                if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+                if (sql.includes('COALESCE(SUM(amount_cents)')) return { balance: 700 };
+                return null;
+              },
+              async all() {
+                // knownPlayers reads the ledger for everyone ever charged.
+                if (sql.includes('FROM ledger AS l')) {
+                  return { results: [{ slug: 'u11', user_id: 11, name: 'Jared' }] };
+                }
+                return { results: [] };
+              },
+              async run() {
+                if (sql.includes('INSERT INTO ledger')) inserts.push(args);
+                return { meta: { changes: 0 } };
+              },
+            };
+          },
+        };
+      },
+    };
+  }
+
+  function debtEnv(inserts) {
+    return {
+      BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789',
+      OWNER: '@nick', OWNER_USER_ID: '7', OWNER_NAME: 'Nicholas',
+      DB: debtDb(inserts),
+    };
+  }
+
+  function debtMessage(text) {
+    return {
+      message: {
+        message_id: 5,
+        chat: { id: -123456789 },
+        from: { id: 7, username: 'nick', first_name: 'Nick' },
+        text,
+      },
+    };
+  }
+
+  it('adds to a tab from /debt and tells the player why', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 12 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const inserts = [];
+    await handleUpdate(debtEnv(inserts), debtMessage('/debt +2 jared mcdonalds ice cream'));
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0][4]).toBe(200);
+    expect(inserts[0][5]).toContain('mcdonalds ice cream · by @nick');
+    const sends = requests.filter((request) => request.url.endsWith('/sendMessage'));
+    // The person whose money moved was not in the conversation, so they hear it
+    // from the bot with the reason attached.
+    const receipt = sends.find((send) => send.body.receiver_user_id === 11);
+    expect(receipt.body.text).toContain('$2.00 added to your squash tab');
+    expect(receipt.body.text).toContain('mcdonalds ice cream');
+    expect(receipt.body.text).toContain('You now owe <b>$7.00</b>.');
+    const confirmation = sends.find((send) => send.body.receiver_user_id === 7);
+    expect(confirmation.body.text).toContain("$2.00 added to Jared's tab");
+    expect(confirmation.body.text).toContain('Jared now owes <b>$7.00</b>.');
+  });
+
+  it('takes money off a tab when /debt is given a minus', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      JSON.stringify({ ok: true, result: { message_id: 12 } }),
+      { headers: { 'Content-Type': 'application/json' } }
+    )));
+    const inserts = [];
+    await handleUpdate(
+      debtEnv(inserts), debtMessage('/debt -1 jared played only 30 mins last time')
+    );
+    expect(inserts[0][4]).toBe(-100);
+    expect(inserts[0][5]).toContain('played only 30 mins last time');
+  });
+
+  it('refuses /debt from a member and from a name nobody answers to', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify(
+        url.toString().endsWith('/getChatMember')
+          ? { ok: true, result: { status: 'member' } }
+          : { ok: true, result: { message_id: 12 } }
+      ), { headers: { 'Content-Type': 'application/json' } });
+    }));
+    const inserts = [];
+    const member = {
+      message: {
+        message_id: 5,
+        chat: { id: -123456789 },
+        from: { id: 42, username: 'mallory' },
+        text: '/debt +50 jared because i say so',
+      },
+    };
+    await handleUpdate(debtEnv(inserts), member);
+    expect(inserts).toHaveLength(0);
+    const refusal = requests.find((request) => request.url.endsWith('/sendMessage'));
+    expect(refusal.body.text).toContain('Only group admins');
+
+    // Free text must never open a ledger account, so an unknown name is
+    // refused rather than charged.
+    await handleUpdate(debtEnv(inserts), debtMessage('/debt +2 bob ice cream'));
+    expect(inserts).toHaveLength(0);
+    const unknown = requests.filter((request) => request.url.endsWith('/sendMessage')).pop();
+    expect(unknown.body.text).toContain("I don't know <b>bob</b>");
+  });
+
+  it('answers /debt with usage rather than guessing at a missing reason', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 12 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const inserts = [];
+    await handleUpdate(debtEnv(inserts), debtMessage('/debt +2 jared'));
+    expect(inserts).toHaveLength(0);
+    const send = requests.find((request) => request.url.endsWith('/sendMessage'));
+    expect(send.body.text).toContain('/debt +AMOUNT player reason');
+    expect(send.body.text).toContain('The reason is required');
   });
 });
