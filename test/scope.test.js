@@ -2,7 +2,7 @@ import { describe, expect, it, vi, afterEach } from 'vitest';
 import { addBooking } from '../src/bookings.js';
 import { boardChats, dataChatId, reachableChat } from '../src/scope.js';
 
-const GROUP_A = -1004418632524;
+const GROUP_A = -1001111111111;
 const GROUP_B = -984202118;
 const shared = { ALLOWED_CHATS: `${GROUP_A},${GROUP_B}`, DATA_CHAT_ID: String(GROUP_A) };
 const separate = { ALLOWED_CHATS: `${GROUP_A},${GROUP_B}` };

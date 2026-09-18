@@ -194,17 +194,28 @@ export async function rememberPlayer(env, from) {
   // old rows move onto the slug they key as now, because otherwise they are
   // offered Join for a court they are already on, take a second seat on it, and
   // are billed twice for the one game.
+  //
+  // Both spellings can already sit on one booking, where UNIQUE
+  // (booking_id, slug) leaves no room to move the old row in: the delete
+  // drops the old one first so the merge is one row, not a constraint
+  // failure. Only a row that is *theirs* under the new slug counts — the
+  // first statement has just claimed any provisional one — because a handle
+  // can change hands, and the previous holder's seat under it must neither
+  // cost this person their own seat nor be merged into it. Where somebody
+  // else holds the slug, their old-slug row is left exactly as it was:
+  // matchesPlayer follows the numeric id, so it still finds them.
   env.DB.prepare(
     `DELETE FROM booking_players
       WHERE user_id = ? AND slug != ?
-        AND booking_id IN (SELECT booking_id FROM booking_players WHERE slug = ?)`
-  ).bind(who.userId, who.slug, who.slug),
-  // Both spellings can already sit on one booking, where UNIQUE
-  // (booking_id, slug) leaves no room to move the old row in: the delete above
-  // drops it first so the merge is one row, not a constraint failure.
+        AND booking_id IN (
+          SELECT booking_id FROM booking_players WHERE slug = ? AND user_id = ?
+        )`
+  ).bind(who.userId, who.slug, who.slug, who.userId),
   env.DB.prepare(
-    'UPDATE booking_players SET slug = ?, name = ? WHERE user_id = ? AND slug != ?'
-  ).bind(who.slug, who.name, who.userId, who.slug)];
+    `UPDATE booking_players SET slug = ?, name = ?
+      WHERE user_id = ? AND slug != ?
+        AND booking_id NOT IN (SELECT booking_id FROM booking_players WHERE slug = ?)`
+  ).bind(who.slug, who.name, who.userId, who.slug, who.slug)];
   // These statements depend on their order, but D1 can execute the batch in
   // one trip. The fallback keeps lightweight test doubles and local adapters
   // useful without weakening the production path.

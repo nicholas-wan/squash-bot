@@ -21,7 +21,8 @@
     "db:migrate:012": "wrangler d1 execute squashbot-eu --remote --file=migrations/012-maintenance-schedule.sql",
     "db:migrate:013": "wrangler d1 execute squashbot-eu --remote --file=migrations/013-ledger-identities.sql",
     "db:migrate:014": "wrangler d1 execute squashbot-eu --remote --file=migrations/014-availability-notices.sql",
-    "db:verify": "wrangler d1 execute squashbot-eu --remote --command=\"SELECT (SELECT count(tab_message_id) + count(board_day) + count(nudged_month) FROM settings) + (SELECT count(capacity) + count(charged) FROM bookings) + (SELECT count(reminder_sent) + count(pre_reminder_sent) + count(heads) FROM booking_players) + (SELECT count(status) + count(last_attempt_at) FROM monthly_notice_deliveries) + (SELECT count(board) + count(tab) FROM pending_refreshes) + (SELECT count(booking_id) + count(message_id) + count(lease_until) FROM availability_notices) + (SELECT count(next_due) + count(revision) FROM maintenance_schedule) + (SELECT count(user_id) FROM ledger_identity_aliases) AS schema_ok\"",
+    "db:migrate:015": "wrangler d1 execute squashbot-eu --remote --file=migrations/015-processed-updates.sql",
+    "db:verify": "wrangler d1 execute squashbot-eu --remote --command=\"SELECT (SELECT count(tab_message_id) + count(board_day) + count(nudged_month) FROM settings) + (SELECT count(capacity) + count(charged) FROM bookings) + (SELECT count(reminder_sent) + count(pre_reminder_sent) + count(heads) FROM booking_players) + (SELECT count(status) + count(last_attempt_at) FROM monthly_notice_deliveries) + (SELECT count(board) + count(tab) FROM pending_refreshes) + (SELECT count(booking_id) + count(message_id) + count(lease_until) FROM availability_notices) + (SELECT count(next_due) + count(revision) FROM maintenance_schedule) + (SELECT count(user_id) FROM ledger_identity_aliases) + (SELECT count(seen_at) FROM processed_updates) AS schema_ok\"",
     "test": "vitest run"
   },
   "devDependencies": {

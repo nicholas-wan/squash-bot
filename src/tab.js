@@ -405,17 +405,22 @@ export function parseDebtAdjustment(args) {
 // financial history — so an unrecognised word is refused rather than billed.
 //
 // Tried in order, because the group types first names: an account key, then a
-// display name, then a name only one person's begins with. A word two people
-// answer to is refused at every step rather than guessed at, since guessing
-// here bills the wrong person and the bot cannot know it did. Two people means
-// two accounts, not two rows: knownPlayers lists a config `id:@handle` player
-// under the handle and again under the numeric key their charges are filed
-// by, and those resolve to the same ledger account.
+// display name, then a name or handle only one person's begins with. A word
+// two people answer to is refused at every step rather than guessed at, since
+// guessing here bills the wrong person and the bot cannot know it did. Two
+// people means two accounts, not two rows: knownPlayers lists a config
+// `id:@handle` player under the handle and again under the numeric key their
+// charges are filed by, and those resolve to the same ledger account.
+//
+// The prefix step reads handles and names only, never the synthetic `u123`
+// and `nname` keys: those all begin with the same letter, so a stray "u"
+// would otherwise bill whoever happens to be the one account keyed by id.
 export function matchAccount(players, target) {
   const wanted = String(target).replace(/^@/, '').toLowerCase();
   if (!wanted) return { error: 'unknown' };
   const key = /^\d+$/.test(wanted) ? `u${wanted}` : `@${wanted}`;
   const slugOf = (player) => String(player.slug).toLowerCase();
+  const handleOf = (player) => (slugOf(player).startsWith('@') ? slugOf(player).slice(1) : null);
   const nameOf = (player) => String(player.name).replace(/^@/, '').toLowerCase();
   // An account key is unique by construction, so the first hit is the only one.
   const keyed = players.find((player) => [wanted, key].includes(slugOf(player)));
@@ -425,8 +430,8 @@ export function matchAccount(players, target) {
   ).size;
   for (const found of [
     players.filter((player) => nameOf(player) === wanted),
-    players.filter((player) => [slugOf(player).replace(/^@/, ''), nameOf(player)]
-      .some((spelling) => spelling.startsWith(wanted))),
+    players.filter((player) => [handleOf(player), nameOf(player)]
+      .some((spelling) => spelling && spelling.startsWith(wanted))),
   ]) {
     if (!found.length) continue;
     return accounts(found) === 1 ? { player: found[0] } : { error: 'ambiguous' };

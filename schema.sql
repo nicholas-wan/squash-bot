@@ -90,6 +90,17 @@ CREATE TABLE IF NOT EXISTS sent_messages (
   created_at INTEGER NOT NULL
 );
 
+-- Telegram redelivers an update until the webhook answers 2xx, and a
+-- redelivered /debt would be a second ledger row. Every update id is recorded
+-- once and kept for a day; a repeat is answered ok and otherwise ignored.
+CREATE TABLE IF NOT EXISTS processed_updates (
+  update_id INTEGER PRIMARY KEY,
+  seen_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_processed_updates_seen
+  ON processed_updates (seen_at);
+
 -- One row, stamped after each full maintenance pass. The root URL reports its
 -- staleness, so any dumb uptime pinger can tell a dead cron from a live bot.
 CREATE TABLE IF NOT EXISTS heartbeat (

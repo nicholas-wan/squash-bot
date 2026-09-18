@@ -6,8 +6,8 @@ import {
   restoreBoardButtons, runMaintenance, joinPickerView, updateBoard,
 } from './bookings.js';
 import {
-  adminAddPlayer, defaultCapacity, isChatAdmin, knownPlayers, MAX_CAPACITY,
-  raiseCapacity, rememberPlayer, togglePlusOne,
+  adminAddPlayer, defaultCapacity, isChatAdmin, isHouseholdPlayer, knownPlayers,
+  MAX_CAPACITY, raiseCapacity, rememberPlayer, togglePlusOne,
   joinBooking, leaveBooking, removeBookingPlayer, toggleBooking,
 } from './players.js';
 import { looksLikeBooking } from './parser.js';
@@ -18,9 +18,9 @@ import {
   updateTab,
 } from './tab.js';
 import {
-  answerCallback, armWebhookAnswer, deleteEphemeralMessage, deleteMessage,
-  editEphemeralMessage, editReplyMarkup, escapeHtml, OK_MARKUP, sendMessage,
-  setBotProfilePhoto, telegram,
+  answerCallback, armWebhookAnswer, botUsername, deleteEphemeralMessage,
+  deleteMessage, editEphemeralMessage, editReplyMarkup, escapeHtml, OK_MARKUP,
+  sendMessage, setBotProfilePhoto, telegram,
 } from './telegram.js';
 import {
   beginBooking, beginEditBooking, handleBookingCallback, handleBookingReply,
@@ -444,16 +444,13 @@ async function raiseSlotCount(env, callback, match) {
     !raised);
 }
 
-// A private send can come back as an ordinary group message. Every panel uses
-// this one gate so a roster or tab that says "Only you can see this" is never
-// left where everyone can read it. The caller owns the wording shown on failure.
-async function sendPrivatePanel(env, callback, view) {
-  const chatId = callback.message.chat.id;
-  const sent = await sendMessage(env, chatId, view.html, {
-    receiverUserId: callback.from.id,
-    callbackQueryId: callback.id,
-    replyMarkup: view.replyMarkup,
-  });
+// A private send can come back as an ordinary group message. Everything
+// addressed to one person — a panel, a receipt, a reply to a command — goes
+// through this one gate, so a roster, a balance, or a reason somebody was
+// charged is never left where everyone can read it: the public copy is
+// deleted and the caller is told which happened, and owns the wording.
+async function deliverPrivately(env, chatId, userId, html, options = {}) {
+  const sent = await sendMessage(env, chatId, html, { ...options, receiverUserId: userId });
   if (!sent.ok || !sent.result) return { status: 'failed', sent };
   if (sent.result.ephemeral_message_id) return { status: 'private', sent };
   if (sent.result.message_id) {
@@ -461,6 +458,13 @@ async function sendPrivatePanel(env, callback, view) {
     return { status: 'public-fallback', sent, removed };
   }
   return { status: 'failed', sent };
+}
+
+function sendPrivatePanel(env, callback, view) {
+  return deliverPrivately(env, callback.message.chat.id, callback.from.id, view.html, {
+    callbackQueryId: callback.id,
+    replyMarkup: view.replyMarkup,
+  });
 }
 
 function editSucceeded(result) {
@@ -523,18 +527,25 @@ async function dismissMessage(env, callback) {
   const messageId = callback.message && callback.message.message_id;
   if (!messageId) return;
   const chatId = callback.message.chat.id;
-  // The pinned board and the pinned tab wear no dismiss button, but Telegram
-  // never checks callback data against the keyboard it drew, so anyone can
-  // send sb:ok naming one of them and have the group's own record deleted.
-  // Their ids are read back and refused; every other non-ephemeral message
-  // this button lands on is a receipt the tapper is entitled to clear.
-  const pinned = await env.DB.prepare(
-    'SELECT board_message_id, tab_message_id FROM settings WHERE chat_id = ?'
-  ).bind(chatId).first();
-  if (pinned && (Number(pinned.board_message_id) === Number(messageId)
-    || Number(pinned.tab_message_id) === Number(messageId))) {
-    return;
-  }
+  // The pinned board, the pinned tab, and the availability announcement wear
+  // no dismiss button, but Telegram never checks callback data against the
+  // keyboard it drew, so anyone can send sb:ok naming one of them and have the
+  // group's own record deleted. Their ids are read back and refused; every
+  // other non-ephemeral message this button lands on is a receipt the tapper
+  // is entitled to clear.
+  const [pinned, notice] = await Promise.all([
+    env.DB.prepare(
+      'SELECT board_message_id, tab_message_id FROM settings WHERE chat_id = ?'
+    ).bind(chatId).first(),
+    env.DB.prepare(
+      'SELECT message_id FROM availability_notices WHERE chat_id = ?'
+    ).bind(chatId).first(),
+  ]);
+  const shared = [
+    pinned && pinned.board_message_id, pinned && pinned.tab_message_id,
+    notice && notice.message_id,
+  ].filter(Boolean).map(Number);
+  if (shared.includes(Number(messageId))) return;
   await deleteMessage(env, chatId, messageId);
 }
 
@@ -600,15 +611,19 @@ async function settleTapped(env, callback, match) {
   const chatId = callback.message.chat.id;
   const settled = await settleUser(env, chatId, match[1], callback.from);
   // The ledger went quiet for the one person it is about: close the loop
-  // with a private receipt, if they have an id to send it to.
+  // with a private receipt, if they have an id to send it to. Through the
+  // same gate as every panel: a receipt naming a balance must not fall back
+  // to the group, and the admin hears when it did not land.
+  let told = '';
   if (settled && settled.user_id) {
-    await sendMessage(env, chatId,
+    const receipt = await deliverPrivately(env, chatId, settled.user_id,
       `✅ <b>Payment received</b> — your ${formatMoney(settled.balance)} ` +
       'squash tab is settled. Thank you!',
-      { receiverUserId: settled.user_id, replyMarkup: OK_MARKUP });
+      { replyMarkup: OK_MARKUP });
+    if (receipt.status !== 'private') told = ' · they could not be told privately';
   }
   await answerCallback(env, callback.id,
-    settled ? `${settled.name} cleared · ${formatMoney(settled.balance)}`
+    settled ? `${settled.name} cleared · ${formatMoney(settled.balance)}${told}`
       : 'That balance is already clear.', !settled);
 }
 
@@ -627,8 +642,7 @@ async function confirmSettle(env, callback, match) {
 // Every command answers whoever sent it and nobody else, which is the whole
 // point of the bot: the group keeps the pinned board and tab, not the traffic.
 function privateReply(env, msg, html, replyMarkup = OK_MARKUP) {
-  return sendMessage(env, msg.chat.id, html, {
-    receiverUserId: msg.from.id,
+  return deliverPrivately(env, msg.chat.id, msg.from.id, html, {
     replyToEphemeral: msg.ephemeral_message_id || null,
     replyMarkup,
   });
@@ -740,10 +754,17 @@ export async function handleUpdate(env, update) {
     const knownCommands = new Set([
       'start', 'help', 'book', 'courts', 'cancel', 'tab', 'debt',
     ]);
+    // A command addressed @another_bot is theirs, not this bot's — including
+    // a /cancel or a /debt that happens to share a name. The username is one
+    // getMe per isolate, asked for only when a mention is present; when the
+    // lookup fails the command is answered as before, since a bot ignoring
+    // its own commands reads as dead and answering a stranger's is only noise.
+    if (mention) {
+      const me = await botUsername(env);
+      if (me && mention.slice(1).toLowerCase() !== me) return;
+    }
     // A command the bot does not know used to get silence, which reads exactly
-    // like a broken bot. A command addressed @another_bot stays ignored: this
-    // bot does not know its own username to compare against, and answering
-    // someone else's command would be noise.
+    // like a broken bot.
     if (!knownCommands.has(command)) {
       if (mention) return;
       await sendMessage(env, msg.chat.id,
@@ -816,15 +837,13 @@ export async function handleUpdate(env, update) {
       // With everyone settled there is no pinned tab and so no 🧾 button —
       // which left no way at all to read your own history. The command is the
       // only door left, so it opens the same private breakdown the button does.
+      // It carries their own charges, so it goes through the gate that keeps
+      // a private breakdown out of the group.
       const view = await myTabView(
         env, msg.chat.id, msg.from, isChatAdmin(env, msg.chat.id, msg.from)
       );
-      await sendMessage(env, msg.chat.id,
-        `💰 Nothing outstanding on the group tab.\n\n${view.html}`, {
-          receiverUserId: msg.from.id,
-          replyToEphemeral: msg.ephemeral_message_id || null,
-          replyMarkup: view.replyMarkup,
-        });
+      await privateReply(env, msg,
+        `💰 Nothing outstanding on the group tab.\n\n${view.html}`, view.replyMarkup);
       return;
     }
     // Money the courts did not produce: a ball somebody replaced, cash handed
@@ -854,6 +873,14 @@ export async function handleUpdate(env, update) {
             + 'can be charged, so that a typo never opens an account of its own.');
         return;
       }
+      // The organiser pays the courts and the household plays on them for
+      // free: none of them has a tab, and a row for one would put the
+      // organiser on their own tab as a debtor.
+      if (isHouseholdPlayer(env, matched.player)) {
+        await privateReply(env, msg,
+          `<b>${escapeHtml(matched.player.name)}</b> plays for free and is never on the tab.`);
+        return;
+      }
       const entry = await adjustBalance(
         env, msg.chat.id, matched.player, parsed.cents, parsed.reason, msg.from
       );
@@ -862,17 +889,27 @@ export async function handleUpdate(env, update) {
       // The ledger just moved for somebody who was not in the conversation, so
       // they hear it from the bot with the reason attached — the same receipt
       // a settlement sends, and for the same reason. Reachable only once they
-      // have posted at least once, which is what gives them a numeric id.
+      // have posted at least once, which is what gives them a numeric id. The
+      // receipt names a balance and a reason, so it goes through the gate
+      // that keeps it out of the group, and the admin is told when it did not
+      // land: an unprompted ephemeral is the kind Telegram is likeliest to
+      // drop, and the entry is only fair once the person knows about it.
+      let told = '';
       if (entry.userId) {
-        await sendMessage(env, msg.chat.id,
+        const receipt = await deliverPrivately(env, msg.chat.id, entry.userId,
           `🧾 <b>${moved} your squash tab</b>\n\n${escapeHtml(parsed.reason)}\n\n`
           + standingLine('You', entry.balance, true),
-          { receiverUserId: entry.userId, replyMarkup: OK_MARKUP });
+          { replyMarkup: OK_MARKUP });
+        if (receipt.status !== 'private') {
+          told = '\n\nThey could not be told privately, so let them know yourself.';
+        }
+      } else {
+        told = '\n\nThey have never posted here, so they were not told.';
       }
       await privateReply(env, msg,
         `✅ <b>${moved} ${escapeHtml(entry.name)}'s tab</b> — `
         + `${escapeHtml(parsed.reason)}.\n\n`
-        + standingLine(escapeHtml(entry.name), entry.balance));
+        + standingLine(escapeHtml(entry.name), entry.balance) + told);
       return;
     }
     if (command === 'cancel') {
@@ -936,6 +973,45 @@ function adminAuthorized(request, env) {
     || request.headers.get('X-Admin-Secret') === env.ADMIN_SECRET;
 }
 
+// How long an update id is remembered. Telegram gives up redelivering long
+// before this, and the table is pruned on every arrival so it never grows
+// past a day of traffic.
+const PROCESSED_UPDATE_TTL_MS = 24 * 60 * 60 * 1000;
+
+// Telegram redelivers an update until the webhook answers 2xx, and nothing
+// else here tells a redelivery from a new tap or command. Charges are unique
+// per booking and player, and a settlement is conditional on the balance it
+// read — but a /debt entry is a plain append, so a redelivered one is a second
+// row on somebody's tab. Every update is recorded by id before it is handled;
+// a repeat is answered ok and dropped. An update with no id (tests, hand-sent
+// requests) is handled as before. The bookkeeping must not cost the update
+// itself, so a failure here is logged and the update goes through.
+async function firstSighting(env, update) {
+  const updateId = update && update.update_id;
+  if (!Number.isInteger(updateId)) return true;
+  const now = Date.now();
+  const record = env.DB.prepare(
+    'INSERT OR IGNORE INTO processed_updates (update_id, seen_at) VALUES (?, ?)'
+  ).bind(updateId, now);
+  const prune = env.DB.prepare('DELETE FROM processed_updates WHERE seen_at < ?')
+    .bind(now - PROCESSED_UPDATE_TTL_MS);
+  try {
+    let inserted;
+    if (typeof env.DB.batch === 'function') {
+      [inserted] = await env.DB.batch([record, prune]);
+    } else {
+      inserted = await record.run();
+      await prune.run();
+    }
+    // A double that reports no change count is read as a first sighting: the
+    // only safe misreading is the one that handles an update.
+    return !(inserted && inserted.meta && inserted.meta.changes === 0);
+  } catch (error) {
+    console.log(`Update dedup failed: ${error.stack || error}`);
+    return true;
+  }
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -949,6 +1025,10 @@ export default {
         update = await request.json();
       } catch {
         return new Response('bad request', { status: 400 });
+      }
+      if (!(await firstSighting(env, update))) {
+        console.log(`Update ${update.update_id} redelivered by Telegram; already handled`);
+        return new Response('ok');
       }
       const callback = update && update.callback_query;
       if (callback && callback.id) {
@@ -1081,7 +1161,10 @@ export default {
       }
       return new Response(`squashbot is running — last maintenance tick ${staleSeconds}s ago`);
     } catch (error) {
-      return new Response(`squashbot database check failed: ${error.message}`, { status: 500 });
+      // The root is public and unauthenticated, so the detail stays in the
+      // log: a database error message can name tables, bindings, or SQL.
+      console.log(`Health check database read failed: ${error.stack || error}`);
+      return new Response('squashbot database check failed', { status: 500 });
     }
   },
 

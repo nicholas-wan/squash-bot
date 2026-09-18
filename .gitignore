@@ -4,3 +4,7 @@ node_modules/
 .dev.vars
 wrangler.toml
 backup-*.sql
+
+# One-off live repairs: they name real people, ids and balances, so they stay
+# on this machine and never in the public repo.
+repairs/

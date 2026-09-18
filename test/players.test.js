@@ -56,8 +56,9 @@ function rosterDb(rows) {
                   if (row.slug === slug && row.user_id == null) row.user_id = userId;
                 }
               } else if (sql.includes('DELETE FROM booking_players')) {
+                // Only a booking where this person already holds the new slug.
                 const [userId, slug] = args;
-                const taken = rows.filter((row) => row.slug === slug)
+                const taken = rows.filter((row) => row.slug === slug && row.user_id === userId)
                   .map((row) => row.booking_id);
                 for (const row of [...rows]) {
                   if (row.user_id === userId && row.slug !== slug
@@ -66,9 +67,13 @@ function rosterDb(rows) {
                   }
                 }
               } else if (sql.includes('SET slug = ?')) {
+                // Never onto a booking where anybody holds the new slug.
                 const [slug, name, userId] = args;
+                const held = rows.filter((row) => row.slug === slug)
+                  .map((row) => row.booking_id);
                 for (const row of rows) {
-                  if (row.user_id === userId && row.slug !== slug) {
+                  if (row.user_id === userId && row.slug !== slug
+                      && !held.includes(row.booking_id)) {
                     row.slug = slug;
                     row.name = name;
                   }
@@ -133,13 +138,13 @@ describe('player identity', () => {
   });
 
   it('pins the organiser’s handle to their numeric id', () => {
-    const owner = ownerIdentity({ ...env, OWNER_USER_ID: '246334575' });
+    const owner = ownerIdentity({ ...env, OWNER_USER_ID: '111111111' });
     // Still the handle the group knows them by, now with the id that outlives it.
     expect(owner.slug).toBe('@nicholaswan');
     expect(owner.name).toBe('@nicholaswan');
-    expect(owner.userId).toBe(246334575);
+    expect(owner.userId).toBe(111111111);
     // An OWNER that already carries an id keeps it.
-    expect(ownerIdentity({ OWNER: '7:Nicholas', OWNER_USER_ID: '246334575' }))
+    expect(ownerIdentity({ OWNER: '7:Nicholas', OWNER_USER_ID: '111111111' }))
       .toEqual({ userId: 7, username: null, name: 'Nicholas', slug: 'u7' });
   });
 
@@ -148,8 +153,8 @@ describe('player identity', () => {
     vi.stubGlobal('fetch', vi.fn(async () => {
       throw new Error('getChatMember should not be reached');
     }));
-    const pinned = { ...env, OWNER_USER_ID: '246334575' };
-    const renamed = { id: 246334575, username: 'nickw' };
+    const pinned = { ...env, OWNER_USER_ID: '111111111' };
+    const renamed = { id: 111111111, username: 'nickw' };
     expect(await isChatAdmin(pinned, -123, renamed)).toBe(true);
   });
 
@@ -161,7 +166,7 @@ describe('player identity', () => {
         headers: { 'Content-Type': 'application/json' },
       });
     }));
-    const pinned = { ...env, OWNER_USER_ID: '246334575', BOT_TOKEN: 'test-token' };
+    const pinned = { ...env, OWNER_USER_ID: '111111111', BOT_TOKEN: 'test-token' };
     // Same handle as OWNER, different account: the id decides, Telegram is asked.
     expect(await isChatAdmin(pinned, -123, { id: 999, username: 'nicholaswan' })).toBe(false);
     expect(requests.some((url) => url.endsWith('/getChatMember'))).toBe(true);
@@ -270,6 +275,21 @@ describe('remembering a player', () => {
       .toEqual(['1:@alice', '2:@alice']);
     expect(rows.every((row) => row.user_id === 42)).toBe(true);
   });
+
+  it('keeps a seat when the new handle used to be somebody else\'s', async () => {
+    // Bob held @alice once, joined booking 1 under it, and posted, so his row
+    // carries his id. Alice took the handle over and is on booking 1 by id.
+    const rows = [
+      { booking_id: 1, slug: '@alice', user_id: 11, name: '@alice' },
+      { booking_id: 1, slug: 'u42', user_id: 42, name: 'Alice' },
+      { booking_id: 2, slug: 'u42', user_id: 42, name: 'Alice' },
+    ];
+    await rememberPlayer({ DB: rosterDb(rows) }, { id: 42, username: 'alice' });
+    // Bob's seat is Bob's, and Alice's is not deleted as a duplicate of it:
+    // her row on booking 1 stays under her id, where matchesPlayer finds it.
+    expect(rows.map((row) => `${row.booking_id}:${row.slug}:${row.user_id}`))
+      .toEqual(['1:@alice:11', '1:u42:42', '2:@alice:42']);
+  });
 });
 
 describe('rosters', () => {
@@ -314,12 +334,12 @@ describe('rosters', () => {
   it('does not count an id:@handle default as a second organiser seat', async () => {
     const inserts = [];
     const configured = {
-      OWNER: '@nicholaswan', OWNER_USER_ID: '246334575',
-      DEFAULT_PLAYERS: '246334575:@nicholaswan,174640019:@Dodgerblueee',
+      OWNER: '@nicholaswan', OWNER_USER_ID: '111111111',
+      DEFAULT_PLAYERS: '111111111:@nicholaswan,222222222:@Dodgerblueee',
       DB: capturingDb(inserts),
     };
     await seedRoster(configured, -123, 3,
-      { id: 246334575, username: 'nicholaswan' }, 3);
+      { id: 111111111, username: 'nicholaswan' }, 3);
     expect(inserts.map((args) => args[4])).toEqual(['@nicholaswan', '@Dodgerblueee']);
   });
 
