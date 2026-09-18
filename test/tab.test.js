@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  breakdownLines, chargeBooking, myTabView, settleMarkup,
-  settleUser, tabHtml, tabMarkup, theirTabView, updateTab,
+  adjustBalance, breakdownLines, chargeBooking, matchAccount, myTabView,
+  parseDebtAdjustment, settleMarkup, settleUser, tabHtml, tabMarkup,
+  theirTabView, updateTab,
 } from '../src/tab.js';
 
 const env = {
@@ -457,4 +458,188 @@ describe('money tab', () => {
     expect(lines).not.toContain('Earlier history');
   });
 
+});
+
+describe('hand-written debt entries', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('reads an amount, a player, and a reason in the order they are typed', () => {
+    expect(parseDebtAdjustment('-1 jared played only 30 mins last time')).toEqual({
+      target: 'jared', cents: -100, reason: 'played only 30 mins last time',
+    });
+    expect(parseDebtAdjustment('+2 jared mcdonalds ice cream')).toEqual({
+      target: 'jared', cents: 200, reason: 'mcdonalds ice cream',
+    });
+  });
+
+  it('takes the player first just as readily, and reads cents and $ signs', () => {
+    expect(parseDebtAdjustment('jared +2 ice cream')).toEqual({
+      target: 'jared', cents: 200, reason: 'ice cream',
+    });
+    expect(parseDebtAdjustment('@alice -$4.35 half the ball')).toEqual({
+      target: '@alice', cents: -435, reason: 'half the ball',
+    });
+    // Unsigned is a charge: the only kind of entry a court ever makes.
+    expect(parseDebtAdjustment('3 jared new grip').cents).toBe(300);
+  });
+
+  it('refuses an entry that would move nothing or say nothing', () => {
+    expect(parseDebtAdjustment('+2 jared').error).toBe('usage');
+    expect(parseDebtAdjustment('').error).toBe('usage');
+    expect(parseDebtAdjustment('0 jared nothing happened').error).toBe('amount');
+    expect(parseDebtAdjustment('abc jared nope').error).toBe('amount');
+    // A four-figure court is a typo, and the tab is the wrong place to find out.
+    expect(parseDebtAdjustment('9999 jared oops').error).toBe('huge');
+    expect(parseDebtAdjustment(`5 jared ${'x'.repeat(121)}`).error).toBe('long');
+  });
+
+  const players = [
+    { slug: '@jaredlim', name: 'Jared', user_id: 11 },
+    { slug: 'u9', name: '@alice', user_id: 9 },
+    { slug: '@jasmine', name: 'Jasmine', user_id: null },
+  ];
+
+  it('finds a player by first name, handle, or account key', () => {
+    expect(matchAccount(players, 'jared').player.slug).toBe('@jaredlim');
+    expect(matchAccount(players, 'Jared').player.slug).toBe('@jaredlim');
+    expect(matchAccount(players, '@jaredlim').player.slug).toBe('@jaredlim');
+    expect(matchAccount(players, 'alice').player.slug).toBe('u9');
+    expect(matchAccount(players, 'u9').player.slug).toBe('u9');
+    expect(matchAccount(players, '9').player.slug).toBe('u9');
+  });
+
+  it('refuses a name two people answer to rather than billing a guess', () => {
+    expect(matchAccount(players, 'ja').error).toBe('ambiguous');
+    // Two members both called Jared by Telegram, neither with a handle: an
+    // exact name is no safer to guess at than a prefix.
+    const twoJareds = [
+      { slug: 'u11', name: 'Jared', user_id: 11 },
+      { slug: 'u55', name: 'Jared', user_id: 55 },
+    ];
+    expect(matchAccount(twoJareds, 'jared').error).toBe('ambiguous');
+    expect(matchAccount(twoJareds, 'u55').player.user_id).toBe(55);
+    // Free text must never mint a ledger account, the same rule that keeps a
+    // display name from claiming financial history.
+    expect(matchAccount(players, 'bob').error).toBe('unknown');
+  });
+
+  it('counts one person listed two ways as one match, not an ambiguity', () => {
+    // A config `123:@handle` player is known under the handle and again under
+    // the numeric key their charges are filed by.
+    const twice = [
+      { slug: '@handle', name: '@handle', user_id: 123 },
+      { slug: 'u123', name: '@handle', user_id: 123 },
+    ];
+    expect(matchAccount(twice, 'han').player.user_id).toBe(123);
+    expect(matchAccount(twice, 'handle').player.user_id).toBe(123);
+  });
+
+  function debtDb(inserts, existing = 0) {
+    return {
+      prepare(sql) {
+        return {
+          bind(...args) {
+            return {
+              async first() {
+                if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+                if (sql.includes('COALESCE(SUM(amount_cents)')) {
+                  return { balance: existing };
+                }
+                return null;
+              },
+              async all() { return { results: [] }; },
+              async run() {
+                if (sql.includes('INSERT INTO ledger')) inserts.push(args);
+                return { meta: { changes: 1 } };
+              },
+            };
+          },
+        };
+      },
+    };
+  }
+
+  it('writes a charge that carries its reason, its author, and its date', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      JSON.stringify({ ok: true, result: { message_id: 7 } }),
+      { headers: { 'Content-Type': 'application/json' } }
+    )));
+    const inserts = [];
+    const now = vi.spyOn(Date, 'now').mockReturnValue(Date.UTC(2026, 7, 19, 13, 0));
+    const entry = await adjustBalance(
+      { ...env, BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: debtDb(inserts, 500) },
+      -123, { slug: '@jaredlim', name: 'Jared', user_id: 11 }, 200,
+      'mcdonalds ice cream', { id: 5, username: 'nick' }
+    );
+    now.mockRestore();
+    const [row] = inserts;
+    // Keyed on the numeric id, exactly as a court charge is.
+    expect(row[1]).toBe('u11');
+    expect(row[2]).toBe(11);
+    expect(row[4]).toBe(200);
+    // A charge carries its own date, because the breakdown only stamps one on
+    // payments; the author is on the row so the entry can be traced back.
+    expect(row[5]).toBe('mcdonalds ice cream · by @nick · 19 Aug');
+    expect(entry.balance).toBe(500);
+  });
+
+  it('leaves the date off a credit, which the breakdown stamps itself', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      JSON.stringify({ ok: true, result: { message_id: 7 } }),
+      { headers: { 'Content-Type': 'application/json' } }
+    )));
+    const inserts = [];
+    await adjustBalance(
+      { ...env, BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: debtDb(inserts) },
+      -123, { slug: '@jaredlim', name: 'Jared', user_id: 11 }, -100,
+      'played only 30 mins last time', { id: 5, username: 'nick' }
+    );
+    expect(inserts[0][5]).toBe('played only 30 mins last time · by @nick');
+    expect(inserts[0][4]).toBe(-100);
+  });
+
+  it('still reports the entry when only the pinned tab refresh fails', async () => {
+    // Telegram rate-limits the pin edit. The row is already written, so the
+    // command must not read as failed — a retype would write it twice.
+    vi.stubGlobal('fetch', vi.fn(async (url) => new Response(JSON.stringify(
+      String(url).endsWith('/editMessageText')
+        ? { ok: false, error_code: 429, description: 'Too Many Requests: retry after 5' }
+        : { ok: true, result: { message_id: 66 } }
+    ), { headers: { 'Content-Type': 'application/json' } })));
+    const inserts = [];
+    const db = debtDb(inserts, 200);
+    const inner = db.prepare;
+    db.prepare = (sql) => {
+      if (sql.includes('tab_message_id')) {
+        return { bind() { return {
+          async first() { return { board_message_id: null, tab_message_id: 66 }; },
+        }; } };
+      }
+      if (sql.includes('GROUP BY')) {
+        return { bind() { return {
+          async all() { return { results: [{ slug: 'u11', user_id: 11, name: 'Jared', balance: 200 }] }; },
+        }; } };
+      }
+      return inner(sql);
+    };
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const entry = await adjustBalance(
+      { ...env, BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: db },
+      -123, { slug: 'u11', name: 'Jared', user_id: 11 }, 200,
+      'mcdonalds ice cream', { id: 5, username: 'nick' }
+    );
+    log.mockRestore();
+    expect(inserts).toHaveLength(1);
+    expect(entry.balance).toBe(200);
+  });
+
+  it('shows a hand-written entry in the breakdown it was written for', () => {
+    const lines = breakdownLines(env, [
+      { amount_cents: 200, reason: 'mcdonalds ice cream · by @nick · 19 Aug', created_at: 0 },
+      { amount_cents: -100, reason: 'played only 30 mins · by @nick', created_at: Date.now() },
+    ], 'Asia/Singapore').join('\n');
+    expect(lines).toContain('mcdonalds ice cream · by @nick · 19 Aug — $2.00');
+    expect(lines).toContain('played only 30 mins · by @nick');
+    expect(lines).toContain('−$1.00');
+  });
 });

@@ -13,8 +13,9 @@ import {
 import { looksLikeBooking } from './parser.js';
 import { formatMoney } from './pricing.js';
 import {
-  confirmSettleMarkup, myTabView, settleMarkup, settleUser, tabBalances,
-  theirTabView, updateTab,
+  adjustBalance, confirmSettleMarkup, matchAccount, myTabView,
+  parseDebtAdjustment, settleMarkup, settleUser, tabBalances, theirTabView,
+  updateTab,
 } from './tab.js';
 import {
   answerCallback, armWebhookAnswer, deleteEphemeralMessage, deleteMessage,
@@ -56,6 +57,7 @@ function helpHtml(env) {
     'the pinned tab after you have played.\n\n' +
     '/courts — refresh the pinned board\n' +
     '/tab — refresh the pinned money tab\n' +
+    '/debt +2 player reason — admins: add to or take off a debt\n' +
     '/cancel ID — remove a booking\n' +
     '/book [details] [@player or +1] — book with a player or guest';
 }
@@ -622,6 +624,38 @@ async function confirmSettle(env, callback, match) {
   await answerCallback(env, callback.id);
 }
 
+// Every command answers whoever sent it and nobody else, which is the whole
+// point of the bot: the group keeps the pinned board and tab, not the traffic.
+function privateReply(env, msg, html, replyMarkup = OK_MARKUP) {
+  return sendMessage(env, msg.chat.id, html, {
+    receiverUserId: msg.from.id,
+    replyToEphemeral: msg.ephemeral_message_id || null,
+    replyMarkup,
+  });
+}
+
+// Reads the same to the debtor and about them. A balance is only ever one of
+// three things, and saying which is what closes the loop a /debt entry opens:
+// the amount moved means little without where it left the person.
+function standingLine(subject, balance, secondPerson = false) {
+  const [owe, be] = secondPerson ? ['owe', 'are'] : ['owes', 'is'];
+  if (balance > 0) return `${subject} now ${owe} <b>${formatMoney(balance)}</b>.`;
+  if (balance < 0) return `${subject} ${be} <b>${formatMoney(-balance)}</b> in credit.`;
+  return `${subject} ${be} all settled.`;
+}
+
+const DEBT_USAGE = 'Use <code>/debt +AMOUNT player reason</code>.\n\n'
+  + '<code>/debt +2 jared mcdonalds ice cream</code> — adds $2 to what Jared owes\n'
+  + '<code>/debt -1 jared played only 30 mins</code> — takes $1 off\n\n'
+  + 'The reason is required — it is what they read on their own tab.';
+const DEBT_ERRORS = {
+  usage: DEBT_USAGE,
+  amount: `That is not an amount I can read.\n\n${DEBT_USAGE}`,
+  huge: 'That is over $1,000, which is a typo more often than not. '
+    + 'Send it as smaller entries if you meant it.',
+  long: 'That reason is too long for a tab line — keep it under 120 characters.',
+};
+
 // Clearing the message needs the Delete Messages admin right. Failing quietly
 // would leave the booking in the group while the bot behaves as though it had
 // been cleared, so whoever sent it is told to fix the permission.
@@ -703,7 +737,9 @@ export async function handleUpdate(env, update) {
     const command = match[1].toLowerCase();
     const mention = match[2] || null;
     const args = match[3].trim();
-    const knownCommands = new Set(['start', 'help', 'book', 'courts', 'cancel', 'tab']);
+    const knownCommands = new Set([
+      'start', 'help', 'book', 'courts', 'cancel', 'tab', 'debt',
+    ]);
     // A command the bot does not know used to get silence, which reads exactly
     // like a broken bot. A command addressed @another_bot stays ignored: this
     // bot does not know its own username to compare against, and answering
@@ -789,6 +825,54 @@ export async function handleUpdate(env, update) {
           replyToEphemeral: msg.ephemeral_message_id || null,
           replyMarkup: view.replyMarkup,
         });
+      return;
+    }
+    // Money the courts did not produce: a ball somebody replaced, cash handed
+    // over outside the tab, half an hour of a court somebody missed. It moves
+    // money, so it is admin-gated like every other route that does, and it
+    // lands as an ordinary ledger row — which is what puts it in that
+    // person's own breakdown, reason and all, beside the courts they played.
+    if (command === 'debt') {
+      const [admin] = await Promise.all([
+        isChatAdmin(env, msg.chat.id, msg.from), clearCommand,
+      ]);
+      if (!admin) {
+        await privateReply(env, msg, 'Only group admins can change what someone owes.');
+        return;
+      }
+      const parsed = parseDebtAdjustment(args);
+      if (parsed.error) {
+        await privateReply(env, msg, DEBT_ERRORS[parsed.error]);
+        return;
+      }
+      const matched = matchAccount(await knownPlayers(env, msg.chat.id), parsed.target);
+      if (matched.error) {
+        const who = `<b>${escapeHtml(parsed.target)}</b>`;
+        await privateReply(env, msg, matched.error === 'ambiguous'
+          ? `More than one player answers to ${who} — name them by @handle.`
+          : `I don't know ${who}. Only somebody already on a court or on the tab `
+            + 'can be charged, so that a typo never opens an account of its own.');
+        return;
+      }
+      const entry = await adjustBalance(
+        env, msg.chat.id, matched.player, parsed.cents, parsed.reason, msg.from
+      );
+      const moved = `${formatMoney(Math.abs(entry.cents))} `
+        + `${entry.cents > 0 ? 'added to' : 'taken off'}`;
+      // The ledger just moved for somebody who was not in the conversation, so
+      // they hear it from the bot with the reason attached — the same receipt
+      // a settlement sends, and for the same reason. Reachable only once they
+      // have posted at least once, which is what gives them a numeric id.
+      if (entry.userId) {
+        await sendMessage(env, msg.chat.id,
+          `🧾 <b>${moved} your squash tab</b>\n\n${escapeHtml(parsed.reason)}\n\n`
+          + standingLine('You', entry.balance, true),
+          { receiverUserId: entry.userId, replyMarkup: OK_MARKUP });
+      }
+      await privateReply(env, msg,
+        `✅ <b>${moved} ${escapeHtml(entry.name)}'s tab</b> — `
+        + `${escapeHtml(parsed.reason)}.\n\n`
+        + standingLine(escapeHtml(entry.name), entry.balance));
       return;
     }
     if (command === 'cancel') {
@@ -930,6 +1014,7 @@ export default {
       const adminCommands = [
         ...memberCommands,
         { command: 'cancel', description: 'Cancel a booking by ID', is_ephemeral: true },
+        { command: 'debt', description: "Add to or take off a player's tab", is_ephemeral: true },
       ];
       const commands = await telegram(env, 'setMyCommands', { commands: adminCommands });
       const groupMenu = await telegram(env, 'setMyCommands', {
