@@ -337,7 +337,7 @@ describe('public booking announcements', () => {
     expect(sent[0].body.text).toContain('Was: Court 4');
   });
 
-  it('names the booker on the admin panel only', async () => {
+  it('names the booker on the admin panel', async () => {
     captureTelegram();
     const view = await bookingPanelView(
       { BOT_TOKEN: 'test', DB: rosteredDb(bookedByNick, []) }, -123, 3
@@ -424,8 +424,12 @@ describe('public booking announcements', () => {
         slug: '@dodgerblueee', name: '@Dodgerblueee',
       },
     ];
+    // A nearer court in front, so this one is not the board's nearest.
+    const earlier = {
+      ...storedBooking, id: 2, starts_at: startsAt - 86400000, ends_at: endsAt - 86400000,
+    };
     const html = await boardHtml(
-      { DB: bookingDb([storedBooking], roster) }, -123, Date.UTC(2026, 7, 12, 12, 0)
+      { DB: bookingDb([earlier, storedBooking], roster) }, -123, Date.UTC(2026, 7, 12, 12, 0)
     );
     expect(html).toContain('in 7 days · Wed 19 Aug\n9pm · <b>Court 4</b> · 1 slot · 2/3');
     // The roster repeats the same handles on every row, so it moved behind Join.
@@ -436,6 +440,63 @@ describe('public booking announcements', () => {
     const widest = Math.max(...html.replace(/<[^>]+>/g, '').split('\n')
       .map((line) => line.length));
     expect(widest).toBeLessThanOrEqual(30);
+  });
+
+  it('names who is on the nearest court, and only that one', async () => {
+    const soon = {
+      ...storedBooking, id: 2, starts_at: startsAt - 86400000, ends_at: endsAt - 86400000,
+    };
+    const roster = [
+      { id: 1, booking_id: 2, user_id: 7, slug: 'u7', name: 'Nick' },
+      { id: 2, booking_id: 2, user_id: null, slug: '@bo', name: '@Bo' },
+      { id: 3, booking_id: 3, user_id: null, slug: '@alice', name: '@alice' },
+    ];
+    const html = await boardHtml(
+      { DB: bookingDb([soon, storedBooking], roster) }, -123, Date.UTC(2026, 7, 12, 12, 0)
+    );
+    // The court people are deciding about tonight answers "who is on it"
+    // right on the board; the ones further out still keep it behind Join.
+    expect(html).toContain(
+      'in 6 days · Tue 18 Aug\n9pm · <b>Court 4</b> · 1 slot · 2/3\n'
+      + '👥 <a href="tg://user?id=7">Nick</a>, @Bo'
+    );
+    expect(html).not.toContain('@alice');
+  });
+
+  it('names the roster of every court sharing the earliest start', async () => {
+    const twin = { ...storedBooking, id: 4, court: '5' };
+    const roster = [
+      { id: 1, booking_id: 3, user_id: null, slug: '@bo', name: '@Bo' },
+      { id: 2, booking_id: 4, user_id: null, slug: '@alice', name: '@alice' },
+    ];
+    const html = await boardHtml(
+      { DB: bookingDb([storedBooking, twin], roster) }, -123, Date.UTC(2026, 7, 12, 12, 0)
+    );
+    expect(html).toContain('<b>Court 4</b> · 2 slots · 1/3\n👥 @Bo');
+    expect(html).toContain('<b>Court 5</b> · 2 slots · 1/3\n👥 @alice');
+  });
+
+  it('names the booker on the board unless the organiser booked it', async () => {
+    const env = { OWNER: '@nick', OWNER_USER_ID: '7' };
+    const byMember = { ...storedBooking, created_by_user_id: 9, created_by_name: '@jared' };
+    const html = await boardHtml(
+      { ...env, DB: bookingDb([byMember], []) }, -123, Date.UTC(2026, 7, 12, 12, 0)
+    );
+    expect(html).toContain('9pm · <b>Court 4</b> · 3 slots · 0/3\n📝 Booked by @jared');
+
+    // The organiser books most courts; naming them on each row is noise.
+    for (const byOwner of [
+      { ...storedBooking, created_by_user_id: 7, created_by_name: '@nick' },
+      // An older row, or a renamed organiser: the id still says who it was.
+      { ...storedBooking, created_by_user_id: 7, created_by_name: '@oldhandle' },
+      // A booker recorded by name alone, before ids were kept.
+      { ...storedBooking, created_by_user_id: null, created_by_name: '@Nick' },
+    ]) {
+      const quiet = await boardHtml(
+        { ...env, DB: bookingDb([byOwner], []) }, -123, Date.UTC(2026, 7, 12, 12, 0)
+      );
+      expect(quiet).not.toContain('Booked by');
+    }
   });
 
   it('tells the whole roster when somebody joins, once each', async () => {
@@ -671,12 +732,15 @@ describe('public booking announcements', () => {
     );
   });
 
-  it('names nobody on the board for a court with room', async () => {
+  it('names nobody on the board for a later court with room', async () => {
     const two = ['u7', '@dodgerblueee'].map((slug, index) => ({
       id: index + 1, booking_id: 3, user_id: null, slug, name: slug,
     }));
+    const earlier = {
+      ...storedBooking, id: 2, starts_at: startsAt - 86400000, ends_at: endsAt - 86400000,
+    };
     const html = await boardHtml(
-      { DB: bookingDb([storedBooking], two) }, -123, Date.UTC(2026, 7, 12, 12, 0)
+      { DB: bookingDb([earlier, storedBooking], two) }, -123, Date.UTC(2026, 7, 12, 12, 0)
     );
     expect(html).toContain('9pm · <b>Court 4</b> · 1 slot · 2/3');
     expect(html).not.toContain('👥');
