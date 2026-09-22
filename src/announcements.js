@@ -1,4 +1,4 @@
-import { compactTimeRange, courtName, formatCountdown } from './format.js';
+import { compactTimeRange, courtName, formatCountdown, playerTags } from './format.js';
 import { allowedChats, dataChatId } from './scope.js';
 import { DEFAULT_CAPACITY, rosterFor } from './players.js';
 import { getTimezone } from './settings.js';
@@ -36,7 +36,7 @@ async function nextOpenBooking(env, chatId, now) {
   const capacity = booking.capacity || DEFAULT_CAPACITY;
   const free = capacity - roster.reduce((sum, player) => sum + (player.heads || 1), 0);
   // The roster can fill between the two reads; the next sync sees the change.
-  return free > 0 ? { booking, capacity, free } : null;
+  return free > 0 ? { booking, capacity, free, roster } : null;
 }
 
 export async function syncAnnouncements(env, chatId, now = Date.now()) {
@@ -71,13 +71,16 @@ export async function syncAnnouncements(env, chatId, now = Date.now()) {
       }
       return 0;
     }
-    const { booking, capacity, free } = next;
+    const { booking, capacity, free, roster } = next;
     const tz = await getTimezone(env, chatId);
     const html = '🎾 <b>Next available court</b>\n\n'
       + `${formatCountdown(booking.starts_at, tz, now)}\n`
       + `${compactTimeRange(booking.starts_at, booking.ends_at, tz)} · `
       + `<b>${escapeHtml(courtName(booking))}</b> · `
-      + `${free} slot${free === 1 ? '' : 's'} · ${capacity - free}/${capacity}`;
+      + `${free} slot${free === 1 ? '' : 's'} · ${capacity - free}/${capacity}\n`
+      // Who is already on it, so "should I join" can be answered from the
+      // message itself. The booker stays off: the roster is the news.
+      + `👥 ${playerTags(roster)}`;
     // The keyboard is shared, so the admin row is drawn for everyone; the
     // routes behind it refuse a member with a toast. Both open the same
     // private pickers Manage reaches, one tap from the court in question
