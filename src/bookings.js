@@ -445,9 +445,8 @@ function playerTags(roster) {
 // off; anyone else's is shown. The id is the match where it is known, since
 // a handle can change hands; the handle is the fallback for a row written
 // before ids were kept, or a booker recorded by name alone.
-function bookedByLine(env, booking) {
+function bookedByLine(owner, booking) {
   if (!booking.created_by_name) return null;
-  const owner = ownerIdentity(env);
   if (owner) {
     if (owner.userId && booking.created_by_user_id
       && Number(owner.userId) === Number(booking.created_by_user_id)) return null;
@@ -479,6 +478,14 @@ function boardButtons(bookings) {
   return { inline_keyboard: [[{ text: '🙋 Join', callback_data: 'sb:join' }]] };
 }
 
+// A court's name on a button: as short as it can stay unambiguous, since a
+// phone truncates button text from the right.
+function shortBookingLabel(booking, tz) {
+  return `${shortDate(booking.starts_at, tz)} ` +
+    `${compactTimeRange(booking.starts_at, booking.ends_at, tz)} · ` +
+    `${shortCourtName(booking)}`;
+}
+
 // The court list is built per person and sent only to them, so it can offer
 // Join for courts they are not on and Leave for the ones they are. A shared
 // keyboard on the pinned board could never tell the two apart.
@@ -503,9 +510,7 @@ export async function joinPickerView(env, chatId, from, isAdmin = false, now = D
   for (const booking of bookings.slice(0, MAX_JOIN_BUTTONS)) {
     const roster = rosters.get(booking.id) || [];
     const capacity = booking.capacity || DEFAULT_CAPACITY;
-    const label = `${shortDate(booking.starts_at, tz)} ` +
-      `${compactTimeRange(booking.starts_at, booking.ends_at, tz)} · ` +
-      `${shortCourtName(booking)}`;
+    const label = shortBookingLabel(booking, tz);
     const free = Math.max(0, capacity - rosterHeads(roster));
     if (roster.some((player) => matchesPlayer(player, from))) {
       rows.push([{ text: `🚪 Leave ${label}`, callback_data: `sb:leave:${booking.id}` }]);
@@ -532,8 +537,7 @@ export async function joinPickerView(env, chatId, from, isAdmin = false, now = D
     });
     if (open) {
       rows.push([{
-        text: `➕ Seat someone · ${shortDate(open.starts_at, tz)} ` +
-          `${compactTimeRange(open.starts_at, open.ends_at, tz)} · ${shortCourtName(open)}`,
+        text: `➕ Seat someone · ${shortBookingLabel(open, tz)}`,
         callback_data: `sb:addp:${open.id}`,
       }]);
     }
@@ -585,7 +589,12 @@ async function renderBoard(env, chatId, now) {
   // A court booked by somebody other than the organiser says who underneath,
   // so the group can see whose court it is without opening a panel.
   const lines = ['🎾 <b>Upcoming squash courts</b>'];
-  const nearest = bookings[0].starts_at;
+  // A court already in play is listed, but it is no longer the one anyone is
+  // deciding about: its roster is locked. The nearest court is the earliest
+  // that has not started, and only when none is ahead does the court in play
+  // stand in.
+  const nearest = (bookings.find((booking) => booking.starts_at > now) || bookings[0]).starts_at;
+  const owner = ownerIdentity(env);
   for (const booking of bookings) {
     const roster = rosters.get(booking.id) || [];
     const slots = slotsLabel(roster, booking.capacity || DEFAULT_CAPACITY);
@@ -599,7 +608,7 @@ async function renderBoard(env, chatId, now) {
     if ((slots === 'full' || booking.starts_at === nearest) && roster.length) {
       lines.push(`👥 ${playerTags(roster)}`);
     }
-    const bookedBy = bookedByLine(env, booking);
+    const bookedBy = bookedByLine(owner, booking);
     if (bookedBy) lines.push(bookedBy);
   }
   return {

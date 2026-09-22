@@ -68,6 +68,21 @@ const sends = () => requests.filter(r => r.method === 'sendMessage');
 const joinTarget = r => r.reply_markup.inline_keyboard[0][0].callback_data;
 const notice = () => db.prepare('SELECT * FROM availability_notices WHERE chat_id = -123').get();
 
+it('redraws the message when only its keyboard has changed', async () => {
+  seat(1);
+  await syncAnnouncements(env, -123, now);
+  // A deploy that changes the buttons alone: the stored rendering carries the
+  // keyboard, so a message with unchanged text is still brought up to date.
+  db.prepare("UPDATE availability_notices SET html = 'stale' WHERE chat_id = -123").run();
+  expect(await syncAnnouncements(env, -123, now)).toBe(0);
+  expect(requests.at(-1)).toMatchObject({ method: 'editMessageText', message_id: 101 });
+  expect(requests.at(-1).reply_markup.inline_keyboard[1][0].callback_data).toBe('sb:addp:1');
+  // Text and keyboard both unchanged: nothing is sent.
+  const before = requests.length;
+  await syncAnnouncements(env, -123, now);
+  expect(requests.length).toBe(before);
+});
+
 it('posts one silent message for the next open court, edits its slot count, and moves on when it fills', async () => {
   seat(1);
   expect(await syncAnnouncements(env, -123, now)).toBe(0);
