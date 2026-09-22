@@ -497,6 +497,27 @@ describe('the private court list', () => {
     expect(admin.html).toContain('@Bo');
   });
 
+  it('gives an admin a one-tap way to seat somebody on the next open court', async () => {
+    const roster = [{ booking_id: 3, slug: '@alice', name: '@alice', user_id: 9 }];
+    const who = { id: 11, username: 'bob' };
+    const member = await joinPickerView({ DB: db(roster) }, -123, who, false, now);
+    const admin = await joinPickerView({ DB: db(roster) }, -123, who, true, now);
+    const buttons = (view) => view.replyMarkup.inline_keyboard.flat();
+    // Straight to the seat picker: Join, this row, the name — not Manage,
+    // the court, "add a player", the name.
+    const shortcut = buttons(admin).find((b) => b.callback_data === 'sb:addp:3');
+    expect(shortcut.text).toBe('➕ Seat someone · Wed 19 Aug 9pm · C4');
+    expect(buttons(member).map((b) => b.callback_data)).not.toContain('sb:addp:3');
+  });
+
+  it('offers no seating shortcut when every upcoming court is full', async () => {
+    const full = ['@alice', '@bo', '@cy'].map((slug) => ({ booking_id: 3, slug, name: slug }));
+    const admin = await joinPickerView({ DB: db(full) }, -123, { id: 11 }, true, now);
+    const actions = admin.replyMarkup.inline_keyboard.flat().map((b) => b.callback_data);
+    expect(actions).not.toContain('sb:addp:3');
+    expect(actions).toContain('sb:manage');
+  });
+
   it('marks a full court rather than hiding it', async () => {
     const full = ['@a', '@b', '@c'].map((slug) => ({
       booking_id: 3, slug, name: slug, user_id: null,

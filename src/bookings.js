@@ -1,6 +1,7 @@
 import {
   clearRoster, defaultCapacity, DEFAULT_CAPACITY, identity, isChatAdmin,
-  knownPlayers, matchesPlayer, MAX_CAPACITY, openBooking, rosterFor, rostersFor, seedRoster,
+  knownPlayers, matchesPlayer, MAX_CAPACITY, openBooking, ownerIdentity, rosterFor, rostersFor,
+  seedRoster,
 } from './players.js';
 import { compactTimeRange, courtName, formatCountdown, shortClock, shortCourtName, shortDate } from './format.js';
 export { formatCountdown } from './format.js';
@@ -438,6 +439,24 @@ function playerTags(roster) {
   }).join(', ');
 }
 
+// Who booked a court, for the board. The organiser books most of them, so
+// naming them on every row would be noise that buries the one row that is
+// news: a court somebody else took the trouble to book. Their name is left
+// off; anyone else's is shown. The id is the match where it is known, since
+// a handle can change hands; the handle is the fallback for a row written
+// before ids were kept, or a booker recorded by name alone.
+function bookedByLine(env, booking) {
+  if (!booking.created_by_name) return null;
+  const owner = ownerIdentity(env);
+  if (owner) {
+    if (owner.userId && booking.created_by_user_id
+      && Number(owner.userId) === Number(booking.created_by_user_id)) return null;
+    const name = String(booking.created_by_name).toLowerCase();
+    if (name === owner.slug || name === owner.name.toLowerCase()) return null;
+  }
+  return `📝 Booked by ${escapeHtml(booking.created_by_name)}`;
+}
+
 // The board stays about who is playing. Money lives on the tab.
 // Room first, then the head count: "1 slot · 2/3" answers "can I join" at a
 // glance and "how big is the game" right behind it. A full court needs no
@@ -502,6 +521,22 @@ export async function joinPickerView(env, chatId, from, isAdmin = false, now = D
   // Being private, it can hold what only an admin should act on — and name the
   // rosters, which the shared board deliberately does not.
   if (isAdmin) {
+    // Seating somebody is the admin action taken most, and it is nearly always
+    // on the next court with room — the one the availability message points
+    // at. Reaching it through Manage was five taps: Join, Manage, the court,
+    // "add a player", the name. This row opens the seat picker for that court
+    // directly, making it three. Every other court still goes through Manage.
+    const open = bookings.find((booking) => {
+      const roster = rosters.get(booking.id) || [];
+      return rosterHeads(roster) < (booking.capacity || DEFAULT_CAPACITY);
+    });
+    if (open) {
+      rows.push([{
+        text: `➕ Seat someone · ${shortDate(open.starts_at, tz)} ` +
+          `${compactTimeRange(open.starts_at, open.ends_at, tz)} · ${shortCourtName(open)}`,
+        callback_data: `sb:addp:${open.id}`,
+      }]);
+    }
     rows.push([{ text: '⚙️ Manage bookings', callback_data: 'sb:manage' }]);
   }
   rows.push([{ text: '➕ Add booking', callback_data: 'sb:add' }]);
@@ -540,12 +575,17 @@ async function renderBoard(env, chatId, now) {
   // board read as a wall. An open court's roster is dropped because
   // DEFAULT_PLAYERS puts the same handles on every row; who is playing lives
   // behind 🙋 Join, which can answer it per person as the shared board never
-  // could. A full court is the exception: nobody can join it, so the one
+  // could. Two exceptions. A full court: nobody can join it, so the one
   // question left about it is who took it, and that is answered underneath.
-  // Every court is listed, full ones included: the board is the answer to "what
-  // is booked", and a court missing from it reads as a court nobody took. The
-  // slot count carries the difference.
+  // And the nearest court — every court sharing the earliest start — because
+  // that is the one people are deciding about tonight, and "who is on it" is
+  // the question they open the board to ask. Every court is listed, full ones
+  // included: the board is the answer to "what is booked", and a court missing
+  // from it reads as a court nobody took. The slot count carries the difference.
+  // A court booked by somebody other than the organiser says who underneath,
+  // so the group can see whose court it is without opening a panel.
   const lines = ['🎾 <b>Upcoming squash courts</b>'];
+  const nearest = bookings[0].starts_at;
   for (const booking of bookings) {
     const roster = rosters.get(booking.id) || [];
     const slots = slotsLabel(roster, booking.capacity || DEFAULT_CAPACITY);
@@ -556,7 +596,11 @@ async function renderBoard(env, chatId, now) {
     // A full court stays listed — dropping it would read as a court nobody
     // took — but struck through, so the open slots pop at a glance.
     lines.push(slots === 'full' ? `<s>${line}</s>` : line);
-    if (slots === 'full' && roster.length) lines.push(`👥 ${playerTags(roster)}`);
+    if ((slots === 'full' || booking.starts_at === nearest) && roster.length) {
+      lines.push(`👥 ${playerTags(roster)}`);
+    }
+    const bookedBy = bookedByLine(env, booking);
+    if (bookedBy) lines.push(bookedBy);
   }
   return {
     html: lines.join('\n'),

@@ -51,10 +51,15 @@ missing from it would read as a court nobody took. An open court carries its
 head count too — `1 slot · 2/3` is one seat free, two of three taken. An open
 court's roster is not on the board — with `DEFAULT_PLAYERS` seating the same
 people every time it was the same handles on every row, and one shared pinned
-message cannot answer "am I on this?" per person anyway. A full court is the
-exception: nobody can join it, so the board names who took it on a line
-underneath. For an open court, who is playing is named on the court's own panel
-behind ⚙️ Manage, which is private.
+message cannot answer "am I on this?" per person anyway. Two exceptions. A
+full court: nobody can join it, so the board names who took it on a line
+underneath. And the nearest court — every court sharing the earliest start —
+because that is the one people are deciding about tonight, and "who is on it"
+is the question they open the board to ask. For any other open court, who is
+playing is named on the court's own panel behind ⚙️ Manage, which is private.
+A court booked by somebody other than the organiser carries `📝 Booked by`
+and their name underneath; the organiser books most courts, and naming them
+on every row would bury the one row that is news.
 
 The board carries a single **🙋 Join** button. A keyboard belongs to the message,
 so anything drawn on the pinned board reads the same to everyone — which is why
@@ -64,10 +69,14 @@ and can therefore differ per person.
 That list holds up to twelve courts: Join for the ones you are not on, Leave for
 the ones you are, `🔒 Full` for the rest, and **➕ Add booking**. Each court you
 are on is named underneath with who you are playing alongside — the board only
-names the players on full courts, so this is where you read it for the rest,
-and only for your own courts. Group admins
+names the players on full courts and the nearest one, so this is where you
+read it for the rest, and only for your own courts. Group admins
 get **⚙️ Manage bookings** and every roster, since keeping the household
-straight is their job. Manage names who is playing and how
+straight is their job. They also get **➕ Seat someone** for the next court
+with a free slot — the one the availability message points at — which opens
+that court's seat picker directly: Join, the row, the name, three taps where
+going through Manage, the court, and "add a player" was five. Any other court
+is still seated through Manage. Manage names who is playing and how
 many slots are left, edits the date, court, or time, deletes a booking, and lets
 admins open extra slots, seat a player the bot already knows — billed as if
 they joined themselves, or with a friend who costs them a second slot and a
@@ -98,8 +107,8 @@ seeded or unbilled player when identity reuse must be prevented. New ledger char
 usernames are display names rather than ownership proof.
 A group admin can record somebody else as the booker from the confirm form —
 that person is seated and billed as the booker and may cancel the court, while
-the audit row still names the admin. Attribution is for the record: only the
-admin panel ever shows the name, never the board or the group.
+the audit row still names the admin. The board names the booker under the
+court — unless it was the organiser — and the admin panel always does.
 
 ## Money
 
