@@ -5,6 +5,7 @@ import {
   tabNoticeThresholdCents, updateBoard, updateBooking,
 } from '../src/bookings.js';
 import { clearAdminCache } from '../src/players.js';
+import { tabNoticeFallbackDay } from '../src/settings.js';
 
 const startsAt = Date.UTC(2026, 7, 19, 13, 0);
 const endsAt = Date.UTC(2026, 7, 19, 14, 0);
@@ -1193,7 +1194,7 @@ describe('public booking announcements', () => {
   const cronNow = Date.UTC(2026, 7, 12, 12, 0);
 
   function maintenanceDb({
-    boardDay = null, nudgedMonth = '2026-8', balances = [], ledgerRows = [],
+    boardDay = null, nudgedMonth = '2026-8', balances = [], ledgerRows = [], queued = [],
   } = {}) {
     const seen = [];
     return lastMaintenanceDb = {
@@ -1217,6 +1218,7 @@ describe('public booking announcements', () => {
             async all() {
               if (sql.includes('GROUP BY')) return { results: balances };
               if (sql.includes('FROM booking_players')) return { results: [] };
+              if (sql.includes('FROM monthly_notice_deliveries')) return { results: queued };
               if (sql.includes('FROM ledger')) return { results: ledgerRows };
               return { results: sql.includes('ends_at >') ? [storedBooking] : [] };
             },
@@ -1226,6 +1228,64 @@ describe('public booking announcements', () => {
       },
     };
   }
+
+  it('sends a notice nobody has collected by the fallback day, blind, and closes it', async () => {
+    const requests = captureTelegram();
+    // cronNow is the 12th: past the default fallback day of the 7th.
+    const db = maintenanceDb({
+      boardDay: '2026-8-12',
+      queued: [{ slug: 'u9' }, { slug: '@newbie' }, { slug: 'u5' }],
+      balances: [
+        { slug: 'u9', user_id: 9, name: '@alice', balance: 2400 },
+        // Queued while provisional and still never seen: nothing to send to.
+        { slug: '@newbie', user_id: null, name: '@newbie', balance: 3000 },
+        // Paid since the 1st: the row closes without a word.
+        { slug: 'u5', user_id: 5, name: '@paid', balance: 0 },
+      ],
+      ledgerRows: aliceRows,
+    });
+    await runMaintenance({
+      BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DATA_CHAT_ID: '-999', DB: db,
+    }, cronNow);
+    const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
+    expect(sent).toHaveLength(1);
+    // Into the chat they were last seated from, not the storage key.
+    expect(sent[0].body.chat_id).toBe(-123);
+    expect(sent[0].body.receiver_user_id).toBe(9);
+    expect(sent[0].body.text).toContain('• Court 4 · 15 Aug — $24.00');
+    const settled = db.seen
+      .filter((query) => query.sql.includes('SET status = ?'))
+      .map((query) => query.args);
+    expect(settled).toEqual([
+      ['delivered', cronNow, null, -999, '2026-8', 'u9'],
+      ['pending', null, 'no numeric id yet', -999, '2026-8', '@newbie'],
+      ['delivered', null, 'settled or under the threshold before delivery', -999, '2026-8', 'u5'],
+    ]);
+  });
+
+  it('leaves a queued notice to the sighting path before the fallback day', async () => {
+    const requests = captureTelegram();
+    const db = maintenanceDb({
+      boardDay: '2026-8-5',
+      queued: [{ slug: 'u9' }],
+      balances: [{ slug: 'u9', user_id: 9, name: '@alice', balance: 2400 }],
+      ledgerRows: aliceRows,
+    });
+    // 20:00 SGT on 5 Aug: before the 7th.
+    await runMaintenance({
+      BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DATA_CHAT_ID: '-999', DB: db,
+    }, Date.UTC(2026, 7, 5, 12, 0));
+    expect(requests.filter((request) => request.url.endsWith('/sendMessage')))
+      .toHaveLength(0);
+    // And never, when the fallback is switched off.
+    requests.length = 0;
+    await runMaintenance({
+      BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DATA_CHAT_ID: '-999',
+      TAB_NOTICE_FALLBACK_DAY: '0', DB: db,
+    }, cronNow);
+    expect(requests.filter((request) => request.url.endsWith('/sendMessage')))
+      .toHaveLength(0);
+  });
 
   it('redraws each board once per local day so relative labels stay true', async () => {
     const requests = captureTelegram();
@@ -1370,6 +1430,9 @@ describe('public booking announcements', () => {
   });
 
   it('reads the threshold in dollars, and never as zero when it is unset', () => {
+    expect(tabNoticeFallbackDay({})).toBe(7);
+    expect(tabNoticeFallbackDay({ TAB_NOTICE_FALLBACK_DAY: '0' })).toBe(0);
+    expect(tabNoticeFallbackDay({ TAB_NOTICE_FALLBACK_DAY: '31' })).toBe(28);
     expect(tabNoticeThresholdCents({})).toBe(2000);
     expect(tabNoticeThresholdCents({ TAB_NOTICE_MIN: '' })).toBe(2000);
     expect(tabNoticeThresholdCents({ TAB_NOTICE_MIN: 'lots' })).toBe(2000);

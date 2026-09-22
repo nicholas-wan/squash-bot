@@ -23,6 +23,9 @@ DEFAULT_PLAYERS = "123456789:@nicholaswan,987654321:@Dodgerblueee"
 DEFAULT_CAPACITY = "3"
 # Balances under this many dollars are not asked for by the monthly tab notice.
 # TAB_NOTICE_MIN = "20"
+# Day of the month from which a notice nobody has collected by posting is sent
+# anyway, best-effort. 0 turns that off.
+# TAB_NOTICE_FALLBACK_DAY = "7"
 # Optional. Set this to one of the ALLOWED_CHATS ids to make every listed group
 # share one set of bookings, rosters, history, and one tab. Leave it out and each
 # group keeps its own.
