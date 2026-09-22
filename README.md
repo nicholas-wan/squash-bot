@@ -26,7 +26,10 @@ edit, and delete keeps an audit snapshot with the actor and the original text.
 Each group sharing the board also carries one **Next available court** message:
 a silent post (Telegram's native `disable_notification: true`, a notification
 without sound) for the earliest upcoming court with a free slot, with a
-**🙋 Join** button that joins that court. There is only ever one, so the bot's
+**🙋 Join** button that joins that court, and an admin row — **➕ Admin: add**
+and **➖ Admin: remove** — opening that court's seat and remove pickers
+directly. The keyboard is shared, so members see the row too; the routes
+behind it refuse them with a toast. There is only ever one, so the bot's
 latest message is always the most upcoming open court. Joins, +1s, and edits to
 that court's time or court number change the message in place. When a different
 court becomes the one to point at — a nearer court is booked, the current one
