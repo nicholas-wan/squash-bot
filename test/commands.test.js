@@ -956,6 +956,62 @@ describe('Telegram commands', () => {
     expect(answer.body.text).toContain('Some players could not be notified');
   });
 
+  it('opens the seat and remove pickers privately from the availability message', async () => {
+    const booking = {
+      id: 3, chat_id: -123456789, court: '4', capacity: 3,
+      starts_at: Date.UTC(2027, 7, 19, 13, 0), ends_at: Date.UTC(2027, 7, 19, 14, 0),
+    };
+    const db = { prepare(sql) { return { bind() { return {
+      async first() {
+        if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+        if (sql.includes('SELECT * FROM bookings WHERE id')) return booking;
+        return null;
+      },
+      async all() {
+        if (sql.includes('FROM ledger')) {
+          return { results: [{ slug: '@bo', name: '@bo', user_id: 42 }] };
+        }
+        if (sql.includes('FROM booking_players')) {
+          return { results: [{ id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick' }] };
+        }
+        return { results: sql.includes('ends_at >') ? [booking] : [] };
+      },
+      async run() { return { meta: { changes: 1 } }; },
+    }; } }; } };
+    for (const [data, heading, button] of [
+      ['sb:addp:3', 'Seat somebody on', 'sb:addp:3:1:@bo'],
+      ['sb:kick:3', 'Take somebody off', 'sb:kick:3:1'],
+    ]) {
+      const requests = [];
+      vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+        const body = JSON.parse(init.body);
+        requests.push({ url: String(url), body });
+        return new Response(JSON.stringify({ ok: true, result: { ephemeral_message_id: 12 } }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }));
+      await handleUpdate({
+        BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', OWNER_USER_ID: '9', DB: db,
+      }, {
+        callback_query: {
+          id: 'callback-1', data,
+          from: { id: 9, username: 'admin' },
+          // The tap comes off the group message itself: no ephemeral id to edit.
+          message: { message_id: 100, chat: { id: -123456789 } },
+        },
+      });
+      // The picker names a roster, so it must arrive as a new private message
+      // and never as an edit of the group message everyone can read.
+      expect(requests.some((r) => r.url.endsWith('/editMessageText'))).toBe(false);
+      expect(requests.some((r) => r.url.endsWith('/editMessageReplyMarkup'))).toBe(false);
+      const send = requests.find((r) => r.url.endsWith('/sendMessage'));
+      expect(send.body.receiver_user_id).toBe(9);
+      expect(send.body.text).toContain(heading);
+      expect(send.body.reply_markup.inline_keyboard.flat().map((b) => b.callback_data))
+        .toContain(button);
+    }
+  });
+
   it('seats a player with a friend as two heads on one row', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {

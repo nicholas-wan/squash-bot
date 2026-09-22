@@ -89,12 +89,15 @@ export async function syncAnnouncements(env, chatId, now = Date.now()) {
         { text: '➖ Admin: remove', callback_data: `sb:kick:${booking.id}` },
       ],
     ] };
-    if (current.message_id && current.html === html) return 0;
+    // What is stored is the whole rendering, keyboard included, so a change
+    // to the buttons alone still reaches a message whose text is unchanged.
+    const signature = `${html}\n${JSON.stringify(replyMarkup)}`;
+    if (current.message_id && current.html === signature) return 0;
     if (current.message_id) {
       const edited = await editMessage(env, chatId, current.message_id, html, replyMarkup);
       if (edited.ok || /message is not modified/i.test(edited.description || '')) {
         await env.DB.prepare('UPDATE availability_notices SET html = ? WHERE chat_id = ?')
-          .bind(html, chatId).run();
+          .bind(signature, chatId).run();
         return 0;
       }
       if (!/message to edit not found/i.test(edited.description || '')) {
@@ -107,7 +110,7 @@ export async function syncAnnouncements(env, chatId, now = Date.now()) {
     }
     try {
       await env.DB.prepare(`UPDATE availability_notices SET booking_id = ?, message_id = ?, html = ?
-        WHERE chat_id = ?`).bind(booking.id, sent.result.message_id, html, chatId).run();
+        WHERE chat_id = ?`).bind(booking.id, sent.result.message_id, signature, chatId).run();
     } catch (error) {
       // Telegram has already accepted this message. Remove it if persistence
       // failed, otherwise a retry could leave an untracked public duplicate.

@@ -463,6 +463,23 @@ describe('public booking announcements', () => {
     expect(html).not.toContain('@alice');
   });
 
+  it('names the next court to start, not the one already in play', async () => {
+    const now = Date.UTC(2026, 7, 12, 12, 30);
+    const playing = { ...storedBooking, id: 2, starts_at: now - 1800000, ends_at: now + 1800000 };
+    const roster = [
+      { id: 1, booking_id: 2, user_id: null, slug: '@bo', name: '@Bo' },
+      { id: 2, booking_id: 3, user_id: null, slug: '@alice', name: '@alice' },
+    ];
+    const html = await boardHtml({ DB: bookingDb([playing, storedBooking], roster) }, -123, now);
+    // The court in play is locked; the roster worth reading is the next one.
+    expect(html).not.toContain('@Bo');
+    expect(html).toContain('👥 @alice');
+
+    // With nothing ahead of it, the court in play is all there is to name.
+    const alone = await boardHtml({ DB: bookingDb([playing], roster.slice(0, 1)) }, -123, now);
+    expect(alone).toContain('👥 @Bo');
+  });
+
   it('names the roster of every court sharing the earliest start', async () => {
     const twin = { ...storedBooking, id: 4, court: '5' };
     const roster = [
