@@ -10,20 +10,16 @@ export async function nextMaintenanceDue(env, now) {
   const scope = chats.length ? [...new Set([...chats, ...(sharingData(env) ? [sharingData(env)] : [])])] : [];
   const ids = scope.length ? scope.map(() => '?').join(',') : 'NULL';
   const deadlines = [];
-  const monthlyScopes = [];
-  const monthlyArgs = [];
   for (const chat of scope) {
     const tz = await getTimezone(env, chat);
     const p = localParts(now, tz);
     if (chats.includes(chat)) deadlines.push(zonedEpoch(p.y, p.mo, p.d + 1, 0, 0, tz));
     deadlines.push(zonedEpoch(p.y, p.mo, p.d + (p.h >= 9 ? 1 : 0), 9, 0, tz));
-    if (p.h >= 9) {
-      monthlyScopes.push('(chat_id = ? AND month = ?)');
-      monthlyArgs.push(chat, `${p.y}-${p.mo}`);
-    }
   }
   // One aggregate over the existing deadlines, only when a sweep was needed.
   // A spent reminder is excluded even if its original deadline is in the past.
+  // Queued tab notices are not a deadline: they are delivered by the debtor's
+  // next post, not by cron, so a row waiting all month must not wake it.
   const row = await env.DB.prepare(`WITH scoped AS (
       SELECT * FROM bookings WHERE chat_id IN (${ids})
     ) SELECT
@@ -38,12 +34,9 @@ export async function nextMaintenanceDue(env, now) {
       (SELECT MIN(delete_after) FROM sent_messages WHERE chat_id IN (${ids})) AS cleanup_due,
       (SELECT MIN(created_at) + 86400000 FROM booking_drafts) AS draft_due,
       (SELECT MIN(?) FROM pending_refreshes WHERE chat_id IN (${ids})) AS refresh_due,
-      (SELECT MIN(last_attempt_at) + 300000 FROM monthly_notice_deliveries
-        WHERE (${monthlyScopes.join(' OR ') || '0'}) AND status NOT IN ('delivered', 'refused')) AS monthly_due,
       (SELECT MIN(lease_until) FROM availability_notices
         WHERE chat_id IN (${ids}) AND lease_until > ?) AS lease_due`)
-    .bind(...scope, now, now, now, ...scope, nextTick(now), ...scope,
-      ...monthlyArgs, ...scope, now).first();
+    .bind(...scope, now, now, now, ...scope, nextTick(now), ...scope, ...scope, now).first();
   deadlines.push(...Object.values(row || {}).filter(value => value != null));
   // Preserve future deadlines even if less than a minute away. Only overdue
   // work gets a retry boundary; cron jitter must not add a whole extra minute.

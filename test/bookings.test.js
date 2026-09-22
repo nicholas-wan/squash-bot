@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   addBooking, bookingPanelView, BookingConflictError, boardHtml, cancelBooking,
-  deletePanelView, managerView, notifyRosterOfChange, runMaintenance, updateBoard,
-  updateBooking,
+  deletePanelView, deliverSightedTabNotice, managerView, notifyRosterOfChange, runMaintenance,
+  tabNoticeThresholdCents, updateBoard, updateBooking,
 } from '../src/bookings.js';
 import { clearAdminCache } from '../src/players.js';
 
@@ -1196,7 +1196,7 @@ describe('public booking announcements', () => {
     boardDay = null, nudgedMonth = '2026-8', balances = [], ledgerRows = [],
   } = {}) {
     const seen = [];
-    return {
+    return lastMaintenanceDb = {
       seen,
       prepare(sql) {
         return { bind(...args) {
@@ -1274,45 +1274,37 @@ describe('public booking announcements', () => {
       .toHaveLength(0);
   });
 
-  it('tells each debtor their balance once a month, privately, in the group', async () => {
+  it('queues a monthly notice for each debtor over the threshold, sending nothing', async () => {
     const requests = captureTelegram();
     const db = maintenanceDb({
       boardDay: '2026-8-12',
       nudgedMonth: '2026-7',
       balances: [
-        // No id to send to until they post once; the pinned tab still names them.
+        // Under $20: left to the pinned tab rather than asked for.
         { slug: '@thadduu', user_id: null, name: '@thadduu', balance: 1400 },
-        { slug: 'u9', user_id: 9, name: '@alice', balance: 200 },
+        // Over it, with no id yet: queued by slug, matched when they post.
+        { slug: '@newbie', user_id: null, name: '@newbie', balance: 3000 },
+        { slug: 'u9', user_id: 9, name: '@alice', balance: 2400 },
         { slug: 'u5', user_id: 5, name: '@settled', balance: -100 },
       ],
-      ledgerRows: [{
-        slug: 'u9', user_id: 9, name: '@alice', amount_cents: 200,
-        booking_id: 5, reason: 'Court 4 · 15 Aug',
-        created_at: Date.UTC(2026, 7, 15, 14, 0),
-      }],
     });
-    // The data chat id points at a group the bot has left: notices must land
-    // in the chat each player is actually reachable in, not the storage key.
     await runMaintenance({
       BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DATA_CHAT_ID: '-999', DB: db,
     }, cronNow);
-    const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
-    expect(sent).toHaveLength(1);
-    expect(sent[0].body.chat_id).toBe(-123);
-    expect(sent[0].body.receiver_user_id).toBe(9);
-    expect(sent[0].body.text).toContain('August 2026');
-    expect(sent[0].body.text).toContain('$2.00');
-    // The ask carries its own story: the itemised lines, no rate card, no
-    // pointer to go tap something else first.
-    expect(sent[0].body.text).toContain('• Court 4 · 15 Aug — $2.00');
-    expect(sent[0].body.text).not.toContain('$6/hour');
-    expect(sent[0].body.text).not.toContain('My tab');
-    // The month is not stamped complete while a debtor still has no numeric id;
-    // if they post later this month, their own notice remains deliverable.
-    expect(db.seen.find((query) => query.sql.includes('nudged_month) VALUES')))
-      .toBeUndefined();
-    expect(db.seen.find((query) => query.sql.includes('SET status = ?')).args)
-      .toEqual(['delivered', cronNow, -999, '2026-8', 'u9']);
+    // Nothing is sent from cron: an ephemeral message fired blind only reaches
+    // somebody who happens to be online. The row waits for their next post.
+    expect(requests.filter((request) => request.url.endsWith('/sendMessage')))
+      .toHaveLength(0);
+    const queued = db.seen
+      .filter((query) => query.sql.includes('INSERT OR IGNORE INTO monthly_notice_deliveries'))
+      .map((query) => query.args);
+    expect(queued).toEqual([
+      [-999, '2026-8', '@newbie', cronNow],
+      [-999, '2026-8', 'u9', cronNow],
+    ]);
+    // Stamped at once: what is left is the sighting's job, not cron's.
+    expect(db.seen.find((query) => query.sql.includes('nudged_month) VALUES')).args)
+      .toEqual([-999, '2026-8']);
 
     // Already stamped for this month: quiet.
     requests.length = 0;
@@ -1377,7 +1369,15 @@ describe('public booking announcements', () => {
     expect(maxInFlight).toBe(2);
   });
 
-  it('sends the monthly notice for every chat keeping its own books', async () => {
+  it('reads the threshold in dollars, and never as zero when it is unset', () => {
+    expect(tabNoticeThresholdCents({})).toBe(2000);
+    expect(tabNoticeThresholdCents({ TAB_NOTICE_MIN: '' })).toBe(2000);
+    expect(tabNoticeThresholdCents({ TAB_NOTICE_MIN: 'lots' })).toBe(2000);
+    expect(tabNoticeThresholdCents({ TAB_NOTICE_MIN: '0' })).toBe(0);
+    expect(tabNoticeThresholdCents({ TAB_NOTICE_MIN: ' 7.5 ' })).toBe(750);
+  });
+
+  it('queues the monthly notice for every chat keeping its own books', async () => {
     const requests = captureTelegram();
     // Without DATA_CHAT_ID each chat is its own set of books; the old shape
     // served only the first and silently skipped every other chat's debtors.
@@ -1386,7 +1386,7 @@ describe('public booking announcements', () => {
       DB: maintenanceDb({
         boardDay: '2026-8-12',
         nudgedMonth: '2026-7',
-        balances: [{ slug: 'u9', user_id: 9, name: '@alice', balance: 200 }],
+        balances: [{ slug: 'u9', user_id: 9, name: '@alice', balance: 2400 }],
         ledgerRows: [{
           slug: 'u9', user_id: 9, name: '@alice', amount_cents: 200,
           booking_id: 5, reason: 'Court 4 · 15 Aug',
@@ -1394,9 +1394,119 @@ describe('public booking announcements', () => {
         }],
       }),
     }, cronNow);
+    expect(requests.filter((request) => request.url.endsWith('/sendMessage')))
+      .toHaveLength(0);
+    const queued = maintenanceQueued();
+    expect(queued.map((args) => args[0])).toEqual([-123, -456]);
+    expect(queued.every((args) => args[2] === 'u9')).toBe(true);
+  });
+
+  // Reads the queue writes off the most recent maintenanceDb.
+  let lastMaintenanceDb = null;
+  function maintenanceQueued() {
+    return lastMaintenanceDb.seen
+      .filter((query) => query.sql.includes('INSERT OR IGNORE INTO monthly_notice_deliveries'))
+      .map((query) => query.args);
+  }
+
+  // A tab notice is delivered the next time its debtor posts or taps in the
+  // group, which is the one moment an ephemeral message is certain to land.
+  function sightingDb({ due = null, balances = [], ledgerRows = [] } = {}) {
+    const seen = [];
+    return {
+      seen,
+      prepare(sql) {
+        return { bind(...args) {
+          seen.push({ sql, args });
+          return {
+            async first() {
+              if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+              if (sql.includes('FROM monthly_notice_deliveries')) return due;
+              return null;
+            },
+            async all() {
+              if (sql.includes('GROUP BY')) return { results: balances };
+              if (sql.includes('FROM ledger')) return { results: ledgerRows };
+              return { results: [] };
+            },
+            async run() { return { meta: { changes: 1 } }; },
+          };
+        } };
+      },
+    };
+  }
+  const sightingEnv = (db) => ({
+    BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DATA_CHAT_ID: '-999', DB: db,
+  });
+  const alice = { id: 9, username: 'alice' };
+  const aliceRows = [{
+    slug: 'u9', user_id: 9, name: '@alice', amount_cents: 2400,
+    booking_id: 5, reason: 'Court 4 · 15 Aug',
+    created_at: Date.UTC(2026, 7, 15, 14, 0),
+  }];
+
+  it('delivers the queued notice the next time the debtor is seen in the group', async () => {
+    const requests = captureTelegram();
+    const db = sightingDb({
+      due: { month: '2026-8', slug: 'u9' },
+      balances: [{ slug: 'u9', user_id: 9, name: '@alice', balance: 2400 }],
+      ledgerRows: aliceRows,
+    });
+    await deliverSightedTabNotice(sightingEnv(db), -123, alice, cronNow);
+    // Looked up under both spellings the ledger might key them by.
+    expect(db.seen[0].args).toEqual([-999, 'u9', '@alice', cronNow - 300000]);
     const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
-    expect(sent.map((request) => request.body.chat_id)).toEqual([-123, -456]);
-    expect(sent.every((request) => request.body.receiver_user_id === 9)).toBe(true);
+    expect(sent).toHaveLength(1);
+    // Into the chat they are in right now, not the storage key.
+    expect(sent[0].body.chat_id).toBe(-123);
+    expect(sent[0].body.receiver_user_id).toBe(9);
+    expect(sent[0].body.text).toContain('August 2026');
+    // The ask carries its own story: the itemised lines, no rate card, no
+    // pointer to go tap something else first.
+    expect(sent[0].body.text).toContain('• Court 4 · 15 Aug — $24.00');
+    expect(sent[0].body.text).not.toContain('$6/hour');
+    expect(sent[0].body.text).not.toContain('My tab');
+    expect(db.seen.find((query) => query.sql.includes('SET status = ?')).args)
+      .toEqual(['delivered', cronNow, null, -999, '2026-8', 'u9']);
+    // Any older month still waiting for them is covered by this one.
+    expect(db.seen.some((query) => query.sql.includes('superseded') || query.args.includes('superseded by a later notice')))
+      .toBe(true);
+  });
+
+  it('asks for nothing once the balance has been paid or has dropped under the threshold', async () => {
+    const requests = captureTelegram();
+    const db = sightingDb({
+      due: { month: '2026-8', slug: 'u9' },
+      balances: [{ slug: 'u9', user_id: 9, name: '@alice', balance: 1000 }],
+      ledgerRows: aliceRows,
+    });
+    await deliverSightedTabNotice(sightingEnv(db), -123, alice, cronNow);
+    expect(requests.filter((request) => request.url.endsWith('/sendMessage')))
+      .toHaveLength(0);
+    expect(db.seen.find((query) => query.sql.includes('SET status = ?')).args)
+      .toEqual(['delivered', null, 'settled or under the threshold before delivery', -999, '2026-8', 'u9']);
+  });
+
+  it('costs one read and nothing else when nobody is waiting on a notice', async () => {
+    const requests = captureTelegram();
+    const db = sightingDb();
+    await deliverSightedTabNotice(sightingEnv(db), -123, alice, cronNow);
+    expect(db.seen).toHaveLength(1);
+    expect(requests).toHaveLength(0);
+  });
+
+  it('does not hand a balance to whoever now holds its old handle', async () => {
+    const requests = captureTelegram();
+    // Queued under @alice while provisional; the ledger has since tied that
+    // handle's rows to id 42, and the person posting now is id 9.
+    const db = sightingDb({
+      due: { month: '2026-8', slug: '@alice' },
+      balances: [{ slug: '@alice', user_id: 42, name: '@alice', balance: 2400 }],
+    });
+    await deliverSightedTabNotice(sightingEnv(db), -123, alice, cronNow);
+    expect(requests).toHaveLength(0);
+    expect(db.seen.find((query) => query.sql.includes('SET status = ?')).args)
+      .toEqual(['pending', null, null, -999, '2026-8', '@alice']);
   });
 
   it('holds the monthly notice back before 9am local time', async () => {
@@ -1408,5 +1518,6 @@ describe('public booking announcements', () => {
     }, Date.UTC(2026, 7, 11, 22, 0));
     expect(requests.filter((request) => request.url.endsWith('/sendMessage')))
       .toHaveLength(0);
+    expect(maintenanceQueued()).toEqual([]);
   });
 });

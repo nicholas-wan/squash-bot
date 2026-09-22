@@ -79,6 +79,48 @@ describe('Telegram commands', () => {
     expect(removed.body.message_id).toBe(5);
   });
 
+  it('hands a waiting tab notice to its debtor once their own message is answered', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify({ ok: true, result: { ephemeral_message_id: 1 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const db = { prepare(sql) { return { bind() { return {
+      async first() {
+        if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+        if (sql.includes('FROM monthly_notice_deliveries')) return { month: '2026-9', slug: 'u7' };
+        return null;
+      },
+      async all() {
+        if (sql.includes('GROUP BY')) {
+          return { results: [{ slug: 'u7', user_id: 7, name: 'Nick', balance: 2400 }] };
+        }
+        if (sql.includes('FROM ledger')) {
+          return { results: [{
+            slug: 'u7', user_id: 7, name: 'Nick', amount_cents: 2400, booking_id: 5,
+            reason: 'Court 4 · 15 Sep', created_at: Date.UTC(2026, 8, 15, 14, 0),
+          }] };
+        }
+        return { results: [] };
+      },
+      async run() { return { meta: { changes: 1 } }; },
+    }; } }; } };
+    await handleUpdate({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db }, {
+      message: {
+        message_id: 5, chat: { id: -123456789 },
+        from: { id: 7, first_name: 'Nick' }, text: '/help',
+      },
+    });
+    const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
+    // Their own answer first; the notice rides behind it, to them alone.
+    expect(sent.map((request) => request.body.receiver_user_id)).toEqual([7, 7]);
+    expect(sent[0].body.text).toContain('<b>SquashBot</b>');
+    expect(sent[1].body.text).toContain('Your squash tab');
+    expect(sent[1].body.text).toContain('$24.00');
+  });
+
   it('answers an unknown command instead of staying silent', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {

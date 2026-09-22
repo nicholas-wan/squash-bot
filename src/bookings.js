@@ -1366,12 +1366,30 @@ async function flushPendingRefreshes(env) {
   return failures;
 }
 
-// Once a month, everyone still owing hears their own total — in the group, as
-// an ephemeral message only they can see, the same as every other private
-// note. The bot doing the asking is the point: nobody has to be the naggy one.
-// Delivery is claimed per debtor, so retries do not duplicate copies which
-// already arrived. Nothing goes out before 9am local.
-async function sendMonthlyTabNotices(env, now) {
+// Once a month, everyone owing more than the threshold is queued for their
+// own itemised total. Nothing is sent from here: an ephemeral message fired
+// from cron only reliably reaches somebody who is online at that instant
+// (Bot API: "not guaranteed ... especially if they are offline"), and the
+// people who most need the ask are exactly the ones who are not. Each queued
+// row is delivered instead the next time that person posts or taps anything
+// in the group — see deliverSightedTabNotice — when they are demonstrably
+// there. The bot doing the asking is still the point: nobody has to be the
+// naggy one. One row per debtor per month, so the ask repeats monthly and
+// never more often; small balances are left to the pinned tab.
+const DEFAULT_TAB_NOTICE_MIN_DOLLARS = 20;
+
+// TAB_NOTICE_MIN in wrangler.toml, in dollars; balances under it are not
+// asked for. Unset or unreadable falls back to the default rather than to
+// nagging everyone over every dollar.
+export function tabNoticeThresholdCents(env) {
+  const raw = String((env && env.TAB_NOTICE_MIN) || '').trim();
+  // Number('') is 0, which would read "unset" as "ask everyone for anything".
+  const configured = raw === '' ? NaN : Number(raw);
+  return Math.round((Number.isFinite(configured) && configured >= 0
+    ? configured : DEFAULT_TAB_NOTICE_MIN_DOLLARS) * 100);
+}
+
+async function queueMonthlyTabNotices(env, now) {
   const chats = allowedChats(env);
   if (!chats.length) return 0;
   // One pass per set of books: the single shared ledger under DATA_CHAT_ID, or
@@ -1381,9 +1399,7 @@ async function sendMonthlyTabNotices(env, now) {
   let failures = 0;
   for (const chatId of dataChats) {
     try {
-      failures += Number(await sendMonthlyTabNoticesFor(
-        env, now, chatId, chats.includes(chatId) ? chatId : chats[0]
-      )) || 0;
+      failures += Number(await queueMonthlyTabNoticesFor(env, now, chatId)) || 0;
     } catch (error) {
       failures += 1;
       console.log(`Monthly tab notices for chat ${chatId} failed: ${error.stack || error}`);
@@ -1392,93 +1408,111 @@ async function sendMonthlyTabNotices(env, now) {
   return failures;
 }
 
-async function sendMonthlyTabNoticesFor(env, now, chatId, fallbackChat) {
+async function queueMonthlyTabNoticesFor(env, now, chatId) {
   const tz = await getTimezone(env, chatId);
   const parts = localParts(now, tz);
-  if (parts.h < 9) return;
+  if (parts.h < 9) return 0;
   const month = `${parts.y}-${parts.mo}`;
   const setting = await env.DB.prepare(
     'SELECT nudged_month FROM settings WHERE chat_id = ?'
   ).bind(chatId).first();
-  if (setting && setting.nudged_month === month) return;
+  if (setting && setting.nudged_month === month) return 0;
+  const threshold = tabNoticeThresholdCents(env);
+  for (const entry of await tabBalances(env, chatId)) {
+    if (entry.balance < threshold) continue;
+    // A debtor with no numeric id yet is queued too: the row is matched by
+    // slug when they first post, which is also the moment they gain an id.
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO monthly_notice_deliveries
+        (chat_id, month, slug, status, last_attempt_at, delivered_at, last_error)
+       VALUES (?, ?, ?, 'pending', ?, NULL, NULL)`
+    ).bind(chatId, month, entry.slug, now).run();
+  }
+  // Stamped at once: what is left is the sighting's job, not cron's.
+  await env.DB.prepare(
+    `INSERT INTO settings (chat_id, nudged_month) VALUES (?, ?)
+     ON CONFLICT(chat_id) DO UPDATE SET nudged_month = excluded.nudged_month`
+  ).bind(chatId, month).run();
+  return 0;
+}
+
+// A row stuck in "sending" — the worker died mid-send — is claimable again
+// after this long, the same grace the cron path used.
+const NOTICE_CLAIM_GRACE_MS = 5 * 60 * 1000;
+
+// Somebody just posted or tapped in the group: if a tab notice is waiting for
+// them, this is the moment it can actually land. Called after every update,
+// so the common case — nothing waiting — has to be one indexed read and out.
+//
+// Matching is by ledger slug: u<id> for an account the ledger knows by id,
+// @handle for one it only knows provisionally. Both spellings are tried, since
+// which one the ledger uses depends on when the person first posted. A handle
+// can change hands, so a row whose balance is tied to some other id is left
+// alone rather than handed to the current holder. The amount is read fresh at
+// delivery: a balance paid off since the queue was written is not asked for,
+// and one that has dropped under the threshold is not either.
+export async function deliverSightedTabNotice(env, chatId, from, now = Date.now()) {
+  if (!from || !from.id) return;
+  const dataChat = dataChatId(env, chatId);
+  const slugs = [...new Set([`u${from.id}`, identity(from).slug])];
+  const due = await env.DB.prepare(
+    `SELECT month, slug FROM monthly_notice_deliveries
+     WHERE chat_id = ? AND slug IN (?, ?)
+       AND (status = 'pending' OR (status = 'sending' AND last_attempt_at <= ?))
+     ORDER BY month DESC LIMIT 1`
+  ).bind(dataChat, slugs[0], slugs[1] || slugs[0], now - NOTICE_CLAIM_GRACE_MS).first();
+  if (!due) return;
+  const claim = await env.DB.prepare(
+    `UPDATE monthly_notice_deliveries
+     SET status = 'sending', last_attempt_at = ?, last_error = NULL
+     WHERE chat_id = ? AND month = ? AND slug = ?
+       AND (status = 'pending' OR (status = 'sending' AND last_attempt_at <= ?))`
+  ).bind(now, dataChat, due.month, due.slug, now - NOTICE_CLAIM_GRACE_MS).run();
+  if (!claim.meta.changes) return;
+  const settle = (status, error = null) => env.DB.prepare(
+    `UPDATE monthly_notice_deliveries
+     SET status = ?, delivered_at = ?, last_error = ?
+     WHERE chat_id = ? AND month = ? AND slug = ?`
+  ).bind(status, status === 'delivered' && !error ? now : null, error,
+    dataChat, due.month, due.slug).run();
+  const entry = (await tabBalances(env, chatId)).find((row) => row.slug === due.slug);
+  if (entry && entry.user_id && Number(entry.user_id) !== Number(from.id)) {
+    // The handle now belongs to somebody else; the balance does not.
+    await settle('pending');
+    return;
+  }
+  if (!entry || entry.balance < tabNoticeThresholdCents(env)) {
+    await settle('delivered', 'settled or under the threshold before delivery');
+    return;
+  }
+  const tz = await getTimezone(env, chatId);
   const monthName = new Intl.DateTimeFormat('en-SG', {
     timeZone: tz, month: 'long', year: 'numeric',
   }).format(new Date(now));
-  const deleteAfter = endOfLocalDay(now, tz);
-  let failures = 0;
-  let pending = false;
-  for (const entry of await tabBalances(env, chatId)) {
-    // A row without a numeric id cannot be reached until that player posts
-    // once; the pinned tab still names them.
-    if (entry.balance <= 0) continue;
-    if (!entry.user_id) {
-      pending = true;
-      continue;
-    }
-    // A cron overlap, deploy, or timeout may leave a row in "sending". Five
-    // minutes later it is claimable again; delivered/refused rows are terminal.
-    const claim = await env.DB.prepare(
-      `INSERT INTO monthly_notice_deliveries
-        (chat_id, month, slug, status, last_attempt_at, delivered_at, last_error)
-       VALUES (?, ?, ?, 'sending', ?, NULL, NULL)
-       ON CONFLICT(chat_id, month, slug) DO UPDATE SET
-         status = 'sending', last_attempt_at = excluded.last_attempt_at, last_error = NULL
-       WHERE monthly_notice_deliveries.status NOT IN ('delivered', 'refused')
-         AND monthly_notice_deliveries.last_attempt_at <= ?`
-    ).bind(chatId, month, entry.slug, now, now - 5 * 60 * 1000).run();
-    if (!claim.meta.changes) {
-      const delivery = await env.DB.prepare(
-        `SELECT status FROM monthly_notice_deliveries
-         WHERE chat_id = ? AND month = ? AND slug = ?`
-      ).bind(chatId, month, entry.slug).first();
-      if (!delivery || !['delivered', 'refused'].includes(delivery.status)) pending = true;
-      continue;
-    }
-    // The ask arrives with its reasons: the same line-by-line story 🧾 My tab
-    // tells, minus the rate card, so paying needs no second tap to trust.
-    const { results: rows } = await env.DB.prepare(
-      'SELECT * FROM ledger WHERE chat_id = ? AND slug = ? ORDER BY created_at, id'
-    ).bind(chatId, entry.slug).all();
-    const lines = [
-      `💰 <b>Your squash tab — ${escapeHtml(monthName)}</b>`,
-      ...breakdownLines(env, rows, tz, { pricing: false }),
-    ];
-    // An ephemeral message is only visible in the chat it is posted to, and
-    // the data chat id may be no chat at all: aim for the chat this player
-    // was last seated from, falling back to one the bot serves.
-    const seat = await env.DB.prepare(
-      'SELECT chat_id FROM booking_players WHERE user_id = ? ORDER BY id DESC LIMIT 1'
-    ).bind(entry.user_id).first();
-    const target = reachableChat(env, { chat_id: seat && seat.chat_id }, fallbackChat);
-    const outcome = await sendPrivately(env, target, lines.join('\n'),
-      entry.user_id, deleteAfter, { replyMarkup: OK_MARKUP });
-    if (outcome === 'private' || outcome === 'refused') {
-      await env.DB.prepare(
-        `UPDATE monthly_notice_deliveries
-         SET status = ?, delivered_at = ?, last_error = NULL
-         WHERE chat_id = ? AND month = ? AND slug = ?`
-      ).bind(
-        outcome === 'private' ? 'delivered' : 'refused',
-        outcome === 'private' ? now : null,
-        chatId, month, entry.slug
-      ).run();
-      continue;
-    }
-    pending = true;
-    failures += 1;
+  // The ask arrives with its reasons: the same line-by-line story 🧾 My tab
+  // tells, minus the rate card, so paying needs no second tap to trust.
+  const { results: rows } = await env.DB.prepare(
+    'SELECT * FROM ledger WHERE chat_id = ? AND slug = ? ORDER BY created_at, id'
+  ).bind(dataChat, due.slug).all();
+  const html = [
+    `💰 <b>Your squash tab — ${escapeHtml(monthName)}</b>`,
+    ...breakdownLines(env, rows, tz, { pricing: false }),
+  ].join('\n');
+  // Sent to the chat the person is in right now — the one place an ephemeral
+  // message is certain to be looked at — and cleared with the day's receipts.
+  const outcome = await sendPrivately(env, chatId, html, from.id, endOfLocalDay(now, tz),
+    { replyMarkup: OK_MARKUP });
+  if (outcome === 'private' || outcome === 'refused') {
+    await settle(outcome === 'private' ? 'delivered' : 'refused');
+    // Older months still queued for the same person would be a second ask on
+    // their next post, for a balance this notice already covers.
     await env.DB.prepare(
-      `UPDATE monthly_notice_deliveries
-       SET status = 'pending', last_error = ?
-       WHERE chat_id = ? AND month = ? AND slug = ?`
-    ).bind(`Telegram delivery ${outcome}`, chatId, month, entry.slug).run();
+      `UPDATE monthly_notice_deliveries SET status = 'delivered', last_error = ?
+       WHERE chat_id = ? AND slug IN (?, ?) AND month < ? AND status IN ('pending', 'sending')`
+    ).bind('superseded by a later notice', dataChat, slugs[0], slugs[1] || slugs[0], due.month).run();
+    return;
   }
-  if (!pending) {
-    await env.DB.prepare(
-      `INSERT INTO settings (chat_id, nudged_month) VALUES (?, ?)
-       ON CONFLICT(chat_id) DO UPDATE SET nudged_month = excluded.nudged_month`
-    ).bind(chatId, month).run();
-  }
-  return failures;
+  await settle('pending', `Telegram delivery ${outcome}`);
 }
 
 export async function runMaintenance(env, now = Date.now()) {
@@ -1487,7 +1521,7 @@ export async function runMaintenance(env, now = Date.now()) {
     ['two-hour reminders', () => sendPreReminders(env, now)],
     ['queued pinned refreshes', () => flushPendingRefreshes(env)],
     ['board refresh', () => refreshStaleBoards(env, now)],
-    ['monthly tab notices', () => sendMonthlyTabNotices(env, now)],
+    ['monthly tab notices', () => queueMonthlyTabNotices(env, now)],
     ['day reminders', () => sendDueReminders(env, now)],
     ['message cleanup', () => purgeFinishedMessages(env, now)],
     ['booking cleanup', () => removeExpiredBookings(env, now)],

@@ -2,8 +2,8 @@ import { runScheduledMaintenance } from './maintenance-schedule.js';
 import { rememberLedgerIdentity } from './ledger-identity.js';
 import {
   addPlayerView, authorizeBookingChange, bookingPanelView, cancelBooking, deletePanelView,
-  managerView, notifyRemovedPlayer, notifyRosterOfChange, plusOneView, removePlayerView,
-  restoreBoardButtons, runMaintenance, joinPickerView, updateBoard,
+  deliverSightedTabNotice, managerView, notifyRemovedPlayer, notifyRosterOfChange, plusOneView,
+  removePlayerView, restoreBoardButtons, runMaintenance, joinPickerView, updateBoard,
 } from './bookings.js';
 import {
   adminAddPlayer, defaultCapacity, isChatAdmin, isHouseholdPlayer, knownPlayers,
@@ -11,6 +11,7 @@ import {
   joinBooking, leaveBooking, removeBookingPlayer, toggleBooking,
 } from './players.js';
 import { looksLikeBooking } from './parser.js';
+import { allowedChats } from './scope.js';
 import { formatMoney } from './pricing.js';
 import {
   adjustBalance, confirmSettleMarkup, matchAccount, myTabView,
@@ -682,7 +683,34 @@ async function clearSentMessage(env, msg, kind = 'booking message') {
     { receiverUserId: msg.from.id, replyMarkup: OK_MARKUP });
 }
 
+// Every update is a sighting: the person behind it is in the group right now,
+// which is the one moment a private note is certain to reach them. Anything
+// queued for them goes out once their own tap or message has been dealt with,
+// so their answer never waits behind it, and a failure here is logged rather
+// than allowed to fail the update it rode in on.
 export async function handleUpdate(env, update) {
+  try {
+    await dispatchUpdate(env, update);
+  } finally {
+    await noticeSighting(env, update);
+  }
+}
+
+async function noticeSighting(env, update) {
+  const source = (update.callback_query && update.callback_query.message)
+    ? { chat: update.callback_query.message.chat, from: update.callback_query.from }
+    : (update.message ? { chat: update.message.chat, from: update.message.from } : null);
+  if (!source || !source.chat || !source.from) return;
+  // Quietly: chatAllowed has already logged an ignored chat once for this update.
+  if (!allowedChats(env).includes(Number(source.chat.id))) return;
+  try {
+    await deliverSightedTabNotice(env, source.chat.id, source.from);
+  } catch (error) {
+    console.log(`Sighted tab notice failed: ${error.stack || error}`);
+  }
+}
+
+async function dispatchUpdate(env, update) {
   const callback = update.callback_query;
   if (callback && callback.message) {
     if (!chatAllowed(env, callback.message.chat)) return;
