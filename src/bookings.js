@@ -3,7 +3,10 @@ import {
   knownPlayers, matchesPlayer, MAX_CAPACITY, openBooking, ownerIdentity, rosterFor, rostersFor,
   seedRoster,
 } from './players.js';
-import { compactTimeRange, courtName, formatCountdown, shortClock, shortCourtName, shortDate } from './format.js';
+import {
+  compactTimeRange, courtName, formatCountdown, playerHeads, playerTags, rosterHeads, shortClock,
+  shortCourtName, shortDate,
+} from './format.js';
 export { formatCountdown } from './format.js';
 import { allowedChats, boardChats, dataChatId, reachableChat, sharingData } from './scope.js';
 import { getTimezone, updatePinnedMessage } from './settings.js';
@@ -12,7 +15,7 @@ import { formatDate, formatTime, localParts, zonedEpoch } from './time.js';
 import { queuePinnedRefresh } from './refresh-queue.js';
 import { maintainAnnouncements, syncAnnouncements } from './announcements.js';
 import {
-  deleteEphemeralMessage, deleteMessage, editReplyMarkup, escapeHtml, mentionHtml,
+  deleteEphemeralMessage, deleteMessage, editReplyMarkup, escapeHtml,
   OK_MARKUP, sendMessage,
 } from './telegram.js';
 
@@ -413,31 +416,6 @@ const MAX_JOIN_BUTTONS = 12;
 
 // The comma Intl puts after the weekday is dropped: these read alongside “·”
 // separators, and on a phone every character counts against wrapping.
-// Slots one roster row holds: two when an admin seated that member with a
-// friend. A row written before the column existed carries no heads at all, and
-// stands for the one person it always did.
-function playerHeads(player) {
-  return player.heads || 1;
-}
-
-// Capacity and the tab both count people, not rows, so every comparison against
-// capacity goes through this rather than roster.length.
-function rosterHeads(roster) {
-  return roster.reduce((total, player) => total + playerHeads(player), 0);
-}
-
-// A player whose numeric id is known gets a real tag. Anyone still seeded from
-// config by username is written as plain @handle, which Telegram links and
-// notifies by itself; their id is filled in the first time they post.
-function playerTags(roster) {
-  if (!roster.length) return 'nobody yet';
-  return roster.map((player) => {
-    // A friend has no identity of their own, so they are named on the person
-    // who brought them rather than as a row nobody could tap or bill.
-    const name = playerHeads(player) > 1 ? `${player.name} +1` : player.name;
-    return player.user_id ? mentionHtml(player.user_id, name) : escapeHtml(name);
-  }).join(', ');
-}
 
 // Who booked a court, for the board. The organiser books most of them, so
 // naming them on every row would be noise that buries the one row that is

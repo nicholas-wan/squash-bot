@@ -1,3 +1,4 @@
+import { escapeHtml, mentionHtml } from './telegram.js';
 import { localParts } from './time.js';
 
 // How a court is named everywhere a person reads it. These live apart from
@@ -50,4 +51,30 @@ export function shortDate(epochMs, tz) {
   return new Intl.DateTimeFormat('en-SG', {
     timeZone: tz, weekday: 'short', day: 'numeric', month: 'short',
   }).format(new Date(epochMs)).replace(',', '');
+}
+
+// Slots one roster row holds: two when an admin seated that member with a
+// friend. A row written before the column existed carries no heads at all, and
+// stands for the one person it always did.
+export function playerHeads(player) {
+  return player.heads || 1;
+}
+
+// Capacity and the tab both count people, not rows, so every comparison against
+// capacity goes through this rather than roster.length.
+export function rosterHeads(roster) {
+  return roster.reduce((total, player) => total + playerHeads(player), 0);
+}
+
+// A player whose numeric id is known gets a real tag. Anyone still seeded from
+// config by username is written as plain @handle, which Telegram links and
+// notifies by itself; their id is filled in the first time they post.
+export function playerTags(roster) {
+  if (!roster.length) return 'nobody yet';
+  return roster.map((player) => {
+    // A friend has no identity of their own, so they are named on the person
+    // who brought them rather than as a row nobody could tap or bill.
+    const name = playerHeads(player) > 1 ? `${player.name} +1` : player.name;
+    return player.user_id ? mentionHtml(player.user_id, name) : escapeHtml(name);
+  }).join(', ');
 }

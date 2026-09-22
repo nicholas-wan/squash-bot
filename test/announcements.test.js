@@ -99,12 +99,15 @@ it('posts one silent message for the next open court, edits its slot count, and 
   expect(requests[0].text).toContain('Next available court');
   expect(requests[0].text).toContain('in 3 days');
   expect(requests[0].text).toContain('2 slots · 1/3');
+  // Who is on it already, tagged where the id is known.
+  expect(requests[0].text).toContain('\n👥 <a href="tg://user?id=1">Player</a>');
   await syncAnnouncements(env, -123, now);
   expect(requests).toHaveLength(1);
   seat(2);
   await syncAnnouncements(env, -123, now);
   expect(requests[1]).toMatchObject({ method: 'editMessageText', message_id: 101 });
   expect(requests[1].text).toContain('1 slot · 2/3');
+  expect(requests[1].text).toContain('Player</a>, <a href="tg://user?id=2">Player</a>');
   seat(3);
   await syncAnnouncements(env, -123, now);
   expect(requests[2]).toMatchObject({ method: 'deleteMessage', message_id: 101 });

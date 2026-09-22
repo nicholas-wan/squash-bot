@@ -26,7 +26,7 @@ edit, and delete keeps an audit snapshot with the actor and the original text.
 Each group sharing the board also carries one **Next available court** message:
 a silent post (Telegram's native `disable_notification: true`, a notification
 without sound) for the earliest upcoming court with a free slot, with a
-**🙋 Join** button that joins that court, and an admin row — **➕ Admin: add**
+**🙋 Join** button that joins that court, the roster as it stands, and an admin row — **➕ Admin: add**
 and **➖ Admin: remove** — opening that court's seat and remove pickers
 directly. The keyboard is shared, so members see the row too; the routes
 behind it refuse them with a toast. There is only ever one, so the bot's
@@ -191,7 +191,8 @@ ordinary chat out of the group for looking like a court. Anybody else's
 booking-shaped message is ignored where it stands — no form, nothing removed —
 so members book with `/book`, which is never public at any point. The booker
 gets a private receipt with an **OK** button either way. The separate availability
-announcement shows the court, time and free slots, without naming its booker or roster.
+announcement shows the court, time, free slots and who is on it already, so
+"should I join" is answerable from the message; it does not name the booker.
 
 Each player is reminded two hours before their court and again at 10am on the
 day. Reminders and receipts clear themselves at the end of the day they are
