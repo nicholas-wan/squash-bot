@@ -9,7 +9,9 @@ import {
 } from './format.js';
 export { formatCountdown } from './format.js';
 import { allowedChats, boardChats, dataChatId, reachableChat, sharingData } from './scope.js';
-import { getTimezone, updatePinnedMessage } from './settings.js';
+import {
+  getTimezone, tabNoticeFallbackDay, tabNoticeThresholdCents, updatePinnedMessage,
+} from './settings.js';
 import { breakdownLines, chargeBooking, tabBalances, updateTab } from './tab.js';
 import { formatDate, formatTime, localParts, zonedEpoch } from './time.js';
 import { queuePinnedRefresh } from './refresh-queue.js';
@@ -19,7 +21,7 @@ import {
   OK_MARKUP, sendMessage,
 } from './telegram.js';
 
-export { getTimezone };
+export { getTimezone, tabNoticeThresholdCents };
 
 function actorName(from) {
   return from ? identity(from).name : null;
@@ -1373,22 +1375,11 @@ async function flushPendingRefreshes(env) {
 // people who most need the ask are exactly the ones who are not. Each queued
 // row is delivered instead the next time that person posts or taps anything
 // in the group — see deliverSightedTabNotice — when they are demonstrably
-// there. The bot doing the asking is still the point: nobody has to be the
-// naggy one. One row per debtor per month, so the ask repeats monthly and
+// there. Somebody not seen by the fallback day is sent it blind after all —
+// see sendOverdueTabNotices — since a notice that might land beats one that
+// never goes. The bot doing the asking is still the point: nobody has to be
+// the naggy one. One row per debtor per month, so the ask repeats monthly and
 // never more often; small balances are left to the pinned tab.
-const DEFAULT_TAB_NOTICE_MIN_DOLLARS = 20;
-
-// TAB_NOTICE_MIN in wrangler.toml, in dollars; balances under it are not
-// asked for. Unset or unreadable falls back to the default rather than to
-// nagging everyone over every dollar.
-export function tabNoticeThresholdCents(env) {
-  const raw = String((env && env.TAB_NOTICE_MIN) || '').trim();
-  // Number('') is 0, which would read "unset" as "ask everyone for anything".
-  const configured = raw === '' ? NaN : Number(raw);
-  return Math.round((Number.isFinite(configured) && configured >= 0
-    ? configured : DEFAULT_TAB_NOTICE_MIN_DOLLARS) * 100);
-}
-
 async function queueMonthlyTabNotices(env, now) {
   const chats = allowedChats(env);
   if (!chats.length) return 0;
@@ -1440,6 +1431,109 @@ async function queueMonthlyTabNoticesFor(env, now, chatId) {
 // after this long, the same grace the cron path used.
 const NOTICE_CLAIM_GRACE_MS = 5 * 60 * 1000;
 
+// The ask arrives with its reasons: the same line-by-line story 🧾 My tab
+// tells, minus the rate card, so paying needs no second tap to trust.
+async function tabNoticeHtml(env, dataChat, slug, tz, now) {
+  const monthName = new Intl.DateTimeFormat('en-SG', {
+    timeZone: tz, month: 'long', year: 'numeric',
+  }).format(new Date(now));
+  const { results: rows } = await env.DB.prepare(
+    'SELECT * FROM ledger WHERE chat_id = ? AND slug = ? ORDER BY created_at, id'
+  ).bind(dataChat, slug).all();
+  return [
+    `💰 <b>Your squash tab — ${escapeHtml(monthName)}</b>`,
+    ...breakdownLines(env, rows, tz, { pricing: false }),
+  ].join('\n');
+}
+
+// Cron's half of the bargain. From the fallback day of the month, a notice
+// nobody has collected by posting is sent the old way: an ephemeral message
+// aimed at the debtor, into the chat they were last seated from, delivered
+// only if they happen to be online — but a maybe beats a never. Sending it
+// closes the row, because Telegram reports success either way and a later
+// sighting cannot tell a dropped copy from one that was read; a second copy
+// would nag everyone who did read the first. A transient failure stays
+// retryable, five minutes apart; a row that cannot be sent at all — no
+// numeric id yet — is marked once and left to the sighting path.
+const NOTICE_NO_ID = 'no numeric id yet';
+
+async function sendOverdueTabNotices(env, now) {
+  const chats = allowedChats(env);
+  if (!chats.length || !tabNoticeFallbackDay(env)) return 0;
+  const dataChats = [...new Set(chats.map((chat) => dataChatId(env, chat)))];
+  let failures = 0;
+  for (const chatId of dataChats) {
+    try {
+      failures += Number(await sendOverdueTabNoticesFor(
+        env, now, chatId, chats.includes(chatId) ? chatId : chats[0]
+      )) || 0;
+    } catch (error) {
+      failures += 1;
+      console.log(`Overdue tab notices for chat ${chatId} failed: ${error.stack || error}`);
+    }
+  }
+  return failures;
+}
+
+async function sendOverdueTabNoticesFor(env, now, chatId, fallbackChat) {
+  const tz = await getTimezone(env, chatId);
+  const parts = localParts(now, tz);
+  if (parts.d < tabNoticeFallbackDay(env) || parts.h < 9) return 0;
+  const month = `${parts.y}-${parts.mo}`;
+  const claimable = `(status = 'sending' OR (status = 'pending'
+       AND (last_error IS NULL OR last_error LIKE 'Telegram delivery%')))
+     AND last_attempt_at <= ?`;
+  const { results: waiting } = await env.DB.prepare(
+    `SELECT slug FROM monthly_notice_deliveries
+     WHERE chat_id = ? AND month = ? AND ${claimable} ORDER BY slug`
+  ).bind(chatId, month, now - NOTICE_CLAIM_GRACE_MS).all();
+  if (!waiting.length) return 0;
+  const balances = await tabBalances(env, chatId);
+  const threshold = tabNoticeThresholdCents(env);
+  const deleteAfter = endOfLocalDay(now, tz);
+  let failures = 0;
+  for (const { slug } of waiting) {
+    const claim = await env.DB.prepare(
+      `UPDATE monthly_notice_deliveries
+       SET status = 'sending', last_attempt_at = ?, last_error = NULL
+       WHERE chat_id = ? AND month = ? AND slug = ? AND ${claimable}`
+    ).bind(now, chatId, month, slug, now - NOTICE_CLAIM_GRACE_MS).run();
+    if (!claim.meta.changes) continue;
+    const settle = (status, error = null) => env.DB.prepare(
+      `UPDATE monthly_notice_deliveries
+       SET status = ?, delivered_at = ?, last_error = ?
+       WHERE chat_id = ? AND month = ? AND slug = ?`
+    ).bind(status, status === 'delivered' && !error ? now : null, error,
+      chatId, month, slug).run();
+    const entry = balances.find((row) => row.slug === slug);
+    if (!entry || entry.balance < threshold) {
+      await settle('delivered', 'settled or under the threshold before delivery');
+      continue;
+    }
+    if (!entry.user_id) {
+      await settle('pending', NOTICE_NO_ID);
+      continue;
+    }
+    // An ephemeral message is only visible in the chat it is posted to, and
+    // the data chat id may be no chat at all: aim for the chat this player
+    // was last seated from, falling back to one the bot serves.
+    const seat = await env.DB.prepare(
+      'SELECT chat_id FROM booking_players WHERE user_id = ? ORDER BY id DESC LIMIT 1'
+    ).bind(entry.user_id).first();
+    const target = reachableChat(env, { chat_id: seat && seat.chat_id }, fallbackChat);
+    const html = await tabNoticeHtml(env, chatId, slug, tz, now);
+    const outcome = await sendPrivately(env, target, html, entry.user_id, deleteAfter,
+      { replyMarkup: OK_MARKUP });
+    if (outcome === 'private' || outcome === 'refused') {
+      await settle(outcome === 'private' ? 'delivered' : 'refused');
+      continue;
+    }
+    failures += 1;
+    await settle('pending', `Telegram delivery ${outcome}`);
+  }
+  return failures;
+}
+
 // Somebody just posted or tapped in the group: if a tab notice is waiting for
 // them, this is the moment it can actually land. Called after every update,
 // so the common case — nothing waiting — has to be one indexed read and out.
@@ -1486,18 +1580,7 @@ export async function deliverSightedTabNotice(env, chatId, from, now = Date.now(
     return;
   }
   const tz = await getTimezone(env, chatId);
-  const monthName = new Intl.DateTimeFormat('en-SG', {
-    timeZone: tz, month: 'long', year: 'numeric',
-  }).format(new Date(now));
-  // The ask arrives with its reasons: the same line-by-line story 🧾 My tab
-  // tells, minus the rate card, so paying needs no second tap to trust.
-  const { results: rows } = await env.DB.prepare(
-    'SELECT * FROM ledger WHERE chat_id = ? AND slug = ? ORDER BY created_at, id'
-  ).bind(dataChat, due.slug).all();
-  const html = [
-    `💰 <b>Your squash tab — ${escapeHtml(monthName)}</b>`,
-    ...breakdownLines(env, rows, tz, { pricing: false }),
-  ].join('\n');
+  const html = await tabNoticeHtml(env, dataChat, due.slug, tz, now);
   // Sent to the chat the person is in right now — the one place an ephemeral
   // message is certain to be looked at — and cleared with the day's receipts.
   const outcome = await sendPrivately(env, chatId, html, from.id, endOfLocalDay(now, tz),
@@ -1522,6 +1605,7 @@ export async function runMaintenance(env, now = Date.now()) {
     ['queued pinned refreshes', () => flushPendingRefreshes(env)],
     ['board refresh', () => refreshStaleBoards(env, now)],
     ['monthly tab notices', () => queueMonthlyTabNotices(env, now)],
+    ['overdue tab notices', () => sendOverdueTabNotices(env, now)],
     ['day reminders', () => sendDueReminders(env, now)],
     ['message cleanup', () => purgeFinishedMessages(env, now)],
     ['booking cleanup', () => removeExpiredBookings(env, now)],

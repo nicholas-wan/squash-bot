@@ -101,3 +101,31 @@ export async function updatePinnedMessage(env, chatId, column, html, replyMarkup
   ).bind(chatId, sent.result.message_id).run();
   return sent.result.message_id;
 }
+
+// The monthly tab notice: from which balance it is queued, and on which day
+// of the month cron sends it blind to anyone not seen since the 1st. Both are
+// read from wrangler.toml; unset or unreadable falls back to the default.
+
+const DEFAULT_TAB_NOTICE_MIN_DOLLARS = 20;
+const DEFAULT_TAB_NOTICE_FALLBACK_DAY = 7;
+
+function configuredNumber(env, name) {
+  const raw = String((env && env[name]) || '').trim();
+  // Number('') is 0, which would read "unset" as a real zero.
+  return raw === '' ? NaN : Number(raw);
+}
+
+// TAB_NOTICE_MIN, in dollars: balances under it are not asked for.
+export function tabNoticeThresholdCents(env) {
+  const configured = configuredNumber(env, 'TAB_NOTICE_MIN');
+  return Math.round((Number.isFinite(configured) && configured >= 0
+    ? configured : DEFAULT_TAB_NOTICE_MIN_DOLLARS) * 100);
+}
+
+// TAB_NOTICE_FALLBACK_DAY: the day of the month from which a notice nobody
+// has collected by posting is sent anyway. 0 turns the blind send off.
+export function tabNoticeFallbackDay(env) {
+  const configured = configuredNumber(env, 'TAB_NOTICE_FALLBACK_DAY');
+  if (!Number.isFinite(configured) || configured < 0) return DEFAULT_TAB_NOTICE_FALLBACK_DAY;
+  return Math.min(Math.floor(configured), 28);
+}

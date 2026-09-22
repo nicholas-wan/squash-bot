@@ -108,6 +108,21 @@ it('includes message cleanup, and never a queued tab notice', async () => {
   expect(await nextMaintenanceDue(env, now)).toBe(Date.UTC(2026,8,10,16));
 });
 
+it('retries a blind copy that failed in transit, from the fallback day on', async () => {
+  // The 10th is past the default fallback day: a copy Telegram dropped in
+  // transit is worth another go five minutes later.
+  db.prepare(`INSERT INTO monthly_notice_deliveries
+    (chat_id,month,slug,status,last_attempt_at,last_error)
+    VALUES (-123,'2026-9','u1','pending',?,'Telegram delivery failed')`).run(now);
+  expect(await nextMaintenanceDue(env, now)).toBe(now + 300000);
+  // Before the fallback day the same row is the sighting's business only.
+  expect(await nextMaintenanceDue({ ...env, TAB_NOTICE_FALLBACK_DAY: '15' }, now))
+    .toBe(Date.UTC(2026,8,10,16));
+  // A row that cannot be sent at all is not a deadline either.
+  db.prepare(`UPDATE monthly_notice_deliveries SET last_error = 'no numeric id yet'`).run();
+  expect(await nextMaintenanceDue(env, now)).toBe(Date.UTC(2026,8,10,16));
+});
+
 it('retains midnight date refresh and morning notices with no courts', async () => {
   expect(await nextMaintenanceDue(env, now)).toBe(Date.UTC(2026,8,10,16));
   expect(await nextMaintenanceDue(env, Date.UTC(2026,8,11,0))).toBe(Date.UTC(2026,8,11,1));
