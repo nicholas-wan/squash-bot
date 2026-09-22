@@ -78,9 +78,17 @@ export async function syncAnnouncements(env, chatId, now = Date.now()) {
       + `${compactTimeRange(booking.starts_at, booking.ends_at, tz)} · `
       + `<b>${escapeHtml(courtName(booking))}</b> · `
       + `${free} slot${free === 1 ? '' : 's'} · ${capacity - free}/${capacity}`;
-    const replyMarkup = { inline_keyboard: [[{
-      text: '🙋 Join', callback_data: `sb:join:${booking.id}`,
-    }]] };
+    // The keyboard is shared, so the admin row is drawn for everyone; the
+    // routes behind it refuse a member with a toast. Both open the same
+    // private pickers Manage reaches, one tap from the court in question
+    // rather than four taps in.
+    const replyMarkup = { inline_keyboard: [
+      [{ text: '🙋 Join', callback_data: `sb:join:${booking.id}` }],
+      [
+        { text: '➕ Admin: add', callback_data: `sb:addp:${booking.id}` },
+        { text: '➖ Admin: remove', callback_data: `sb:kick:${booking.id}` },
+      ],
+    ] };
     if (current.message_id && current.html === html) return 0;
     if (current.message_id) {
       const edited = await editMessage(env, chatId, current.message_id, html, replyMarkup);

@@ -72,7 +72,14 @@ it('posts one silent message for the next open court, edits its slot count, and 
   seat(1);
   expect(await syncAnnouncements(env, -123, now)).toBe(0);
   expect(requests[0]).toMatchObject({ method: 'sendMessage', disable_notification: true,
-    reply_markup: { inline_keyboard: [[{ text: '🙋 Join', callback_data: 'sb:join:1' }]] } });
+    reply_markup: { inline_keyboard: [
+      [{ text: '🙋 Join', callback_data: 'sb:join:1' }],
+      // Admin shortcuts to the seat and remove pickers; members are refused.
+      [
+        { text: '➕ Admin: add', callback_data: 'sb:addp:1' },
+        { text: '➖ Admin: remove', callback_data: 'sb:kick:1' },
+      ],
+    ] } });
   expect(requests[0].receiver_user_id).toBeUndefined();
   expect(requests[0].text).toContain('Next available court');
   expect(requests[0].text).toContain('in 3 days');
