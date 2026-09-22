@@ -21,6 +21,8 @@ DEFAULT_PLAYERS = "123456789:@nicholaswan,987654321:@Dodgerblueee"
 # UNBILLED_PLAYERS = "456789123:@gabrielwann"
 # Players per court before a group admin opens more slots.
 DEFAULT_CAPACITY = "3"
+# Balances under this many dollars are not asked for by the monthly tab notice.
+# TAB_NOTICE_MIN = "20"
 # Optional. Set this to one of the ALLOWED_CHATS ids to make every listed group
 # share one set of bookings, rosters, history, and one tab. Leave it out and each
 # group keeps its own.

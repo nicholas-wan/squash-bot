@@ -156,12 +156,20 @@ matched by numeric id, so history under an old handle is still owned without
 exposing it to a new holder of that handle. Group admins additionally get a row per open balance
 under their own breakdown, each opening that person's tab, since collecting
 is their job; members can never see anyone else's. Clearing a balance sends
-the debtor a private receipt, and once a month — the first cron tick past 9am
-local — everyone still owing gets their itemised balance the same private way,
-so the bot does the asking rather than a person, and the ask arrives with its
-reasons. Delivery is tracked per debtor: transient failures are retried without
-resending notices that already arrived. Both need the debtor's numeric id, so a
-config-seeded player hears nothing until they post once.
+the debtor a private receipt. Once a month — the first cron tick past 9am
+local — everyone owing `TAB_NOTICE_MIN` or more (default $20) is queued for
+their itemised balance, and each one is delivered the same private way the
+next time that person posts or taps anything in the group. Nothing is sent
+from cron itself: an ephemeral message fired blind only reaches somebody who
+happens to be online at that minute, and Telegram says as much, whereas a
+person who has just posted is certainly there. The bot does the asking rather
+than a person, the ask arrives with its reasons, and it comes once a month at
+most: one queued row per debtor per month, a newer month superseding an older
+one still waiting. The amount is read at delivery, so a balance settled or
+brought under the threshold in the meantime is not asked for. Smaller
+balances are left to the pinned tab. The cost of the design is its own
+mirror image: somebody who never posts or taps in the group is never asked,
+and the pinned tab is all that names them.
 
 The 2026 holiday list in `src/pricing.js` should be checked against mom.gov.sg
 each December. `PUBLIC_HOLIDAYS` replaces that list rather than adding to it, so
@@ -272,6 +280,7 @@ edited or cancelled at all, by anybody; it has to reach the tab.
 | `UNBILLED_PLAYERS` | Never billed, but not seated automatically. Use the same numeric-id form |
 | `DEFAULT_CAPACITY` | Players per court before an admin opens more (default 3) |
 | `PUBLIC_HOLIDAYS` | Optional `YYYY-MM-DD` list replacing the built-in one |
+| `TAB_NOTICE_MIN` | Optional. Balance in dollars from which the monthly tab notice is queued (default 20) |
 | `DEFAULT_TIMEZONE` | Defaults to `Asia/Singapore` |
 
 The D1 database is bound as `DB`. Secrets: `BOT_TOKEN`, `WEBHOOK_SECRET`
@@ -327,7 +336,7 @@ The every-minute cron first reads one persisted next-due timestamp. Idle ticks
 skip the maintenance sweep and draft cleanup, while still updating the health
 heartbeat. Due times come from existing court reminders, starts and ends,
 message/draft cleanup, and retries. Midnight refreshes relative date labels;
-9am checks monthly notices. Database triggers invalidate the cached deadline
+9am queues monthly tab notices, which the debtors' own next posts deliver. Database triggers invalidate the cached deadline
 when bookings, rosters or other scheduled work change, so edits cannot leave a
 stale wake-up time. Changes during a sweep get a follow-up pass the next minute;
 failures also retry then. Interactive Join and booking actions still update

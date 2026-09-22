@@ -96,14 +96,16 @@ it('retries failures next minute without marking them healthy', async () => {
   expect(result).toMatchObject({ ok: false, nextDue: now + 60000 });
 });
 
-it('includes message cleanup and retries for pending monthly deliveries', async () => {
+it('includes message cleanup, and never a queued tab notice', async () => {
   db.prepare(`INSERT INTO sent_messages (chat_id,message_id,delete_after,created_at)
     VALUES (-123,10,?,?)`).run(now + 120000, now);
   expect(await nextMaintenanceDue(env, now)).toBe(now + 120000);
   db.exec('DELETE FROM sent_messages');
+  // A queued notice is delivered by the debtor's next post, not by cron, so a
+  // row waiting all month must not turn every idle minute into a sweep.
   db.prepare(`INSERT INTO monthly_notice_deliveries
-    (chat_id,month,slug,status,last_attempt_at) VALUES (-123,'2026-9','u1','sending',?)`).run(now);
-  expect(await nextMaintenanceDue(env, now)).toBe(now + 300000);
+    (chat_id,month,slug,status,last_attempt_at) VALUES (-123,'2026-9','u1','pending',?)`).run(now);
+  expect(await nextMaintenanceDue(env, now)).toBe(Date.UTC(2026,8,10,16));
 });
 
 it('retains midnight date refresh and morning notices with no courts', async () => {
