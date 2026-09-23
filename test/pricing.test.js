@@ -77,13 +77,20 @@ describe('court pricing', () => {
   });
 
   it('warns rather than pretending an unlisted year has no holidays', () => {
-    // The built-in list stops at 2026, so Fri 1 Jan 2027 prices as an ordinary
+    // The built-in list stops at 2027, so Tue 1 Jan 2030 prices as an ordinary
     // weekday. That is unavoidable — gazetted dates cannot be guessed — but it
     // must not happen quietly.
     const logged = captureLogs();
-    expect(isPeakDay(sgt(2027, 1, 1, 9), TZ, holidays)).toBe(false);
-    expect(courtCostCents(sgt(2027, 1, 1, 9), sgt(2027, 1, 1, 10), TZ, holidays)).toBe(300);
-    expect(logged().join('\n')).toContain('No public holidays listed for 2027');
+    expect(isPeakDay(sgt(2030, 1, 1, 9), TZ, holidays)).toBe(false);
+    expect(courtCostCents(sgt(2030, 1, 1, 9), sgt(2030, 1, 1, 10), TZ, holidays)).toBe(300);
+    expect(logged().join('\n')).toContain('No public holidays listed for 2030');
+  });
+
+  it('bills the 2027 weekday holidays at the evening rate', () => {
+    // Good Friday, and the Monday after a Chinese New Year that falls on Sunday.
+    expect(courtCostCents(sgt(2027, 3, 26, 9), sgt(2027, 3, 26, 10), TZ, holidays)).toBe(600);
+    expect(courtCostCents(sgt(2027, 2, 8, 9), sgt(2027, 2, 8, 10), TZ, holidays)).toBe(600);
+    expect(courtCostCents(sgt(2027, 3, 24, 9), sgt(2027, 3, 24, 10), TZ, holidays)).toBe(300);
   });
 
   it('warns when a configured list covers no dates in the year being priced', () => {
