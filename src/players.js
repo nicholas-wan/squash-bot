@@ -440,17 +440,24 @@ export async function adminAddPlayer(env, chatId, bookingId, player, addedByUser
     `INSERT OR IGNORE INTO booking_players
       (booking_id, chat_id, user_id, slug, name, added_by_user_id, heads, created_at)
      SELECT ?, ?, ?, ?, ?, ?, ?, ?
-     WHERE (
+     -- The same person under another key (their @handle, or their numeric
+     -- account) may already be on the court, and a second seat would split
+     -- the court over a head that never played.
+     WHERE NOT EXISTS (
+       SELECT 1 FROM booking_players WHERE booking_id = ? AND user_id = ?
+     )
+     AND (
        SELECT COALESCE(SUM(heads), 0) FROM booking_players WHERE booking_id = ?
      ) <= ?`
   ).bind(
     bookingId, chatId, player.user_id || null, player.slug, player.name,
-    addedByUserId || null, heads, Date.now(), bookingId, capacity - heads
+    addedByUserId || null, heads, Date.now(),
+    bookingId, player.user_id || null, bookingId, capacity - heads
   ).run();
   if (added.meta.changes) return { status: 'added', booking };
   const existing = await env.DB.prepare(
-    'SELECT id FROM booking_players WHERE booking_id = ? AND slug = ?'
-  ).bind(bookingId, player.slug).first();
+    'SELECT id FROM booking_players WHERE booking_id = ? AND (slug = ? OR user_id = ?)'
+  ).bind(bookingId, player.slug, player.user_id || null).first();
   return { status: existing ? 'already' : 'full', booking };
 }
 

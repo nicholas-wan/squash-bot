@@ -737,14 +737,36 @@ export async function addPlayerView(env, chatId, bookingId, heads = 1) {
   const roster = await rosterFor(env, bookingId);
   const capacity = booking.capacity || DEFAULT_CAPACITY;
   if (rosterHeads(roster) + heads > capacity) return null;
-  const seated = new Set(roster.map((player) => player.slug));
+  // One person can be known under two keys — their @handle, and the numeric
+  // account their charges are filed under — and offering both let an admin
+  // seat them twice, splitting the court over a head that was never there.
+  // Everyone is compared by account: their id where one is known, directly or
+  // through the alias a handle was first charged under.
+  const [known, aliases] = await Promise.all([
+    knownPlayers(env, chatId),
+    env.DB.prepare(
+      'SELECT slug, user_id FROM ledger_identity_aliases WHERE chat_id = ? AND user_id > 0'
+    ).bind(dataChatId(env, chatId)).all(),
+  ]);
+  const aliasIds = new Map((aliases.results || []).map((row) => [row.slug, row.user_id]));
+  const accountOf = (player) => {
+    const slug = String(player.slug).toLowerCase();
+    const userId = player.user_id || aliasIds.get(slug);
+    return userId ? `u${userId}` : slug;
+  };
+  const seated = new Set(roster.flatMap((player) => [player.slug, accountOf(player)]));
+  const offered = new Set();
   const encoder = new TextEncoder();
-  const candidates = (await knownPlayers(env, chatId))
-    .filter((player) => !seated.has(player.slug))
+  const candidates = known
+    .filter((player) => !seated.has(player.slug) && !seated.has(accountOf(player)))
     // Telegram caps callback_data at 64 bytes; a slug that will not fit
     // cannot be offered as a button.
     .filter((player) => encoder
       .encode(`sb:addp:${bookingId}:${heads}:${player.slug}`).length <= 64)
+    // The @handle spelling is the one an admin recognises, so it goes first
+    // and is the one kept.
+    .sort((a, b) => Number(!a.slug.startsWith('@')) - Number(!b.slug.startsWith('@')))
+    .filter((player) => !offered.has(accountOf(player)) && offered.add(accountOf(player)))
     .sort((a, b) => a.name.localeCompare(b.name))
     .slice(0, MAX_JOIN_BUTTONS);
   if (!candidates.length) return null;
@@ -1025,6 +1047,10 @@ async function scheduleCleanup(env, chatId, sent, receiverUserId, deleteAfter) {
 // — is worth another go on the next tick.
 const PERMANENT_REFUSAL = /blocked|not found|not a member|not_participant|forbidden|deactivated/i;
 
+// The same, for a whole group: the bot was removed, the group was deleted, or
+// it became a supergroup under a new id. None of it clears up on a retry.
+const CHAT_GONE = /forbidden|chat not found|bot was kicked|bot is not a member|group chat was upgraded/i;
+
 // Telegram falls back to an ordinary group message when it cannot deliver an
 // ephemeral one. Anything addressed to one person — a receipt with the roster on
 // it, a reminder, a removal notice — would then sit in the group instead, so the
@@ -1181,13 +1207,21 @@ async function sendClaimedReminders(env, now, column, headline) {
       }
       if (outcome === 'not-ephemeral') {
         // Claim the rest of this roster so the public fallback is sent once.
+        // Only the claims taken here are handed back if it fails: a player
+        // whose private reminder already went out earlier in this pass would
+        // otherwise be reminded a second time on the next tick.
+        const { results: unclaimed } = await env.DB.prepare(
+          `SELECT id FROM booking_players WHERE booking_id = ? AND ${column}_sent = 0`
+        ).bind(row.id).all();
         await env.DB.prepare(
-          `UPDATE booking_players SET ${column}_sent = 1 WHERE booking_id = ?`
+          `UPDATE booking_players SET ${column}_sent = 1 WHERE booking_id = ? AND ${column}_sent = 0`
         ).bind(row.id).run();
         if (!(await remindPublicly(env, row, roster, headline, tz))) {
+          const ids = [row.player_row_id, ...unclaimed.map((player) => player.id)];
           await env.DB.prepare(
-            `UPDATE booking_players SET ${column}_sent = 0 WHERE booking_id = ?`
-          ).bind(row.id).run();
+            `UPDATE booking_players SET ${column}_sent = 0
+             WHERE id IN (${ids.map(() => '?').join(', ')})`
+          ).bind(...ids).run();
           failures += 1;
         }
         continue;
@@ -1299,12 +1333,21 @@ async function removeExpiredBookings(env, now) {
         console.log(`Cleanup of booking ${booking.id} failed: ${error.stack || error}`);
       }
     }
+    // Separate scopes: a board that cannot be edited used to skip the tab too,
+    // leaving the new charges off it — and a stale settle button up — with
+    // nothing queued to put them there. Each call queues its own retry.
     try {
       await updateBoard(env, chatId, now);
-      if (charged) await updateTab(env, chatId);
     } catch (error) {
       failures += 1;
-      console.log(`Pinned message refresh for chat ${chatId} failed: ${error.stack || error}`);
+      console.log(`Board refresh for chat ${chatId} failed: ${error.stack || error}`);
+    }
+    if (!charged) continue;
+    try {
+      await updateTab(env, chatId);
+    } catch (error) {
+      failures += 1;
+      console.log(`Tab refresh for chat ${chatId} failed: ${error.stack || error}`);
     }
   }
   return failures;
@@ -1355,15 +1398,43 @@ async function flushPendingRefreshes(env) {
   ).bind(...chats).all();
   let failures = 0;
   for (const row of results) {
-    try {
-      if (row.board) await updateBoard(env, row.chat_id);
-      if (row.tab) await updateTab(env, row.chat_id);
-      await env.DB.prepare('DELETE FROM pending_refreshes WHERE chat_id = ?')
-        .bind(row.chat_id).run();
-    } catch (error) {
-      failures += 1;
-      console.log(`Queued pinned refresh for chat ${row.chat_id} failed: ${error.stack || error}`);
+    const errors = [];
+    // The board and the tab are separate messages; one failing is no reason
+    // to leave the other stale.
+    for (const [wanted, refresh] of [[row.board, updateBoard], [row.tab, updateTab]]) {
+      if (!wanted) continue;
+      try {
+        await refresh(env, row.chat_id);
+      } catch (error) {
+        errors.push(error);
+      }
     }
+    try {
+      if (!errors.length) {
+        // Only the request that was read is done. One queued while this ran
+        // bumped updated_at and stays for the next tick.
+        await env.DB.prepare('DELETE FROM pending_refreshes WHERE chat_id = ? AND updated_at = ?')
+          .bind(row.chat_id, row.updated_at).run();
+        continue;
+      }
+      // A chat the bot has been removed from refuses every call for good, and
+      // retrying it every minute kept maintenance from ever finishing cleanly —
+      // which withheld the heartbeat and reported the whole bot as down. The
+      // request is dropped; the next change queues it again, costing one call.
+      if (errors.every((error) => CHAT_GONE.test(String(error.message || error)))) {
+        await env.DB.prepare('DELETE FROM pending_refreshes WHERE chat_id = ?')
+          .bind(row.chat_id).run();
+        console.log(
+          `Gave up refreshing chat ${row.chat_id}: the bot can no longer reach it `
+          + `(${errors[0].message || errors[0]}). Remove it from ALLOWED_CHATS or add the bot back.`
+        );
+        continue;
+      }
+    } catch (error) {
+      errors.push(error);
+    }
+    failures += 1;
+    console.log(`Queued pinned refresh for chat ${row.chat_id} failed: ${errors.map((error) => error.stack || error).join('; ')}`);
   }
   return failures;
 }
