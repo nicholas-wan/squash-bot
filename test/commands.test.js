@@ -1273,7 +1273,7 @@ describe('Telegram commands', () => {
     };
     await handleUpdate({ BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db }, {
       callback_query: {
-        id: 'callback-1', data: 'tb:paid:u42',
+        id: 'callback-1', data: 'tb:paid:1400:u42',
         from: { id: 7, username: 'nicholaswan' },
         message: { message_id: 55, chat: { id: -123456789 } },
       },
@@ -1292,6 +1292,76 @@ describe('Telegram commands', () => {
     expect(requests.find((request) => request.url.endsWith('/deleteMessage')).body.message_id)
       .toBe(1);
     expect(answer.body.text).toContain('could not be told privately');
+  });
+
+  // The confirmation said $14; a court charged since has made it $20. Clearing
+  // $20 would settle money the admin never saw, so nothing is written and the
+  // confirmation is redrawn with the new amount.
+  function settleRun(balance) {
+    const requests = [];
+    const writes = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      const result = String(url).endsWith('/getChatMember')
+        ? { status: 'creator' } : { message_id: 1 };
+      return new Response(JSON.stringify({ ok: true, result }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const db = {
+      prepare(sql) {
+        return { bind() { return {
+          async first() {
+            if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+            if (sql.includes('board_message_id')) {
+              return { board_message_id: null, tab_message_id: 66 };
+            }
+            return null;
+          },
+          async all() {
+            return { results: sql.includes('GROUP BY')
+              ? [{ slug: 'u42', user_id: 42, name: '@bo', balance }] : [] };
+          },
+          async run() {
+            if (sql.includes('INSERT INTO ledger')) writes.push(sql);
+            return { meta: { changes: 1 } };
+          },
+        }; } };
+      },
+    };
+    return { requests, writes, env: { BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789', DB: db } };
+  }
+
+  it('refuses to clear a balance that moved after the admin confirmed it', async () => {
+    const { requests, writes, env } = settleRun(2000);
+    await handleUpdate(env, {
+      callback_query: {
+        id: 'callback-1', data: 'tb:paid:1400:u42',
+        from: { id: 7, username: 'nicholaswan' },
+        message: { message_id: 55, chat: { id: -123456789 } },
+      },
+    });
+    expect(writes).toHaveLength(0);
+    expect(requests.some((request) => request.body.receiver_user_id === 42)).toBe(false);
+    const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+    expect(answer.body.text).toContain('$20.00');
+    expect(answer.body.show_alert).toBe(true);
+    const redraw = requests.find((request) => request.url.endsWith('/editMessageReplyMarkup'));
+    expect(redraw.body.reply_markup.inline_keyboard[0][0].callback_data).toBe('tb:paid:2000:u42');
+  });
+
+  it('only redraws the confirmation for a button that names no amount', async () => {
+    const { requests, writes, env } = settleRun(1400);
+    await handleUpdate(env, {
+      callback_query: {
+        id: 'callback-1', data: 'tb:paid:u42',
+        from: { id: 7, username: 'nicholaswan' },
+        message: { message_id: 55, chat: { id: -123456789 } },
+      },
+    });
+    expect(writes).toHaveLength(0);
+    const redraw = requests.find((request) => request.url.endsWith('/editMessageReplyMarkup'));
+    expect(redraw.body.reply_markup.inline_keyboard[0][0].callback_data).toBe('tb:paid:1400:u42');
   });
 
   it('refuses extra slots and tab settlement to members who are not admins', async () => {
