@@ -8,6 +8,8 @@ const PEAK_FROM_HOUR = 18;
 // Singapore public holidays. Lunar and Islamic dates move every year, so verify
 // this list against mom.gov.sg each December and override it without a deploy by
 // setting PUBLIC_HOLIDAYS in wrangler.toml to a comma-separated YYYY-MM-DD list.
+// That setting replaces this list rather than adding to it, so it has to repeat
+// every year still being billed.
 // Pricing a day in a year this list does not reach logs a warning rather than
 // treating that year as holiday-free.
 const DEFAULT_PUBLIC_HOLIDAYS = [
@@ -25,6 +27,18 @@ const DEFAULT_PUBLIC_HOLIDAYS = [
   '2026-11-08', // Deepavali
   '2026-11-09', // Deepavali observed
   '2026-12-25', // Christmas Day
+  '2027-01-01', // New Year's Day
+  '2027-02-06', // Chinese New Year
+  '2027-02-07', // Chinese New Year
+  '2027-02-08', // Chinese New Year observed
+  '2027-03-10', // Hari Raya Puasa
+  '2027-03-26', // Good Friday
+  '2027-05-01', // Labour Day
+  '2027-05-17', // Hari Raya Haji
+  '2027-05-20', // Vesak Day
+  '2027-08-09', // National Day
+  '2027-10-28', // Deepavali
+  '2027-12-25', // Christmas Day
 ];
 
 // Pricing runs on every board and tab render, so a misconfigured holiday list
