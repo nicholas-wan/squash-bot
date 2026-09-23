@@ -46,9 +46,20 @@ function uniqueDates(values) {
   });
 }
 
+// A date without a year that is already behind us this year means next year
+// only when it is far behind — "5 Jan" typed in late December. One a few days
+// or weeks gone is a slip, and reading it as next year booked a court eleven
+// months out without a word; it stays in this year and is refused as passed.
+const ROLLOVER_DAYS = 180;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
 function inferredYear(month, day, current) {
-  if (month < current.mo || (month === current.mo && day < current.d)) return current.y + 1;
-  return current.y;
+  const behind = Date.UTC(current.y, current.mo - 1, current.d) - Date.UTC(current.y, month - 1, day);
+  return behind > ROLLOVER_DAYS * DAY_MS ? current.y + 1 : current.y;
+}
+
+function isPast(value, current) {
+  return Date.UTC(value.y, value.mo - 1, value.d) < Date.UTC(current.y, current.mo - 1, current.d);
 }
 
 function normalizeYear(raw) {
@@ -57,39 +68,117 @@ function normalizeYear(raw) {
   return year < 100 ? 2000 + year : year;
 }
 
+// A four-digit number after a written date is a year only when it is this
+// year or next: "13 Aug 2027". Anything else there is a 24-hour clock —
+// "13 Aug 2100" is 9pm, not the twenty-second century — and extractTime asks
+// the same question, so one number is never read as both.
+function plausibleYear(raw, current) {
+  const year = Number(raw);
+  return /^\d{4}$/.test(String(raw)) && year >= current.y && year <= current.y + 1;
+}
+
+// A number straight after "court" or "c" is the court: "court 4 Aug 27" is
+// court 4 on 27 Aug, never 4 Aug 2027.
+function followsCourtWord(input, index) {
+  return /\b(?:courts?|crt|ct|c)\s*#?\s*$/.test(input.slice(0, index));
+}
+
+const RELATIVE_DAYS = [
+  [/\bday after tomorrow\b/, 2],
+  [/\btomorrow\b|\btmr\b|\btmrw\b/, 1],
+  [/\btoday\b|\btonight\b/, 0],
+];
+
+function relativeDate(input, current) {
+  for (const [pattern, days] of RELATIVE_DAYS) {
+    if (pattern.test(input)) return dateAdd(current.y, current.mo, current.d, days);
+  }
+  return null;
+}
+
+// A written date and a "today" or a weekday can disagree — "15 Oct court 4
+// (paid today)" — and either could be the booking. Asking costs a tap;
+// guessing books the wrong day. A written date still beats a weekday name
+// outright, because "sat 15/8" means the 15th.
+function reconcile(found, other) {
+  if (!other || !found.value || dateKey(found.value) === dateKey(other)) return found;
+  return { value: null, choices: [found.value, other], issue: 'Which date did you mean?' };
+}
+
 export function extractDate(text, nowMs = Date.now(), tz = 'Asia/Singapore') {
   const input = String(text).toLowerCase();
   const current = localParts(nowMs, tz);
+  const relative = relativeDate(input, current);
+  const written = writtenDate(input, current);
+  if (written) return reconcile(written, relative);
+  const weekday = weekdayDate(input, current);
+  if (relative) return reconcile({ value: relative, choices: [] }, weekday);
+  if (weekday) return { value: weekday, choices: [] };
 
-  if (/\bday after tomorrow\b/.test(input)) return { value: dateAdd(current.y, current.mo, current.d, 2), choices: [] };
-  if (/\btomorrow\b|\btmr\b|\btmrw\b/.test(input)) return { value: dateAdd(current.y, current.mo, current.d, 1), choices: [] };
-  if (/\btoday\b|\btonight\b/.test(input)) return { value: { y: current.y, mo: current.mo, d: current.d }, choices: [] };
+  // A day number without a month is genuinely ambiguous. Offer the next two
+  // matching calendar dates instead of silently choosing a month.
+  const match = input.match(/\bon(?:\s+the)?\s+(\d{1,2})(?:st|nd|rd|th)?\b/);
+  if (match) {
+    const day = Number(match[1]);
+    const candidates = [];
+    for (let add = 0; add < 4 && candidates.length < 2; add++) {
+      const m = monthAdd(current.y, current.mo, add);
+      const candidate = { y: m.y, mo: m.mo, d: day };
+      if (!dateExists(candidate)) continue;
+      if (add === 0 && day < current.d) continue;
+      candidates.push(candidate);
+    }
+    return { value: null, choices: candidates, issue: 'Which month did you mean?' };
+  }
 
+  return { value: null, choices: [] };
+}
+
+function weekdayDate(input, current) {
+  const match = input.match(/\b(next\s+)?(sun(?:day)?|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?)\b/i);
+  if (!match) return null;
+  const weekday = WEEKDAYS.get(match[2].toLowerCase());
+  const todayWeekday = new Date(Date.UTC(current.y, current.mo - 1, current.d)).getUTCDay();
+  let ahead = (weekday - todayWeekday + 7) % 7;
+  // In booking language, "next Monday" means the nearest upcoming Monday.
+  // Only advance a full week when today is already that weekday.
+  if (match[1] && ahead === 0) ahead = 7;
+  return dateAdd(current.y, current.mo, current.d, ahead);
+}
+
+// A date spelled out in the message — ISO, day and month, or numeric — as an
+// extractDate result, or null when the message spells none out.
+function writtenDate(input, current) {
   let match = input.match(/\b(20\d{2})-(\d{1,2})-(\d{1,2})\b/);
   if (match) {
     const value = { y: Number(match[1]), mo: Number(match[2]), d: Number(match[3]) };
     return dateExists(value) ? { value, choices: [] } : { value: null, choices: [], issue: 'That date does not exist.' };
   }
 
-  match = input.match(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(${MONTH_WORD})(?:\\s+(\\d{2,4}))?\\b`, 'i'));
+  match = null;
+  const dayFirst = new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(${MONTH_WORD})(?:\\s+(\\d{4}))?\\b`, 'gi');
+  for (const found of input.matchAll(dayFirst)) {
+    if (followsCourtWord(input, found.index)) continue;
+    match = found;
+    break;
+  }
   if (!match) {
-    match = input.match(new RegExp(`\\b(${MONTH_WORD})\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:,?\\s+(\\d{2,4}))?\\b`, 'i'));
+    match = input.match(new RegExp(`\\b(${MONTH_WORD})\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:,?\\s+(\\d{4}))?\\b`, 'i'));
     if (match) match = [match[0], match[2], match[1], match[3]];
   }
   if (match) {
     const d = Number(match[1]);
     const mo = monthNumber(match[2]);
-    const y = normalizeYear(match[3]) || inferredYear(mo, d, current);
+    const y = plausibleYear(match[3], current) ? Number(match[3]) : inferredYear(mo, d, current);
     const value = { y, mo, d };
     return dateExists(value) ? { value, choices: [] } : { value: null, choices: [], issue: 'That date does not exist.' };
   }
 
   // “courts 3/4” lists two courts and “8-9” is a time range, so a numeric pair
-  // only counts as a date once those readings are ruled out. Anything left over
-  // still beats a weekday name, because “sat 15/8” means the 15th.
+  // only counts as a date once those readings are ruled out.
   match = null;
   for (const numeric of input.matchAll(/\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b/g)) {
-    if (/\b(?:courts?|crt|ct|c)\s*#?\s*$/.test(input.slice(0, numeric.index))) continue;
+    if (followsCourtWord(input, numeric.index)) continue;
     if (numeric[0].includes('-') && !numeric[3]
       && readsAsTimeRange(numeric[1], numeric[2])
       && !statesClockElsewhere(input, numeric.index, numeric[0].length)) continue;
@@ -108,7 +197,10 @@ export function extractDate(text, nowMs = Date.now(), tz = 'Asia/Singapore') {
     };
     if (!explicitYear && first <= 12 && second <= 12 && first !== second) {
       const alternate = { y: inferredYear(first, second, current), mo: first, d: second };
-      const choices = uniqueDates([primary, alternate]);
+      // A reading that has already passed is no longer a real choice.
+      const readings = uniqueDates([primary, alternate]);
+      const upcoming = readings.filter((value) => !isPast(value, current));
+      const choices = upcoming.length ? upcoming : readings;
       return choices.length === 1
         ? { value: choices[0], choices: [] }
         : { value: null, choices, issue: 'Which numeric date did you mean?' };
@@ -118,38 +210,14 @@ export function extractDate(text, nowMs = Date.now(), tz = 'Asia/Singapore') {
       : { value: null, choices: [], issue: 'That date does not exist.' };
   }
 
-  match = input.match(/\b(next\s+)?(sun(?:day)?|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?)\b/i);
-  if (match) {
-    const weekday = WEEKDAYS.get(match[2].toLowerCase());
-    const todayWeekday = new Date(Date.UTC(current.y, current.mo - 1, current.d)).getUTCDay();
-    let ahead = (weekday - todayWeekday + 7) % 7;
-    // In booking language, "next Monday" means the nearest upcoming Monday.
-    // Only advance a full week when today is already that weekday.
-    if (match[1] && ahead === 0) ahead = 7;
-    return { value: dateAdd(current.y, current.mo, current.d, ahead), choices: [] };
-  }
-
-  // A day number without a month is genuinely ambiguous. Offer the next two
-  // matching calendar dates instead of silently choosing a month.
-  match = input.match(/\bon(?:\s+the)?\s+(\d{1,2})(?:st|nd|rd|th)?\b/);
-  if (match) {
-    const day = Number(match[1]);
-    const candidates = [];
-    for (let add = 0; add < 4 && candidates.length < 2; add++) {
-      const m = monthAdd(current.y, current.mo, add);
-      const candidate = { y: m.y, mo: m.mo, d: day };
-      if (!dateExists(candidate)) continue;
-      if (add === 0 && day < current.d) continue;
-      candidates.push(candidate);
-    }
-    return { value: null, choices: candidates, issue: 'Which month did you mean?' };
-  }
-
-  return { value: null, choices: [] };
+  return null;
 }
 
+// "04" and "4" are one court, and the overlap check compares the stored text,
+// so a number is stored without its leading zeros.
 function courtValue(raw) {
   const clean = String(raw).trim().toLowerCase();
+  if (/^\d+$/.test(clean)) return String(Number(clean));
   return COURT_WORDS.get(clean) || clean.toUpperCase();
 }
 
@@ -234,8 +302,9 @@ function statesClockElsewhere(input, index, length) {
   return CLOCK_TOKEN.test(`${input.slice(0, index)} ${input.slice(index + length)}`);
 }
 
-export function extractTime(text) {
+export function extractTime(text, nowMs = Date.now(), tz = 'Asia/Singapore') {
   const input = String(text).toLowerCase();
+  const current = localParts(nowMs, tz);
   const atom = '(?:\\d{1,2}(?:(?::|\\.)\\d{2})?\\s*(?:am|pm)?|\\d{3,4}|noon|midnight)';
   const range = input.match(new RegExp(`\\b(${atom})\\s*(?:-|–|—|to|until)\\s*(${atom})\\b`, 'i'));
   if (range && !statesClockElsewhere(input, range.index, range[0].length)) {
@@ -259,9 +328,14 @@ export function extractTime(text) {
     const token = match[0];
     const before = input.slice(Math.max(0, match.index - 20), match.index);
     const after = input.slice(match.index + token.length, match.index + token.length + 10);
-    // Do not mistake the year in “13 Aug 2026” or “2026-08-13” for 20:26.
-    const looksLikeYear = /^20\d{2}$/.test(token)
-      && (new RegExp(`${MONTH_WORD}\\s*$`, 'i').test(before) || /^\s*[-/]\d/.test(after));
+    // Do not mistake the year in “13 Aug 2026”, “Aug 13 2026”, “13/8/2026” or
+    // “2026-08-13” for 20:26. After a written month it is a year only when
+    // extractDate would take it as one; otherwise it is the clock.
+    const afterMonth = new RegExp(`${MONTH_WORD}(?:\\s+\\d{1,2}(?:st|nd|rd|th)?,?)?\\s*$`, 'i').test(before);
+    const looksLikeYear = /^\d{4}$/.test(token) && (
+      (afterMonth && plausibleYear(token, current))
+      || /\d[/-]$/.test(before)
+      || (/^20\d{2}$/.test(token) && /^\s*[-/]\d/.test(after)));
     if (!looksLikeYear) tokens.push(token);
   }
   if (!tokens.length) {
@@ -304,7 +378,7 @@ export function analyzeBooking(text, nowMs = Date.now(), tz = 'Asia/Singapore', 
   if (!looksLikeBooking(text, forceIntent)) return null;
   const date = extractDate(text, nowMs, tz);
   const court = extractCourt(text);
-  const time = extractTime(text);
+  const time = extractTime(text, nowMs, tz);
   return {
     sourceText: String(text).trim(),
     date: date.value,
@@ -369,12 +443,17 @@ export function bookingFromDraft(draft, nowMs = Date.now(), tz = 'Asia/Singapore
 
 export function parseField(field, text, nowMs = Date.now(), tz = 'Asia/Singapore') {
   if (field === 'date') return extractDate(text, nowMs, tz);
-  if (field === 'time') return extractTime(text);
+  if (field === 'time') return extractTime(text, nowMs, tz);
   if (field === 'court') {
     const parsed = extractCourt(text);
     if (parsed.value || parsed.choices.length) return parsed;
     const raw = String(text).trim().replace(/^(?:court|crt|ct|c)\s*#?\s*/i, '');
-    if (/^[a-z0-9][a-z0-9 -]{0,19}$/i.test(raw)) return { value: courtValue(raw), choices: [] };
+    // A reply that reads as a date or a time was meant for another question:
+    // "tomorrow" is not a court called TOMORROW.
+    const misplaced = extractDate(raw, nowMs, tz).value || extractTime(raw, nowMs, tz).value;
+    if (!misplaced && /^[a-z0-9][a-z0-9 -]{0,19}$/i.test(raw)) {
+      return { value: courtValue(raw), choices: [] };
+    }
     return { value: null, choices: [], issue: 'Reply with a court number or name, such as 4 or Court A.' };
   }
   throw new BookingParseError(`Unknown booking field: ${field}`);

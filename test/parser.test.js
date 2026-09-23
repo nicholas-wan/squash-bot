@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { analyzeBooking, BookingParseError, draftComplete, parseBooking } from '../src/parser.js';
+import {
+  analyzeBooking, BookingParseError, draftComplete, parseBooking, parseField,
+} from '../src/parser.js';
 import { localParts } from '../src/time.js';
 import { formatCountdown } from '../src/bookings.js';
 
@@ -34,9 +36,17 @@ describe('parseBooking', () => {
     expect(local(booking.startsAt)).toMatchObject({ y: 2026, mo: 8, d: 17, h: 21 });
   });
 
-  it('uses next year for an omitted date that has passed', () => {
-    const booking = parseBooking('1 Aug Court 2 7pm', NOW, TZ);
-    expect(local(booking.startsAt).y).toBe(2027);
+  it('refuses an omitted-year date that passed recently rather than booking it next year', () => {
+    // 1 Aug typed on 12 Aug is a slip, not a court eleven months out.
+    expect(() => parseBooking('1 Aug Court 2 7pm', NOW, TZ)).toThrow(/already passed/);
+  });
+
+  it('rolls an omitted-year date far behind us into next year', () => {
+    const lateDecember = Date.UTC(2026, 11, 20, 4); // 20 Dec 2026, noon SGT
+    expect(local(parseBooking('5 Jan Court 2 7pm', lateDecember, TZ).startsAt))
+      .toMatchObject({ y: 2027, mo: 1, d: 5 });
+    expect(local(parseBooking('25/1 Court 2 7pm', lateDecember, TZ).startsAt))
+      .toMatchObject({ y: 2027, mo: 1, d: 25 });
   });
 
   it('rejects a time that already passed today', () => {
@@ -87,10 +97,58 @@ describe('confidence-based natural language parsing', () => {
   });
 
   it('does not guess an ambiguous numeric date', () => {
-    const draft = analyzeBooking('8/9 Court 4 9pm', NOW, TZ);
+    const draft = analyzeBooking('9/10 Court 4 9pm', NOW, TZ);
     expect(draft.date).toBeNull();
     expect(draft.dateChoices).toHaveLength(2);
     expect(draftComplete(draft)).toBe(false);
+  });
+
+  it('drops the reading of a numeric date that has already passed', () => {
+    // 8 Sep or 9 Aug — and 9 Aug went by three days ago.
+    expect(analyzeBooking('8/9 Court 4 9pm', NOW, TZ).date).toEqual({ y: 2026, mo: 9, d: 8 });
+  });
+
+  it('never reads the court number as the day of a month-first date', () => {
+    expect(analyzeBooking('court 4 Aug 27 9pm', NOW, TZ)).toMatchObject({
+      court: '4', date: { y: 2026, mo: 8, d: 27 },
+    });
+    expect(analyzeBooking('Court 2 Aug 13 8pm', NOW, TZ).date).toEqual({ y: 2026, mo: 8, d: 13 });
+  });
+
+  it('asks when a written date and "today" disagree', () => {
+    const draft = analyzeBooking('15 Aug court 4 9pm (paid today)', NOW, TZ);
+    expect(draft.date).toBeNull();
+    expect(draft.dateChoices).toEqual([{ y: 2026, mo: 8, d: 15 }, { y: 2026, mo: 8, d: 12 }]);
+    expect(analyzeBooking('13 Aug court 4 9pm tomorrow', NOW, TZ).date)
+      .toEqual({ y: 2026, mo: 8, d: 13 });
+  });
+
+  it('asks when a weekday and "today" disagree', () => {
+    // 12 Aug 2026 is a Wednesday.
+    const draft = analyzeBooking('c4 fri 9pm (moved from today)', NOW, TZ);
+    expect(draft.date).toBeNull();
+    expect(draft.dateChoices).toEqual([{ y: 2026, mo: 8, d: 12 }, { y: 2026, mo: 8, d: 14 }]);
+  });
+
+  it('never reads one number as both the year and the start time', () => {
+    expect(analyzeBooking('15/8/2027 court 4', NOW, TZ)).toMatchObject({
+      date: { y: 2027, mo: 8, d: 15 }, start: null,
+    });
+    expect(analyzeBooking('court 4 15/8/2027 at 9pm', NOW, TZ).start).toEqual({ h: 21, mi: 0 });
+    expect(analyzeBooking('13 Aug 2027 court 4 9pm', NOW, TZ)).toMatchObject({
+      date: { y: 2027, mo: 8, d: 13 }, start: { h: 21, mi: 0 },
+    });
+    // Not a year this bot would book, so it is the clock.
+    expect(analyzeBooking('13 Aug 2100 court 4', NOW, TZ)).toMatchObject({
+      date: { y: 2026, mo: 8, d: 13 }, start: { h: 21, mi: 0 },
+    });
+    expect(analyzeBooking('Aug 13 2027 court 4 9pm', NOW, TZ)).toMatchObject({
+      date: { y: 2027, mo: 8, d: 13 }, start: { h: 21, mi: 0 },
+    });
+  });
+
+  it('stores a court number without leading zeros', () => {
+    expect(analyzeBooking('court 04 tomorrow 9pm', NOW, TZ).court).toBe('4');
   });
 
   it('does not guess am or pm for a bare hour', () => {
@@ -207,5 +265,21 @@ describe('pinned-board countdown', () => {
     expect(formatCountdown(Date.UTC(2026, 7, 13, 13, 0), TZ, NOW)).toBe('tomorrow · Thu 13 Aug');
     expect(formatCountdown(Date.UTC(2026, 7, 17, 13, 0), TZ, NOW)).toBe('in 5 days · Mon 17 Aug');
     expect(formatCountdown(Date.UTC(2026, 7, 19, 13, 0), TZ, NOW)).toBe('in 7 days · Wed 19 Aug');
+  });
+});
+
+describe('typed court replies', () => {
+  it('accepts a court number or name', () => {
+    expect(parseField('court', '4', NOW, TZ).value).toBe('4');
+    expect(parseField('court', '04', NOW, TZ).value).toBe('4');
+    expect(parseField('court', 'Court A', NOW, TZ).value).toBe('A');
+  });
+
+  it('refuses a reply that was meant for the date or time question', () => {
+    for (const reply of ['tomorrow', 'friday', '9pm', '15 Aug']) {
+      const parsed = parseField('court', reply, NOW, TZ);
+      expect(parsed.value).toBeNull();
+      expect(parsed.issue).toMatch(/court number or name/);
+    }
   });
 });
