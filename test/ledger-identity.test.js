@@ -101,3 +101,14 @@ it('reserves ambiguous old aliases instead of assigning unlinked history to eith
   expect(db.prepare('SELECT COUNT(*) AS n FROM ledger WHERE user_id IS NULL').get().n).toBe(1);
   expect((await myTabView(env,-123,{id:99,username:'alice'})).html).not.toContain('$4.00');
 });
+
+it('settles only the amount the admin confirmed, not a charge that landed since', async () => {
+  charge('u42',42,1000);
+  const confirmedCents = (await tabBalances(env,-123))[0].balance;
+  charge('u42',42,600);
+  const stale = await settleUser(env,-123,'u42',{id:1,first_name:'Admin'},confirmedCents);
+  expect(stale).toMatchObject({ stale: true, balance: 1600 });
+  expect((await tabBalances(env,-123))[0].balance).toBe(1600);
+  expect((await settleUser(env,-123,'u42',{id:1,first_name:'Admin'},1600)).balance).toBe(1600);
+  expect(await tabBalances(env,-123)).toEqual([]);
+});

@@ -85,10 +85,13 @@ export async function tabBalances(env, chatId) {
 }
 
 // Telegram caps callback_data at 64 bytes. A slug is a username or a numeric
-// id, so this only ever excludes an absurdly long free-text name.
+// id, so this only ever excludes an absurdly long free-text name. Measured
+// against the longest button that carries it: the confirm button, which also
+// names the amount being cleared.
+const MAX_SETTLE_CENTS = '99999999';
 export function settleKey(slug) {
   const key = String(slug);
-  return new TextEncoder().encode(`tb:paid:${key}`).length <= 64 ? key : null;
+  return new TextEncoder().encode(`tb:paid:${MAX_SETTLE_CENTS}:${key}`).length <= 64 ? key : null;
 }
 
 export function settleable(balances) {
@@ -330,7 +333,7 @@ export async function confirmSettleMarkup(env, chatId, slug) {
   return { entry, markup: { inline_keyboard: [
     [{
       text: `✅ Clear ${entry.name} · ${formatMoney(entry.balance)}`,
-      callback_data: `tb:paid:${settleKey(entry.slug)}`,
+      callback_data: `tb:paid:${entry.balance}:${settleKey(entry.slug)}`,
     }],
     [{ text: '← Back', callback_data: 'tb:pay' }],
   ] } };
@@ -339,10 +342,19 @@ export async function confirmSettleMarkup(env, chatId, slug) {
 // The confirm button sits on a shared pinned message, so two admins can tap it
 // at the same time. The payment is only written if the balance is still exactly
 // what was read, which makes a second tap a no-op instead of a double credit.
-export async function settleUser(env, chatId, slug, actor) {
+//
+// The button also names the amount the admin was shown. A court charged after
+// the confirmation was drawn would otherwise be cleared along with it — money
+// nobody confirmed — so a balance that has moved since is not settled: it comes
+// back marked stale, with the amount it stands at now, for a fresh confirmation.
+// Null means there is nothing left to clear.
+export async function settleUser(env, chatId, slug, actor, expectedCents = null) {
   const dataChat = dataChatId(env, chatId);
   const entry = findOwing(await tabBalances(env, chatId), slug);
   if (!entry) return null;
+  if (expectedCents !== null && entry.balance !== expectedCents) {
+    return { ...entry, stale: true };
+  }
   const who = identity(actor);
   const result = await env.DB.prepare(
     `INSERT INTO ledger
@@ -357,8 +369,21 @@ export async function settleUser(env, chatId, slug, actor) {
     `Cleared by ${who.name}`, Date.now(),
     dataChat, entry.slug, entry.balance
   ).run();
-  if (!result.meta.changes) return null;
-  await updateTab(env, chatId);
+  if (!result.meta.changes) {
+    // The balance moved between the read and the write. Either another admin
+    // cleared it first, or a charge landed — and "already clear" would be a
+    // lie about a debt that is still open.
+    const fresh = findOwing(await tabBalances(env, chatId), slug);
+    return fresh ? { ...fresh, stale: true } : null;
+  }
+  // The payment is written; the pinned tab is only a rendering of it. Same
+  // rule as adjustBalance: a throw here would report a failure after the money
+  // moved, and skip the debtor's receipt.
+  try {
+    await updateTab(env, chatId);
+  } catch (error) {
+    console.log(`Tab refresh after a settlement failed: ${error.stack || error}`);
+  }
   return entry;
 }
 

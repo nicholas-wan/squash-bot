@@ -559,7 +559,10 @@ const tabRoutes = [
   { pattern: /^tb:mine:(.+)$/, admin: 'Only group admins can read another tab.', handler: openTheirTab },
   { pattern: /^tb:back$/, admin: SETTLE_ADMIN, handler: closeSettlePicker },
   { pattern: /^tb:pay$/, admin: SETTLE_ADMIN, handler: openSettlePicker },
-  { pattern: /^tb:paid:(.+)$/, admin: SETTLE_ADMIN, handler: settleTapped },
+  { pattern: /^tb:paid:(\d+):(.+)$/, admin: SETTLE_ADMIN, handler: settleTapped },
+  // A confirm button drawn before it carried the amount. It cannot say what
+  // the admin agreed to clear, so it only redraws the confirmation.
+  { pattern: /^tb:paid:(.+)$/, admin: SETTLE_ADMIN, handler: confirmSettle },
   { pattern: /^tb:pay:(.+)$/, admin: SETTLE_ADMIN, handler: confirmSettle },
 ];
 
@@ -610,7 +613,20 @@ async function openSettlePicker(env, callback) {
 
 async function settleTapped(env, callback, match) {
   const chatId = callback.message.chat.id;
-  const settled = await settleUser(env, chatId, match[1], callback.from);
+  const settled = await settleUser(env, chatId, match[2], callback.from, Number(match[1]));
+  // The balance moved after the confirmation was drawn — most often a court
+  // charged in between. Nothing was written; the admin is shown the new amount
+  // and confirms that instead.
+  if (settled && settled.stale) {
+    const confirmation = await confirmSettleMarkup(env, chatId, match[2]);
+    if (confirmation) {
+      await editReplyMarkup(env, chatId, callback.message.message_id, confirmation.markup);
+    }
+    await answerCallback(env, callback.id,
+      `${settled.name}'s balance is now ${formatMoney(settled.balance)}. `
+      + 'Check the amount and confirm again.', true);
+    return;
+  }
   // The ledger went quiet for the one person it is about: close the loop
   // with a private receipt, if they have an id to send it to. Through the
   // same gate as every panel: a receipt naming a balance must not fall back
