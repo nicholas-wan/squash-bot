@@ -30,6 +30,13 @@ export async function ledgerAccount(env, dataChat, player) {
 // (booking_id, slug) keeps a retried cron run from double charging.
 export async function chargeBooking(env, booking, roster) {
   if (!roster.length || booking.charged) return 0;
+  // A free court was paid by somebody who is not passing the bill on, so
+  // nobody on it owes the organiser anything. Marked charged all the same, so
+  // the cron does not come back to it.
+  if (booking.free) {
+    await env.DB.prepare('UPDATE bookings SET charged = 1 WHERE id = ?').bind(booking.id).run();
+    return 0;
+  }
   const tz = await getTimezone(env, booking.chat_id);
   const totalCents = courtCostCents(
     booking.starts_at, booking.ends_at, tz, publicHolidays(env)

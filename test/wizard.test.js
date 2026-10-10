@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { handleBookingCallback } from '../src/wizard.js';
+import { handleBookingCallback, handleBookingReply } from '../src/wizard.js';
 import { clearAdminCache } from '../src/players.js';
 
 // A complete draft one tap away from saving. Pinned in 2027 so the "already
@@ -78,7 +78,7 @@ function draftDb(state) {
           if (sql.startsWith('INSERT INTO bookings')) {
             // The conflict guard rides inside the insert; the allow flag is the
             // bound value the guard reads.
-            if (state.conflict && args[13] !== 1) return { meta: { changes: 0 } };
+            if (state.conflict && args[14] !== 1) return { meta: { changes: 0 } };
             state.inserted = true;
             state.insertArgs = args;
             return { meta: { changes: 1, last_row_id: 9 } };
@@ -167,6 +167,62 @@ describe('booking wizard save', () => {
     expect(requests.some((request) => request.url.endsWith('/sendMessage'))).toBe(false);
   });
 
+  it('saves a free court from the booked-by picker', async () => {
+    const requests = captureTelegram();
+    const state = { payload: completePayload(), pending: null };
+    const env = { BOT_TOKEN: 'test', OWNER_USER_ID: '7', DB: draftDb(state) };
+
+    await handleBookingCallback(env, confirmTap('bw:1:x:b'));
+    await handleBookingCallback(env, confirmTap('bw:1:b:f'));
+    // The toggle stays on the picker, so the booker can be set in the same trip.
+    expect(state.payload.free).toBe(true);
+    expect(state.payload.choosingBooker).toBe(true);
+    await handleBookingCallback(env, confirmTap('bw:1:b:k'));
+    expect(state.payload.choosingBooker).toBe(false);
+    const form = requests
+      .filter((request) => request.url.endsWith('/editEphemeralMessageText')).at(-1);
+    expect(form.body.text).toContain('Cost: <b>🆓 Free</b>');
+    expect(form.body.reply_markup.inline_keyboard.flat().map((button) => button.text))
+      .toContain('👤 Admin: 🆓 free court — change');
+
+    await handleBookingCallback(env, confirmTap('bw:1:y'));
+    expect(state.insertArgs[13]).toBe(1);
+  });
+
+  it('records a typed booker the bot does not know without seating them', async () => {
+    captureTelegram();
+    const state = { payload: completePayload(), pending: 'booker' };
+    const env = { BOT_TOKEN: 'test', OWNER_USER_ID: '7', DB: draftDb(state) };
+
+    await handleBookingReply(env, {
+      chat: { id: -123 }, from: { id: 7, first_name: 'Nick' },
+      text: '  Jared   Tan ', message_id: 41, reply_to_message: { message_id: 60 },
+    });
+    expect(state.payload.booker).toEqual({ userId: null, slug: null, name: 'Jared Tan', typed: true });
+
+    await handleBookingCallback(env, confirmTap('bw:1:y'));
+    expect(state.insertArgs[9]).toBe(null);
+    expect(state.insertArgs[10]).toBe('Jared Tan');
+    expect(state.insertArgs[13]).toBe(0);
+    // A label, not a player: nobody by that name is seated or billed.
+    expect(state.seated || []).not.toContain('njared tan');
+    expect((state.seated || []).length).toBe(1);
+  });
+
+  it('treats a typed name the bot already knows as picking that player', async () => {
+    captureTelegram();
+    const state = { payload: completePayload(), pending: 'booker' };
+    const env = {
+      BOT_TOKEN: 'test', OWNER_USER_ID: '7', DEFAULT_PLAYERS: '@alice', DB: draftDb(state),
+    };
+    await handleBookingReply(env, {
+      chat: { id: -123 }, from: { id: 7, first_name: 'Nick' },
+      text: 'alice', message_id: 41, reply_to_message: { message_id: 60 },
+    });
+    expect(state.payload.booker).toMatchObject({ slug: '@alice', name: '@alice' });
+    expect(state.payload.booker.typed).toBeUndefined();
+  });
+
   it.each([
     [{ players: [{ slug: '@alice', name: '@alice', userId: null }] },
       [{ slug: 'u7', heads: 1 }, { slug: '@alice', heads: 1 }]],
@@ -189,7 +245,7 @@ describe('booking wizard save', () => {
       { BOT_TOKEN: 'test', DB: draftDb(state) }, confirmTap('bw:1:x:b')
     );
     const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
-    expect(answer.body.text).toBe('Only group admins can book for someone else.');
+    expect(answer.body.text).toBe('Only group admins can change who booked a court.');
     expect(state.payload.choosingBooker).not.toBe(true);
   });
 

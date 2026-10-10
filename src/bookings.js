@@ -129,7 +129,9 @@ async function confirmToBooker(env, chatId, bookingId, booking, capacity, from, 
 
 export async function addBooking(
   env, chatId, parsed, from, sourceText = null,
-  { allowConflict = false, callbackQueryId = null, bookedFor = null, companions = {} } = {}
+  {
+    allowConflict = false, callbackQueryId = null, bookedFor = null, free = false, companions = {},
+  } = {}
 ) {
   const now = Date.now();
   const preReminderAt = parsed.startsAt - 2 * 60 * 60 * 1000;
@@ -141,8 +143,9 @@ export async function addBooking(
   const result = await env.DB.prepare(
     `INSERT INTO bookings
       (chat_id, court, starts_at, ends_at, reminder_at, reminder_sent, pre_reminder_at,
-       pre_reminder_sent, capacity, created_by_user_id, created_by_name, source_text, created_at)
-     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+       pre_reminder_sent, capacity, created_by_user_id, created_by_name, source_text, created_at,
+       free)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
      WHERE ? = 1 OR NOT EXISTS (
        SELECT 1 FROM bookings
        WHERE chat_id = ? AND LOWER(TRIM(court)) = LOWER(TRIM(?))
@@ -153,9 +156,11 @@ export async function addBooking(
     reminderSent, preReminderAt, preReminderSent, capacity,
     // An admin can record somebody else as the booker: that person owns the
     // booking — seated first, billed the booker's share, allowed to cancel it
-    // — while the audit row still names the admin who typed it in.
+    // — while the audit row still names the admin who typed it in. A typed
+    // name the bot does not know carries no id, so only admins can cancel.
     bookedFor ? bookedFor.userId || null : from && from.id || null,
-    bookedFor ? bookedFor.name : actorName(from), sourceText, now, allowConflict ? 1 : 0,
+    bookedFor ? bookedFor.name : actorName(from), sourceText, now, free ? 1 : 0,
+    allowConflict ? 1 : 0,
     dataChatId(env, chatId), parsed.court, parsed.endsAt, parsed.startsAt
   ).run();
   if (!result.meta.changes) {
@@ -719,6 +724,7 @@ export async function bookingPanelView(env, chatId, bookingId) {
       + `👥 ${playerTags(roster)} · ${slotsLabel(roster, capacity)}\n`
       + (booking.created_by_name
         ? `📝 Booked by ${escapeHtml(booking.created_by_name)}\n` : '')
+      + (booking.free ? '🆓 Free court — nobody is billed\n' : '')
       + '\nOnly you can see this.',
     replyMarkup: { inline_keyboard: rows },
   };

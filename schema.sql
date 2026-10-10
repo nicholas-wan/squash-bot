@@ -24,7 +24,9 @@ CREATE TABLE IF NOT EXISTS bookings (
   created_by_user_id INTEGER,
   created_by_name TEXT,
   source_text TEXT,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  -- 1 when whoever booked it paid and is not charging anyone: never billed.
+  free INTEGER NOT NULL DEFAULT 0
 );
 
 -- Who is playing. slug is the stable identity: "u<telegram id>" for anyone who
