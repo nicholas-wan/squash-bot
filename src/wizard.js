@@ -14,6 +14,8 @@ import {
 } from './telegram.js';
 
 const DRAFT_LIFETIME_MS = 24 * 60 * 60 * 1000;
+const BOOKER_ADMIN = 'Only group admins can change who booked a court.';
+const MAX_TYPED_BOOKER = 40;
 
 function userName(from) {
   return from && (from.username ? `@${from.username}` : from.first_name) || 'Player';
@@ -93,19 +95,32 @@ function chunk(items, size) {
 
 function wizardView(id, payload, now, tz) {
   const field = prepareChoices(payload, now, tz);
-  // Booked on behalf: a record-keeping picker, reachable only through the
-  // admin-gated button below. Whoever is chosen is seated and billed as the
-  // booker; the court is still paid to the organiser.
+  // Booked by: a record-keeping picker, reachable only through the
+  // admin-gated button below. A known player is seated and billed as the
+  // booker. A typed name is somebody the bot has never seen, so it is a label
+  // and nothing more — admin-entered text never seats or bills anyone. Free
+  // lives here too, because the usual reason a court costs nobody anything is
+  // that whoever booked it paid and is not passing the bill on.
   if (payload.choosingBooker) {
-    const rows = [[{ text: '🙋 Me', callback_data: `bw:${id}:b:me` }]];
+    const rows = [[{
+      text: payload.free
+        ? '🆓 Free court: ON — tap to bill as usual'
+        : '💵 Free court: off — tap to make it free',
+      callback_data: `bw:${id}:b:f`,
+    }], [{ text: '🙋 Me', callback_data: `bw:${id}:b:me` }]];
     (payload.bookerChoices || []).forEach((player, index) => {
       rows.push([{ text: `👤 ${player.name}`, callback_data: `bw:${id}:b:${index}` }]);
     });
-    rows.push([{ text: '✕ Cancel booking', callback_data: `bw:${id}:n` }]);
+    rows.push([{ text: '✍️ Type a name', callback_data: `bw:${id}:b:t` }]);
+    rows.push([{ text: '← Back', callback_data: `bw:${id}:b:k` }]);
     return {
       html: '👤 <b>Who booked this court?</b>\n\n'
-        + 'For the record: they are seated and billed as the booker, and only '
-        + 'admins ever see the name. The court is still paid to the organiser.',
+        + 'Somebody picked from the list is seated and billed as the booker. '
+        + 'A typed name is for somebody the bot does not know yet: it is '
+        + 'recorded as the booker, but not seated or billed.\n\n'
+        + (payload.free
+          ? '🆓 <b>Free court</b>: nobody on it will be billed.'
+          : '💵 Billed as usual: the court is split across the roster.'),
       replyMarkup: { inline_keyboard: rows },
       payload,
     };
@@ -120,8 +135,10 @@ function wizardView(id, payload, now, tz) {
     `Time: ${payload.start ? `<b>${escapeHtml(timeLabel(payload))}</b>` : '❓ Need your input'}`,
   ];
   if (payload.booker) {
-    lines.push(`Booked by: <b>${escapeHtml(payload.booker.name)}</b>`);
+    lines.push(`Booked by: <b>${escapeHtml(payload.booker.name)}</b>${
+      payload.booker.typed ? ' (not seated)' : ''}`);
   }
+  if (payload.free) lines.push('Cost: <b>🆓 Free</b> — nobody is billed');
   if (payload.companions?.players.length) {
     lines.push(`Also playing: <b>${payload.companions.players.map(p => escapeHtml(p.name)).join(', ')}</b>`);
   }
@@ -184,13 +201,16 @@ function wizardView(id, payload, now, tz) {
       ],
       [{ text: '🕐 Change time', callback_data: `bw:${id}:x:t` }],
     ];
-    // Attribution, not announcement: the name reaches the record and the
-    // admin panel, never the board. Same Admin: label as every gated button.
+    // Attribution and the free flag. Same Admin: label as every gated button.
     if (!editing) {
+      const setting = [
+        payload.booker && `booked by ${payload.booker.name}`,
+        payload.free && (payload.booker ? '🆓 free' : '🆓 free court'),
+      ].filter(Boolean).join(' · ');
       keyboard.push([{
-        text: payload.booker
-          ? `👤 Admin: booked by ${payload.booker.name} — change`
-          : '👤 Admin: booked for someone else',
+        text: setting
+          ? `👤 Admin: ${setting} — change`
+          : '👤 Admin: booked by / free',
         callback_data: `bw:${id}:x:b`,
       }]);
     }
@@ -350,6 +370,7 @@ async function requestTypedField(env, row, field, callbackId) {
     date: ['date', '13 Aug, tomorrow, or Friday'],
     court: ['court', '4 or Court A'],
     time: ['time', '9pm or 8pm-9:30pm'],
+    booker: ['name of whoever booked it', 'Jared'],
   };
   const [name, example] = labels[field];
   const prompt = await sendMessage(env, row.chat_id,
@@ -357,7 +378,7 @@ async function requestTypedField(env, row, field, callbackId) {
     {
       replyMarkup: {
         force_reply: true,
-        input_field_placeholder: `Type the ${name}`,
+        input_field_placeholder: field === 'booker' ? 'Type their name' : `Type the ${name}`,
         selective: false,
       },
       receiverUserId: row.user_id,
@@ -375,7 +396,7 @@ async function requestTypedField(env, row, field, callbackId) {
 
 export async function handleBookingCallback(env, callback) {
   const match = String(callback.data || '')
-    .match(/^bw:(\d+):([dctuynxob])(?::([dctb]|me|\d+))?$/);
+    .match(/^bw:(\d+):([dctuynxob])(?::([dctbfk]|me|\d+))?$/);
   if (!match || !callback.message) return false;
   const id = Number(match[1]);
   const action = match[2];
@@ -417,7 +438,7 @@ export async function handleBookingCallback(env, callback) {
     // Attribution changes who is seated and billed, so it carries the same
     // gate as seating somebody from the manage panel.
     if (!(await isChatAdmin(env, chatId, callback.from))) {
-      await answerCallback(env, callback.id, 'Only group admins can book for someone else.', true);
+      await answerCallback(env, callback.id, BOOKER_ADMIN, true);
       return true;
     }
     payload.choosingBooker = true;
@@ -430,10 +451,25 @@ export async function handleBookingCallback(env, callback) {
   }
   if (action === 'b') {
     if (!(await isChatAdmin(env, chatId, callback.from))) {
-      await answerCallback(env, callback.id, 'Only group admins can book for someone else.', true);
+      await answerCallback(env, callback.id, BOOKER_ADMIN, true);
       return true;
     }
-    if (value === 'me') {
+    // The free toggle stays on the picker: it is usually set together with
+    // the booker, and closing the picker would make that two trips.
+    if (value === 'f') {
+      payload.free = !payload.free;
+      await saveAndRender(env, row, payload);
+      await answerCallback(env, callback.id,
+        payload.free ? 'Free court: nobody is billed' : 'Billed as usual');
+      return true;
+    }
+    if (value === 't') {
+      await requestTypedField(env, row, 'booker', callback.id);
+      return true;
+    }
+    if (value === 'k') {
+      // Back to the form, with the booker left as it was.
+    } else if (value === 'me') {
       payload.booker = null;
     } else {
       const pick = (payload.bookerChoices || [])[Number(value)];
@@ -526,6 +562,7 @@ export async function handleBookingCallback(env, callback) {
           {
             allowConflict: action === 'o', callbackQueryId: callback.id,
             bookedFor: payload.booker || null,
+            free: Boolean(payload.free),
             companions: payload.companions,
           }
         );
@@ -579,6 +616,44 @@ export async function handleBookingCallback(env, callback) {
   return false;
 }
 
+// Takes down the reply prompt and, outside ephemeral mode, the typed answer.
+async function clearReplyPrompt(env, row, msg, replyId) {
+  if (row.wizard_ephemeral) {
+    await deleteEphemeralMessage(env, msg.chat.id, msg.from.id, replyId);
+  } else {
+    await deleteMessage(env, msg.chat.id, replyId);
+    if (msg.message_id) await deleteMessage(env, msg.chat.id, msg.message_id);
+  }
+}
+
+// A typed booker. A name or handle the bot already knows is the same as
+// picking it from the list, so that person is seated and billed as usual.
+// Anything else is somebody the bot has never seen: it is kept as a label on
+// the booking and nothing more, since admin-entered text must never mint a
+// ledger account. A word two known players answer to is not guessed at.
+async function applyTypedBooker(env, row, payload, msg, replyId) {
+  if (!(await isChatAdmin(env, msg.chat.id, msg.from))) return true;
+  const name = String(msg.text || '').replace(/\s+/g, ' ').trim().slice(0, MAX_TYPED_BOOKER);
+  if (name) {
+    const wanted = name.toLowerCase();
+    const handle = `@${wanted.replace(/^@/, '')}`;
+    const matches = (await knownPlayers(env, msg.chat.id)).filter((player) =>
+      player.slug === wanted || player.slug === handle
+      || player.name.toLowerCase() === wanted);
+    if (matches.length === 1) {
+      const [player] = matches;
+      payload.booker = { userId: player.user_id || null, slug: player.slug, name: player.name };
+    } else {
+      payload.booker = { userId: null, slug: null, name, typed: true };
+    }
+    payload.choosingBooker = false;
+    payload.bookerChoices = [];
+  }
+  await saveAndRender(env, row, payload);
+  await clearReplyPrompt(env, row, msg, replyId);
+  return true;
+}
+
 export async function handleBookingReply(env, msg) {
   const replyId = msg.reply_to_message
     && (msg.reply_to_message.ephemeral_message_id || msg.reply_to_message.message_id);
@@ -590,6 +665,7 @@ export async function handleBookingReply(env, msg) {
   if (!row || !row.pending_field) return false;
 
   const payload = JSON.parse(row.payload);
+  if (row.pending_field === 'booker') return applyTypedBooker(env, row, payload, msg, replyId);
   const tz = await getTimezone(env, msg.chat.id);
   const parsed = parseField(row.pending_field, msg.text, Date.now(), tz);
   applyParsedField(payload, row.pending_field, parsed);
@@ -620,12 +696,7 @@ export async function handleBookingReply(env, msg) {
   }
 
   await saveAndRender(env, row, payload);
-  if (row.wizard_ephemeral) {
-    await deleteEphemeralMessage(env, msg.chat.id, msg.from.id, replyId);
-  } else {
-    await deleteMessage(env, msg.chat.id, replyId);
-    if (msg.message_id) await deleteMessage(env, msg.chat.id, msg.message_id);
-  }
+  await clearReplyPrompt(env, row, msg, replyId);
   return true;
 }
 

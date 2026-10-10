@@ -165,6 +165,21 @@ describe('money tab', () => {
     expect(inserts.map((args) => args[1])).toEqual(['u9']);
   });
 
+  it('charges nobody for a free court, and still marks it charged', async () => {
+    const inserts = [];
+    const updates = [];
+    const db = ledgerDb(inserts);
+    const prepare = db.prepare;
+    db.prepare = (sql) => {
+      if (sql.startsWith('UPDATE bookings SET charged')) updates.push(sql);
+      return prepare(sql);
+    };
+    const charged = await chargeBooking({ ...env, DB: db }, { ...booking, free: 1 }, roster);
+    expect(charged).toBe(0);
+    expect(inserts).toHaveLength(0);
+    expect(updates).toHaveLength(1);
+  });
+
   it('charges nothing when only the household played', async () => {
     const inserts = [];
     await chargeBooking({ ...env, DB: ledgerDb(inserts) }, booking, roster.slice(0, 2));

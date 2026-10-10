@@ -108,10 +108,19 @@ inherit that player's roster or private tab. Username-only config entries remain
 provisional until that person first posts, so use `id:Name` entries for every
 seeded or unbilled player when identity reuse must be prevented. New ledger charges use numeric identities;
 usernames are display names rather than ownership proof.
-A group admin can record somebody else as the booker from the confirm form —
-that person is seated and billed as the booker and may cancel the court, while
-the audit row still names the admin. The board names the booker under the
-court — unless it was the organiser — and the admin panel always does.
+A group admin can record somebody else as the booker from the confirm form's
+**👤 Admin: booked by / free** button. Somebody picked from the list is seated
+and billed as the booker and may cancel the court, while the audit row still
+names the admin. **✍️ Type a name** covers somebody the bot has never seen: a
+name or handle it already knows is treated as picking that person, and
+anything else is recorded as the booker's name only — not seated, not billed,
+and only admins can cancel — because admin-entered text never mints a ledger
+account. The board names the booker under the court — unless it was the
+organiser — and the admin panel always does.
+
+The same picker carries a **Free court** toggle, for a court whoever booked it
+paid for and is not charging anyone. A free court is never billed: nobody on
+its roster reaches the tab, and the admin panel marks it 🆓.
 
 ## Money
 
@@ -385,11 +394,12 @@ npm run db:migrate:012
 npm run db:migrate:013
 npm run db:migrate:014
 npm run db:migrate:015
+npm run db:migrate:016
 npm run db:verify
 ```
 
 Run them in that order. Everything the migrations used to create now lives in
-`schema.sql`, leaving 002, 003, 005, and 006 as `ALTER TABLE` alone, 004 as a
+`schema.sql`, leaving 002, 003, 005, 006, and 016 (free courts) as `ALTER TABLE` alone, 004 as a
 no-op, and 007–013 and 015 as idempotent table/index/trigger migrations. 015
 adds the table that records every Telegram update id once, so an update
 Telegram redelivers is answered and dropped rather than handled twice — the

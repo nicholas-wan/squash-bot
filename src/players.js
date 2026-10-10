@@ -251,8 +251,11 @@ export async function seedRoster(env, chatId, bookingId, from, capacity, bookedF
     )) seats.push(player);
   };
   // Booked on behalf, the named booker takes the booker's seat — they may
-  // carry no numeric id yet, exactly like a config-seeded player.
-  const booker = bookedFor || (from && from.id ? identity(from) : null);
+  // carry no numeric id yet, exactly like a config-seeded player. A typed
+  // name is a label only: seating it would put a stranger on the tab.
+  const booker = bookedFor
+    ? (bookedFor.typed ? null : bookedFor)
+    : (from && from.id ? identity(from) : null);
   if (booker) seat(booker);
   if (companions.plusOne && from?.id) {
     const actor = identity(from);
