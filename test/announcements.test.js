@@ -201,41 +201,61 @@ it('retries transient edit/delete failures without sending duplicate messages', 
   expect(notice().message_id).toBeNull();
 });
 
-it('retires an undeletable old message by removing its Join button, once', async () => {
+const undeletable = method => method === 'deleteMessage'
+  ? { ok: false, description: "Bad Request: message can't be deleted" } : null;
+
+it('closes an undeletable message as a record of its court, once, with no pointer text', async () => {
   await syncAnnouncements(env, -123, now);
   seat(1, 3);
-  failure = method => method === 'deleteMessage'
-    ? { ok: false, description: "Bad Request: message can't be deleted" } : null;
+  failure = undeletable;
   expect(await syncAnnouncements(env, -123, now)).toBe(0);
   expect(requests.at(-1)).toMatchObject({ method: 'editMessageText', message_id: 101, reply_markup: { inline_keyboard: [] } });
-  expect(requests.at(-1).text).toContain('no longer open');
+  expect(requests.at(-1).text).toBe('🎾 <b>Court 4</b> · Sun 13 Sept · 8am · full\n👥 <a href="tg://user?id=1">Player +1</a>');
   expect(notice()).toMatchObject({ message_id: 101, booking_id: null });
-  // The next sweep finds nothing to change and sends nothing.
+  // The next sweep finds nothing to change and calls Telegram for nothing.
   const count = requests.length;
   expect(await syncAnnouncements(env, -123, now)).toBe(0);
   expect(requests).toHaveLength(count);
 });
 
+it('records a cancelled court from its audit trail, and a played one as played', async () => {
+  await syncAnnouncements(env, -123, now);
+  failure = undeletable;
+  db.prepare(`INSERT INTO booking_audit (booking_id, chat_id, action, source_text, before_json, created_at)
+    VALUES (1, -123, 'deleted', 'cancel', ?, ?)`)
+    .run(JSON.stringify({ court: '4', startsAt: now + 3 * DAY, endsAt: now + 3 * DAY + 3600000 }), now);
+  db.prepare('DELETE FROM bookings WHERE id = 1').run();
+  await syncAnnouncements(env, -123, now);
+  expect(requests.at(-1).text).toBe('🎾 <b>Court 4</b> · Sun 13 Sept · 8am · cancelled');
+  // A court that started, still on the table, reads as played.
+  book(2, now - 60000, '1');
+  seat(5, 1, 2);
+  await syncAnnouncements(env, -123, now - DAY);
+  expect(joinTarget(requests.at(-1))).toBe('sb:join:2');
+  await syncAnnouncements(env, -123, now);
+  expect(requests.at(-1).text).toBe('🎾 <b>Court 1</b> · Thu 10 Sept · 7:59am · played');
+  expect(requests.every(r => !/pinned board/.test(r.text || ''))).toBe(true);
+});
+
 it('rewrites an undeletable message in place for the next court instead of leaving a stub', async () => {
   await syncAnnouncements(env, -123, now);
-  failure = method => method === 'deleteMessage'
-    ? { ok: false, description: "Bad Request: message can't be deleted" } : null;
+  failure = undeletable;
   // A nearer court is booked: the old message becomes its announcement.
   book(2, now + DAY, '1');
   expect(await syncAnnouncements(env, -123, now)).toBe(0);
   expect(requests.at(-1)).toMatchObject({ method: 'editMessageText', message_id: 101 });
   expect(joinTarget(requests.at(-1))).toBe('sb:join:2');
-  expect(requests.at(-1).text).not.toContain('pinned board');
   expect(notice()).toMatchObject({ message_id: 101, booking_id: 2 });
   // Both courts fill, then one reopens: the closed message is reused too.
   seat(1, 3, 1); seat(2, 3, 2);
   await syncAnnouncements(env, -123, now);
-  expect(requests.at(-1).text).toContain('no longer open');
+  expect(requests.at(-1).text).toContain('· full');
   db.prepare('DELETE FROM booking_players WHERE booking_id = 2').run();
   await syncAnnouncements(env, -123, now);
   expect(requests.at(-1)).toMatchObject({ method: 'editMessageText', message_id: 101 });
   expect(joinTarget(requests.at(-1))).toBe('sb:join:2');
   expect(sends()).toHaveLength(1);
+  expect(requests.every(r => !/pinned board/.test(r.text || ''))).toBe(true);
 });
 
 it('serializes overlapping refreshes and keeps shared-chat message ids separate', async () => {

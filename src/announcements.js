@@ -1,4 +1,4 @@
-import { compactTimeRange, courtName, formatCountdown, playerTags } from './format.js';
+import { compactTimeRange, courtName, formatCountdown, playerTags, shortDate } from './format.js';
 import { allowedChats, dataChatId } from './scope.js';
 import { DEFAULT_CAPACITY, rosterFor } from './players.js';
 import { getTimezone } from './settings.js';
@@ -11,8 +11,6 @@ import { deleteMessage, editMessage, escapeHtml, sendMessage } from './telegram.
 // next. So the bot's latest message is always the most upcoming open court,
 // and a batch of new bookings produces one message rather than one each.
 
-const CLOSED_TEXT = '🎾 This court is no longer open. See the pinned board.';
-
 // True when the message is gone. Telegram lets a bot delete its own messages
 // for 48 hours; after that it needs the Delete Messages admin right, and
 // without it the message stays. The caller keeps such a message and edits it
@@ -24,8 +22,36 @@ async function deleteAnnouncement(env, chatId, messageId) {
   throw new Error(removed.description || 'Announcement deletion failed');
 }
 
-async function closeAnnouncement(env, chatId, messageId) {
-  const closed = await editMessage(env, chatId, messageId, CLOSED_TEXT, { inline_keyboard: [] });
+// What a kept message says once there is no open court to show: the fate of
+// the court it announced, in one line, with no button. A line that only
+// points at the board says nothing anyone needs; the closing state of the
+// court at least records what happened to it. A cancelled or played court
+// has left the bookings table, so its details come from the audit trail.
+async function closedRendering(env, chatId, bookingId, now) {
+  const tz = await getTimezone(env, chatId);
+  let booking = await env.DB.prepare('SELECT * FROM bookings WHERE id = ?').bind(bookingId).first();
+  let status;
+  if (booking) {
+    const roster = await rosterFor(env, bookingId);
+    const seated = roster.reduce((sum, player) => sum + (player.heads || 1), 0);
+    status = booking.starts_at <= now ? 'played'
+      : seated >= (booking.capacity || DEFAULT_CAPACITY) ? 'full' : null;
+    if (status === 'full') status += `\n👥 ${playerTags(roster)}`;
+  } else {
+    const audit = await env.DB.prepare(`SELECT source_text, before_json FROM booking_audit
+      WHERE booking_id = ? AND action = 'deleted' ORDER BY id DESC LIMIT 1`).bind(bookingId).first();
+    if (!audit?.before_json) return null;
+    const snapshot = JSON.parse(audit.before_json);
+    booking = { court: snapshot.court, starts_at: snapshot.startsAt, ends_at: snapshot.endsAt };
+    status = /expired/i.test(audit.source_text || '') ? 'played' : 'cancelled';
+  }
+  if (!status) return null;
+  return `🎾 <b>${escapeHtml(courtName(booking))}</b> · ${shortDate(booking.starts_at, tz)} · `
+    + `${compactTimeRange(booking.starts_at, booking.ends_at, tz)} · ${status}`;
+}
+
+async function closeAnnouncement(env, chatId, messageId, text) {
+  const closed = await editMessage(env, chatId, messageId, text, { inline_keyboard: [] });
   if (!closed.ok && !/message is not modified/i.test(closed.description || '')) {
     throw new Error(closed.description || 'Announcement retirement failed');
   }
@@ -69,17 +95,24 @@ export async function syncAnnouncements(env, chatId, now = Date.now()) {
           SET message_id = NULL, html = NULL, booking_id = NULL WHERE chat_id = ?`).bind(chatId).run();
         current.message_id = null;
         current.html = null;
-      } else {
-        await env.DB.prepare('UPDATE availability_notices SET booking_id = NULL WHERE chat_id = ?')
-          .bind(chatId).run();
+        current.booking_id = null;
+      } else if (!next) {
+        // Nothing to point at and no way to remove the message: close it as a
+        // record of its court, once. The stored rendering is the closed text
+        // and booking_id is cleared, so later sweeps leave it alone until a
+        // court opens and the message is rewritten for that one.
+        const closed = await closedRendering(env, chatId, current.booking_id, now)
+          || current.html.split('\n{')[0];
+        await closeAnnouncement(env, chatId, current.message_id, closed);
+        await env.DB.prepare(`UPDATE availability_notices SET booking_id = NULL, html = ?
+          WHERE chat_id = ?`).bind(closed, chatId).run();
+        return 0;
       }
-      current.booking_id = null;
     }
     if (!next) {
-      if (current.message_id && current.html !== CLOSED_TEXT) {
-        await closeAnnouncement(env, chatId, current.message_id);
-        await env.DB.prepare('UPDATE availability_notices SET html = ? WHERE chat_id = ?')
-          .bind(CLOSED_TEXT, chatId).run();
+      if (current.booking_id !== null && !current.message_id) {
+        await env.DB.prepare('UPDATE availability_notices SET booking_id = NULL WHERE chat_id = ?')
+          .bind(chatId).run();
       }
       return 0;
     }
@@ -131,8 +164,9 @@ export async function syncAnnouncements(env, chatId, now = Date.now()) {
       // Telegram has already accepted this message. Remove it if persistence
       // failed, otherwise a retry could leave an untracked public duplicate.
       try {
+        // A message seconds old is always deletable; the close is a last resort.
         if (!await deleteAnnouncement(env, chatId, sent.result.message_id)) {
-          await closeAnnouncement(env, chatId, sent.result.message_id);
+          await closeAnnouncement(env, chatId, sent.result.message_id, html);
         }
       } catch (cleanupError) {
         console.log(`Untracked announcement ${chatId}/${sent.result.message_id}: ${cleanupError.message}`);

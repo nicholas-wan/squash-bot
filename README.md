@@ -37,8 +37,11 @@ fills, starts, or is cancelled — the old message is deleted and a fresh one is
 posted at the bottom of the chat; when no open court remains, it is deleted
 and nothing replaces it. A message Telegram refuses to delete — one older than
 48 hours in a group where the bot lacks the Delete Messages right — is kept and
-rewritten in place for the next court instead, so the chat never collects a
-trail of retired announcements. A batch of new bookings therefore produces one message
+rewritten in place for the next court instead, or, when no court is open,
+closed as a one-line record of what became of its court (full, played, or
+cancelled) with no button. The chat therefore never collects a trail of
+retired announcements, and the bot never posts a line that only points at the
+board. A batch of new bookings therefore produces one message
 for the nearest of them, not one each, and a court further out is never
 announced until it is next. Maintenance posts the message if a refresh failed
 and moves it on at the start time. Telegram only permits deletion within 48
