@@ -11,15 +11,21 @@ import { deleteMessage, editMessage, escapeHtml, sendMessage } from './telegram.
 // next. So the bot's latest message is always the most upcoming open court,
 // and a batch of new bookings produces one message rather than one each.
 
-async function retireAnnouncement(env, chatId, messageId, text) {
-  if (!messageId) return;
+const CLOSED_TEXT = '🎾 This court is no longer open. See the pinned board.';
+
+// True when the message is gone. Telegram lets a bot delete its own messages
+// for 48 hours; after that it needs the Delete Messages admin right, and
+// without it the message stays. The caller keeps such a message and edits it
+// in place rather than leaving a stub behind every retired announcement.
+async function deleteAnnouncement(env, chatId, messageId) {
   const removed = await deleteMessage(env, chatId, messageId);
-  if (removed.ok || /message to delete not found/i.test(removed.description || '')) return;
-  if (!/message can.t be deleted/i.test(removed.description || '')) {
-    throw new Error(removed.description || 'Announcement deletion failed');
-  }
-  // Telegram cannot delete messages older than 48 hours; remove the action.
-  const closed = await editMessage(env, chatId, messageId, text, { inline_keyboard: [] });
+  if (removed.ok || /message to delete not found/i.test(removed.description || '')) return true;
+  if (/message can.t be deleted/i.test(removed.description || '')) return false;
+  throw new Error(removed.description || 'Announcement deletion failed');
+}
+
+async function closeAnnouncement(env, chatId, messageId) {
+  const closed = await editMessage(env, chatId, messageId, CLOSED_TEXT, { inline_keyboard: [] });
   if (!closed.ok && !/message is not modified/i.test(closed.description || '')) {
     throw new Error(closed.description || 'Announcement retirement failed');
   }
@@ -55,19 +61,25 @@ export async function syncAnnouncements(env, chatId, now = Date.now()) {
       // The tracked court is no longer the one to point at. Whether it filled,
       // started, was cancelled, or was overtaken by a nearer booking, the
       // message goes so that a fresh one can land at the bottom of the chat.
-      await retireAnnouncement(env, chatId, current.message_id,
-        next ? '🎾 See the pinned board for current availability.'
-          : '🎾 This court is no longer open. See the pinned board.');
-      await env.DB.prepare(`UPDATE availability_notices
-        SET message_id = NULL, html = NULL, booking_id = NULL WHERE chat_id = ?`).bind(chatId).run();
-      current.message_id = null;
-      current.html = null;
+      // A message Telegram will not delete is kept and rewritten in place
+      // instead: one long-lived message beats a trail of retired ones.
+      const deleted = await deleteAnnouncement(env, chatId, current.message_id);
+      if (deleted) {
+        await env.DB.prepare(`UPDATE availability_notices
+          SET message_id = NULL, html = NULL, booking_id = NULL WHERE chat_id = ?`).bind(chatId).run();
+        current.message_id = null;
+        current.html = null;
+      } else {
+        await env.DB.prepare('UPDATE availability_notices SET booking_id = NULL WHERE chat_id = ?')
+          .bind(chatId).run();
+      }
       current.booking_id = null;
     }
     if (!next) {
-      if (current.booking_id !== null) {
-        await env.DB.prepare('UPDATE availability_notices SET booking_id = NULL WHERE chat_id = ?')
-          .bind(chatId).run();
+      if (current.message_id && current.html !== CLOSED_TEXT) {
+        await closeAnnouncement(env, chatId, current.message_id);
+        await env.DB.prepare('UPDATE availability_notices SET html = ? WHERE chat_id = ?')
+          .bind(CLOSED_TEXT, chatId).run();
       }
       return 0;
     }
@@ -99,8 +111,9 @@ export async function syncAnnouncements(env, chatId, now = Date.now()) {
     if (current.message_id) {
       const edited = await editMessage(env, chatId, current.message_id, html, replyMarkup);
       if (edited.ok || /message is not modified/i.test(edited.description || '')) {
-        await env.DB.prepare('UPDATE availability_notices SET html = ? WHERE chat_id = ?')
-          .bind(signature, chatId).run();
+        // booking_id moves too: a kept message may now show a different court.
+        await env.DB.prepare('UPDATE availability_notices SET booking_id = ?, html = ? WHERE chat_id = ?')
+          .bind(booking.id, signature, chatId).run();
         return 0;
       }
       if (!/message to edit not found/i.test(edited.description || '')) {
@@ -118,8 +131,9 @@ export async function syncAnnouncements(env, chatId, now = Date.now()) {
       // Telegram has already accepted this message. Remove it if persistence
       // failed, otherwise a retry could leave an untracked public duplicate.
       try {
-        await retireAnnouncement(env, chatId, sent.result.message_id,
-          '🎾 See the pinned board for current availability.');
+        if (!await deleteAnnouncement(env, chatId, sent.result.message_id)) {
+          await closeAnnouncement(env, chatId, sent.result.message_id);
+        }
       } catch (cleanupError) {
         console.log(`Untracked announcement ${chatId}/${sent.result.message_id}: ${cleanupError.message}`);
       }

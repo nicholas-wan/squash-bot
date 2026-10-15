@@ -35,7 +35,10 @@ that court's time or court number change the message in place. When a different
 court becomes the one to point at — a nearer court is booked, the current one
 fills, starts, or is cancelled — the old message is deleted and a fresh one is
 posted at the bottom of the chat; when no open court remains, it is deleted
-and nothing replaces it. A batch of new bookings therefore produces one message
+and nothing replaces it. A message Telegram refuses to delete — one older than
+48 hours in a group where the bot lacks the Delete Messages right — is kept and
+rewritten in place for the next court instead, so the chat never collects a
+trail of retired announcements. A batch of new bookings therefore produces one message
 for the nearest of them, not one each, and a court further out is never
 announced until it is next. Maintenance posts the message if a refresh failed
 and moves it on at the start time. Telegram only permits deletion within 48
