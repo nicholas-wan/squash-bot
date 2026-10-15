@@ -201,14 +201,41 @@ it('retries transient edit/delete failures without sending duplicate messages', 
   expect(notice().message_id).toBeNull();
 });
 
-it('retires an undeletable old message by removing its Join button', async () => {
+it('retires an undeletable old message by removing its Join button, once', async () => {
   await syncAnnouncements(env, -123, now);
   seat(1, 3);
   failure = method => method === 'deleteMessage'
     ? { ok: false, description: "Bad Request: message can't be deleted" } : null;
   expect(await syncAnnouncements(env, -123, now)).toBe(0);
-  expect(requests.at(-1)).toMatchObject({ method: 'editMessageText', reply_markup: { inline_keyboard: [] } });
+  expect(requests.at(-1)).toMatchObject({ method: 'editMessageText', message_id: 101, reply_markup: { inline_keyboard: [] } });
   expect(requests.at(-1).text).toContain('no longer open');
+  expect(notice()).toMatchObject({ message_id: 101, booking_id: null });
+  // The next sweep finds nothing to change and sends nothing.
+  const count = requests.length;
+  expect(await syncAnnouncements(env, -123, now)).toBe(0);
+  expect(requests).toHaveLength(count);
+});
+
+it('rewrites an undeletable message in place for the next court instead of leaving a stub', async () => {
+  await syncAnnouncements(env, -123, now);
+  failure = method => method === 'deleteMessage'
+    ? { ok: false, description: "Bad Request: message can't be deleted" } : null;
+  // A nearer court is booked: the old message becomes its announcement.
+  book(2, now + DAY, '1');
+  expect(await syncAnnouncements(env, -123, now)).toBe(0);
+  expect(requests.at(-1)).toMatchObject({ method: 'editMessageText', message_id: 101 });
+  expect(joinTarget(requests.at(-1))).toBe('sb:join:2');
+  expect(requests.at(-1).text).not.toContain('pinned board');
+  expect(notice()).toMatchObject({ message_id: 101, booking_id: 2 });
+  // Both courts fill, then one reopens: the closed message is reused too.
+  seat(1, 3, 1); seat(2, 3, 2);
+  await syncAnnouncements(env, -123, now);
+  expect(requests.at(-1).text).toContain('no longer open');
+  db.prepare('DELETE FROM booking_players WHERE booking_id = 2').run();
+  await syncAnnouncements(env, -123, now);
+  expect(requests.at(-1)).toMatchObject({ method: 'editMessageText', message_id: 101 });
+  expect(joinTarget(requests.at(-1))).toBe('sb:join:2');
+  expect(sends()).toHaveLength(1);
 });
 
 it('serializes overlapping refreshes and keeps shared-chat message ids separate', async () => {
