@@ -243,6 +243,7 @@ considered and declined to keep the bot group-only.
 /courts          Refresh the pinned board
 /tab             Refresh the pinned money tab
 /debt +2 player reason   Admins: add to or take off what someone owes
+/debt undo               Admins: remove a /debt entry made by mistake
 /cancel ID       Remove a booking you made
 /help, /start    Show examples
 ```
@@ -275,9 +276,17 @@ that keeps a display name from claiming financial history. A word two people
 answer to is refused rather than guessed at, since guessing bills the wrong
 person and nothing downstream can tell. The organiser and the household play
 for free and are refused outright: a row for them would list the organiser as
-owing themselves. The ledger is append-only, so an entry that turns out to be
-wrong is undone by its opposite rather than by deletion; an update Telegram
-delivers twice is handled once, so a redelivered `/debt` is not a second entry.
+owing themselves. An update Telegram delivers twice is handled once, so a
+redelivered `/debt` is not a second entry.
+
+A `/debt` typed by mistake is undone rather than corrected with its opposite:
+a charge and a refund that cancel out are two lines the player has to puzzle
+over. The confirmation carries an **↩️ Undo** button, and `/debt undo` lists the
+last few `/debt` entries for when that confirmation is already gone. Undo
+deletes the row, so the tab reads as though it was never written, and the
+player is told it was removed. It reaches only rows `/debt` wrote, and only for
+7 days: court charges and settlements are money that really moved, and the rest
+of the ledger stays append-only.
 
 Booking ids are small sequential numbers, so editing or removing one — by command
 or from **⚙️ Manage** — is limited to whoever booked the court and to group

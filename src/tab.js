@@ -471,11 +471,11 @@ export function matchAccount(players, target) {
   return { error: 'unknown' };
 }
 
-// Appended, never edited: the tab is the record of what happened, so an entry
-// that turns out to be wrong is undone by its opposite rather than by deletion.
-// The breakdown stamps a date on payments only — a court charge already
-// carries its own in the reason — so a charge written here carries one too,
-// and both kinds of row end up reading the same way.
+// Appended, never edited: the tab is the record of what happened. The one
+// exception is undoAdjustment below, for an entry that should never have been
+// written at all. The breakdown stamps a date on payments only — a court
+// charge already carries its own in the reason — so a charge written here
+// carries one too, and both kinds of row end up reading the same way.
 export async function adjustBalance(env, chatId, player, cents, reason, actor) {
   const dataChat = dataChatId(env, chatId);
   const [account, tz] = await Promise.all([
@@ -483,7 +483,7 @@ export async function adjustBalance(env, chatId, player, cents, reason, actor) {
   ]);
   const now = Date.now();
   const note = `${reason} · by ${identity(actor).name}`;
-  await env.DB.prepare(
+  const inserted = await env.DB.prepare(
     `INSERT INTO ledger
       (chat_id, slug, user_id, name, amount_cents, booking_id, reason, created_at)
      VALUES (?, ?, ?, ?, ?, NULL, ?, ?)`
@@ -508,9 +508,64 @@ export async function adjustBalance(env, chatId, player, cents, reason, actor) {
     console.log(`Tab refresh after a /debt entry failed: ${error.stack || error}`);
   }
   return {
+    id: inserted.meta.last_row_id || null,
     name: player.name,
     userId: account.userId,
     cents,
+    balance: (total && total.balance) || 0,
+  };
+}
+
+// A typo'd /debt used to be fixable only by typing its opposite, which left
+// the player reading a charge and a refund that between them meant nothing —
+// and an admin who mistyped the fix as well had three lines to explain. Undo
+// takes the mistaken row out instead, so the tab reads as though it was never
+// written. Only rows /debt wrote can go: a court charge is derived from a
+// booking and a settlement from a balance, and deleting either would rewrite
+// money that really moved. The " · by " stamp is what marks a /debt row — a
+// settlement reads "Cleared by", a court "Court · day". The window is there
+// because a week-old line is history the player has already read and acted on.
+export const UNDO_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const ADJUSTMENT_ROW = "booking_id IS NULL AND reason LIKE '% · by %'";
+
+// The note an admin wrote, without the stamp adjustBalance added to it.
+export function adjustmentNote(row) {
+  return String(row.reason || '').split(' · by ')[0];
+}
+
+export async function recentAdjustments(env, chatId, limit = 5) {
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM ledger WHERE chat_id = ? AND ${ADJUSTMENT_ROW} AND created_at > ?
+     ORDER BY created_at DESC, id DESC LIMIT ?`
+  ).bind(dataChatId(env, chatId), Date.now() - UNDO_WINDOW_MS, limit).all();
+  return results;
+}
+
+// One statement, so two admins tapping the same Undo remove one row between
+// them and the second is told it has already gone. Null means nothing was
+// removed: undone already, out of the window, or never a /debt row.
+export async function undoAdjustment(env, chatId, id) {
+  const dataChat = dataChatId(env, chatId);
+  const row = await env.DB.prepare(
+    `DELETE FROM ledger WHERE id = ? AND chat_id = ? AND ${ADJUSTMENT_ROW} AND created_at > ?
+     RETURNING *`
+  ).bind(Number(id), dataChat, Date.now() - UNDO_WINDOW_MS).first();
+  if (!row) return null;
+  const total = await env.DB.prepare(
+    'SELECT COALESCE(SUM(amount_cents), 0) AS balance FROM ledger WHERE chat_id = ? AND slug = ?'
+  ).bind(dataChat, row.slug).first();
+  // Same rule as adjustBalance: the row is gone, so a refresh failure is
+  // logged rather than reported as though the undo had not happened.
+  try {
+    await updateTab(env, chatId);
+  } catch (error) {
+    console.log(`Tab refresh after a /debt undo failed: ${error.stack || error}`);
+  }
+  return {
+    name: row.name,
+    userId: row.user_id,
+    cents: row.amount_cents,
+    note: adjustmentNote(row),
     balance: (total && total.balance) || 0,
   };
 }

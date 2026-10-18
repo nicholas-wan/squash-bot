@@ -2393,4 +2393,133 @@ describe('Telegram commands', () => {
     expect(send.body.text).toContain('/debt +AMOUNT player reason');
     expect(send.body.text).toContain('The reason is required');
   });
+
+  // A mistaken /debt is taken out, not answered with its opposite: a charge
+  // and a refund that cancel are two lines the player has to puzzle over.
+  function undoDb(deletes, ledger) {
+    return {
+      prepare(sql) {
+        return { bind(...args) { return {
+          async first() {
+            if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+            if (sql.includes('DELETE FROM ledger')) {
+              deletes.push({ sql, args });
+              const at = ledger.findIndex((row) => row.id === args[0]);
+              return at === -1 ? null : ledger.splice(at, 1)[0];
+            }
+            if (sql.includes('COALESCE(SUM(amount_cents)')) {
+              return { balance: ledger.reduce((sum, row) => sum + row.amount_cents, 0) };
+            }
+            return null;
+          },
+          async all() {
+            if (sql.includes("LIKE '% · by %'")) return { results: [...ledger].reverse() };
+            return { results: [] };
+          },
+          async run() { return { meta: { changes: 1, last_row_id: 34 } }; },
+        }; } };
+      },
+    };
+  }
+
+  function wsRows() {
+    return [
+      { id: 33, slug: 'u64', user_id: 64, name: '@wsthang', amount_cents: 500,
+        reason: 'for court 18 oct · by @nick · 18 Oct', created_at: Date.now() },
+      { id: 34, slug: 'u64', user_id: 64, name: '@wsthang', amount_cents: -1000,
+        reason: '18 oct court · by @nick', created_at: Date.now() },
+    ];
+  }
+
+  function recordFetch(requests) {
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      const result = String(url).endsWith('/getChatMember')
+        ? { status: 'member' } : { ephemeral_message_id: 12 };
+      return new Response(JSON.stringify({ ok: true, result }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+  }
+
+  it('puts an Undo button on the /debt confirmation', async () => {
+    const requests = [];
+    recordFetch(requests);
+    const env = debtEnv([]);
+    env.DB = { prepare(sql) {
+      const inner = debtDb([]).prepare(sql);
+      return { bind(...args) {
+        const bound = inner.bind(...args);
+        return { ...bound, async run() {
+          await bound.run();
+          return { meta: { changes: 1, last_row_id: 33 } };
+        } };
+      } };
+    } };
+    await handleUpdate(env, debtMessage('/debt +5 jared for court'));
+    const confirmation = requests.filter((request) => request.url.endsWith('/sendMessage'))
+      .find((send) => send.body.receiver_user_id === 7);
+    expect(confirmation.body.reply_markup.inline_keyboard[0].map((button) => button.callback_data))
+      .toEqual(['tb:undo:33', 'sb:ok']);
+  });
+
+  it('removes a /debt entry on Undo, tells the player, and refuses a second tap', async () => {
+    const requests = [];
+    recordFetch(requests);
+    const deletes = [];
+    const ledger = wsRows();
+    const env = { ...debtEnv([]), DB: undoDb(deletes, ledger) };
+    const tap = {
+      callback_query: {
+        id: 'cb-undo', data: 'tb:undo:33', from: { id: 7, username: 'nick' },
+        message: { message_id: 90, ephemeral_message_id: 91, chat: { id: -123456789 } },
+      },
+    };
+    await handleUpdate(env, tap);
+    // Only /debt rows inside the window can be deleted; the guard is in the
+    // statement itself, so a forged id for a court charge removes nothing.
+    expect(deletes[0].sql).toContain("booking_id IS NULL AND reason LIKE '% · by %'");
+    expect(deletes[0].sql).toContain('created_at > ?');
+    expect(ledger.map((row) => row.id)).toEqual([34]);
+    const receipt = requests.filter((request) => request.url.endsWith('/sendMessage'))
+      .find((send) => send.body.receiver_user_id === 64);
+    expect(receipt.body.text).toContain('+$5.00 entry on your squash tab was undone');
+    expect(receipt.body.text).toContain('You are <b>$10.00</b> in credit.');
+    const panel = requests.find((request) => request.url.endsWith('/editEphemeralMessageText'));
+    expect(panel.body.ephemeral_message_id).toBe(91);
+    expect(panel.body.text).toContain("Undid +$5.00 on @wsthang's tab");
+    expect(panel.body.text).not.toContain('could not be told');
+
+    requests.length = 0;
+    await handleUpdate(env, tap);
+    expect(ledger).toHaveLength(1);
+    const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+    expect(answer.body.text).toContain('already been undone');
+  });
+
+  it('lists recent /debt entries for /debt undo, and keeps Undo from members', async () => {
+    const requests = [];
+    recordFetch(requests);
+    const deletes = [];
+    const ledger = wsRows();
+    const env = { ...debtEnv([]), DB: undoDb(deletes, ledger) };
+    await handleUpdate(env, debtMessage('/debt undo'));
+    const list = requests.find((request) => request.url.endsWith('/sendMessage'));
+    const buttons = list.body.reply_markup.inline_keyboard.flat();
+    expect(buttons.map((button) => button.callback_data))
+      .toEqual(['tb:undo:34', 'tb:undo:33', 'sb:ok']);
+    expect(buttons[1].text).toBe('↩️ @wsthang +$5.00 · for court 18 oct');
+    expect(buttons[0].text).toBe('↩️ @wsthang −$10.00 · 18 oct court');
+
+    requests.length = 0;
+    await handleUpdate(env, {
+      callback_query: {
+        id: 'cb-undo', data: 'tb:undo:33', from: { id: 42, username: 'mallory' },
+        message: { message_id: 90, chat: { id: -123456789 } },
+      },
+    });
+    expect(deletes).toHaveLength(0);
+    const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+    expect(answer.body.text).toContain('Only group admins');
+  });
 });
