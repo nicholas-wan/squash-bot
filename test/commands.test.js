@@ -2184,7 +2184,10 @@ describe('Telegram commands', () => {
 
   // The ledger row is what makes /debt worth having: it is the same kind of row
   // a court writes, so it lands in that person's own breakdown with its reason.
-  function debtDb(inserts) {
+  // It is parked as a draft first, and written only when the admin confirms.
+  function debtDb(inserts, { balance = 700, known, roster = [] } = {}) {
+    const drafts = [];
+    let nextDraft = 1;
     return {
       prepare(sql) {
         return {
@@ -2192,18 +2195,34 @@ describe('Telegram commands', () => {
             return {
               async first() {
                 if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
-                if (sql.includes('COALESCE(SUM(amount_cents)')) return { balance: 700 };
+                if (sql.includes('COALESCE(SUM(amount_cents)')) return { balance };
+                if (sql.includes('DELETE FROM debt_drafts')) {
+                  const at = drafts.findIndex(
+                    (draft) => draft.id === args[0] && draft.actor_id === args[2]
+                  );
+                  return at === -1 ? null : drafts.splice(at, 1)[0];
+                }
                 return null;
               },
               async all() {
                 // knownPlayers reads the ledger for everyone ever charged.
                 if (sql.includes('FROM ledger AS l')) {
-                  return { results: [{ slug: 'u11', user_id: 11, name: 'Jared' }] };
+                  return { results: known || [{ slug: 'u11', user_id: 11, name: 'Jared' }] };
                 }
+                if (sql.includes('FROM booking_players')) return { results: roster };
                 return { results: [] };
               },
               async run() {
-                if (sql.includes('INSERT INTO ledger')) inserts.push(args);
+                if (sql.includes('INSERT INTO debt_drafts')) {
+                  const [chat_id, actor_id, slug, user_id, name, amount_cents, reason] = args;
+                  const id = nextDraft++;
+                  drafts.push({ id, chat_id, actor_id, slug, user_id, name, amount_cents, reason });
+                  return { meta: { changes: 1, last_row_id: id } };
+                }
+                if (sql.includes('INSERT INTO ledger')) {
+                  inserts.push(args);
+                  return { meta: { changes: 1, last_row_id: 33 } };
+                }
                 return { meta: { changes: 0 } };
               },
             };
@@ -2213,26 +2232,40 @@ describe('Telegram commands', () => {
     };
   }
 
-  function debtEnv(inserts) {
+  function debtEnv(inserts, options) {
     return {
       BOT_TOKEN: 'test-token', ALLOWED_CHATS: '-123456789',
       OWNER: '@nick', OWNER_USER_ID: '7', OWNER_NAME: 'Nicholas',
-      DB: debtDb(inserts),
+      DB: debtDb(inserts, options),
     };
   }
 
-  function debtMessage(text) {
+  function debtMessage(text, from = { id: 7, username: 'nick', first_name: 'Nick' }) {
     return {
       message: {
         message_id: 5,
         chat: { id: -123456789 },
-        from: { id: 7, username: 'nick', first_name: 'Nick' },
+        from,
         text,
       },
     };
   }
 
-  it('adds to a tab from /debt and tells the player why', async () => {
+  // A tap inside the private preview, which edits that preview in place.
+  function debtTap(data = 'tb:debt:1', from = { id: 7, username: 'nick' }) {
+    return {
+      callback_query: {
+        id: 'cb-debt', data, from,
+        message: { message_id: 90, ephemeral_message_id: 91, chat: { id: -123456789 } },
+      },
+    };
+  }
+
+  function editedPanel(requests) {
+    return requests.filter((request) => request.url.endsWith('/editEphemeralMessageText')).pop();
+  }
+
+  it('adds to a tab from /debt once confirmed, and tells the player why', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
       requests.push({ url: String(url), body: JSON.parse(init.body) });
@@ -2241,7 +2274,11 @@ describe('Telegram commands', () => {
       });
     }));
     const inserts = [];
-    await handleUpdate(debtEnv(inserts), debtMessage('/debt +2 jared mcdonalds ice cream'));
+    const env = debtEnv(inserts);
+    await handleUpdate(env, debtMessage('/debt +2 jared mcdonalds ice cream'));
+    // Nothing moves until the admin has read back what the entry means.
+    expect(inserts).toHaveLength(0);
+    await handleUpdate(env, debtTap());
     expect(inserts).toHaveLength(1);
     expect(inserts[0][4]).toBe(200);
     expect(inserts[0][5]).toContain('mcdonalds ice cream · by @nick');
@@ -2252,9 +2289,9 @@ describe('Telegram commands', () => {
     expect(receipt.body.text).toContain('$2.00 added to your squash tab');
     expect(receipt.body.text).toContain('mcdonalds ice cream');
     expect(receipt.body.text).toContain('You now owe <b>$7.00</b>.');
-    const confirmation = sends.find((send) => send.body.receiver_user_id === 7);
+    const confirmation = editedPanel(requests);
     expect(confirmation.body.text).toContain("$2.00 added to Jared's tab");
-    expect(confirmation.body.text).toContain('Jared now owes <b>$7.00</b>.');
+    expect(confirmation.body.text).toContain('Jared owes you <b>$7.00</b>.');
     // Telegram answered every send with a plain message_id — the receipt fell
     // back to the group, naming a balance and a reason — so the public copy
     // was taken down and the admin was told to pass the word on themselves.
@@ -2272,10 +2309,10 @@ describe('Telegram commands', () => {
       });
     }));
     const inserts = [];
-    await handleUpdate(debtEnv(inserts), debtMessage('/debt +2 jared ice cream'));
-    let confirmation = requests.filter((request) => request.url.endsWith('/sendMessage'))
-      .find((send) => send.body.receiver_user_id === 7);
-    expect(confirmation.body.text).not.toContain('could not be told');
+    let env = debtEnv(inserts);
+    await handleUpdate(env, debtMessage('/debt +2 jared ice cream'));
+    await handleUpdate(env, debtTap());
+    expect(editedPanel(requests).body.text).not.toContain('could not be told');
     // The only delete is the command itself being cleared; the ephemeral
     // receipt had no public copy to take down.
     expect(requests.filter((request) => request.url.endsWith('/deleteMessage'))
@@ -2284,36 +2321,66 @@ describe('Telegram commands', () => {
     // A player known only by handle has no id to reach: the entry is still
     // written, and the admin hears that nobody else was told.
     requests.length = 0;
-    const env = debtEnv(inserts);
-    env.DB = {
-      prepare(sql) {
-        return { bind(...args) { return {
-          async first() {
-            if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
-            if (sql.includes('COALESCE(SUM(amount_cents)')) return { balance: 200 };
-            return null;
-          },
-          async all() {
-            if (sql.includes('FROM booking_players')) {
-              return { results: [{ slug: '@sam', user_id: null, name: '@sam' }] };
-            }
-            return { results: [] };
-          },
-          async run() {
-            if (sql.includes('INSERT INTO ledger')) inserts.push(args);
-            return { meta: { changes: 0 } };
-          },
-        }; } };
-      },
-    };
+    env = debtEnv(inserts, {
+      balance: 200, known: [], roster: [{ slug: '@sam', user_id: null, name: '@sam' }],
+    });
     await handleUpdate(env, debtMessage('/debt +2 sam new ball'));
+    await handleUpdate(env, debtTap());
     expect(inserts).toHaveLength(2);
     expect(inserts[1][1]).toBe('@sam');
+    // The preview is the only message sent: there is nobody to receipt.
     const sends = requests.filter((request) => request.url.endsWith('/sendMessage'));
     expect(sends).toHaveLength(1);
-    confirmation = sends[0];
-    expect(confirmation.body.receiver_user_id).toBe(7);
-    expect(confirmation.body.text).toContain('never posted here, so they were not told');
+    expect(sends[0].body.receiver_user_id).toBe(7);
+    expect(editedPanel(requests).body.text).toContain('never posted here, so they were not told');
+  });
+
+  it('previews a /debt in words, and writes nothing on Cancel', async () => {
+    const requests = [];
+    recordFetch(requests);
+    const inserts = [];
+    const env = debtEnv(inserts);
+    await handleUpdate(env, debtMessage('/debt -10 jared 18 oct court'));
+    const preview = requests.find((request) => request.url.endsWith('/sendMessage'));
+    expect(preview.body.text).toContain('You owe Jared <b>$10.00</b>\nReason: 18 oct court');
+    expect(preview.body.text).toContain('Now: Jared owes you <b>$7.00</b>.');
+    expect(preview.body.text).toContain('After: you will owe Jared <b>$3.00</b>.');
+    expect(preview.body.reply_markup.inline_keyboard[0].map((button) => button.callback_data))
+      .toEqual(['tb:debt:1', 'tb:nodebt:1']);
+
+    await handleUpdate(env, debtTap('tb:nodebt:1'));
+    expect(inserts).toHaveLength(0);
+    expect(editedPanel(requests).body.text).toContain("nothing was written to Jared's tab");
+    // The draft went with the cancel, so a stale Confirm cannot bring it back.
+    requests.length = 0;
+    await handleUpdate(env, debtTap());
+    expect(inserts).toHaveLength(0);
+    const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
+    expect(answer.body.text).toContain('already written or cancelled');
+  });
+
+  it('names the organiser to another admin, and keeps their draft theirs', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      const result = String(url).endsWith('/getChatMember')
+        ? { status: 'administrator' } : { ephemeral_message_id: 12 };
+      return new Response(JSON.stringify({ ok: true, result }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const inserts = [];
+    const env = debtEnv(inserts);
+    const sam = { id: 42, username: 'samadmin' };
+    await handleUpdate(env, debtMessage('/debt +2 jared new ball', sam));
+    const preview = requests.find((request) => request.url.endsWith('/sendMessage'));
+    expect(preview.body.text).toContain('Jared owes Nicholas <b>$2.00</b>');
+    expect(preview.body.text).toContain('After: Jared will owe Nicholas <b>$9.00</b>.');
+    // The preview was shown to them alone, so only they can confirm it.
+    await handleUpdate(env, debtTap('tb:debt:1'));
+    expect(inserts).toHaveLength(0);
+    await handleUpdate(env, debtTap('tb:debt:1', sam));
+    expect(inserts).toHaveLength(1);
   });
 
   it('refuses to put the organiser or the household on the tab', async () => {
@@ -2339,9 +2406,9 @@ describe('Telegram commands', () => {
       { headers: { 'Content-Type': 'application/json' } }
     )));
     const inserts = [];
-    await handleUpdate(
-      debtEnv(inserts), debtMessage('/debt -1 jared played only 30 mins last time')
-    );
+    const env = debtEnv(inserts);
+    await handleUpdate(env, debtMessage('/debt -1 jared played only 30 mins last time'));
+    await handleUpdate(env, debtTap());
     expect(inserts[0][4]).toBe(-100);
     expect(inserts[0][5]).toContain('played only 30 mins last time');
   });
@@ -2446,21 +2513,10 @@ describe('Telegram commands', () => {
     const requests = [];
     recordFetch(requests);
     const env = debtEnv([]);
-    env.DB = { prepare(sql) {
-      const inner = debtDb([]).prepare(sql);
-      return { bind(...args) {
-        const bound = inner.bind(...args);
-        return { ...bound, async run() {
-          await bound.run();
-          return { meta: { changes: 1, last_row_id: 33 } };
-        } };
-      } };
-    } };
     await handleUpdate(env, debtMessage('/debt +5 jared for court'));
-    const confirmation = requests.filter((request) => request.url.endsWith('/sendMessage'))
-      .find((send) => send.body.receiver_user_id === 7);
-    expect(confirmation.body.reply_markup.inline_keyboard[0].map((button) => button.callback_data))
-      .toEqual(['tb:undo:33', 'sb:ok']);
+    await handleUpdate(env, debtTap());
+    expect(editedPanel(requests).body.reply_markup.inline_keyboard[0]
+      .map((button) => button.callback_data)).toEqual(['tb:undo:33', 'sb:ok']);
   });
 
   it('removes a /debt entry on Undo, tells the player, and refuses a second tap', async () => {

@@ -147,17 +147,22 @@ export function defaultCapacity(env) {
     ? Math.min(configured, MAX_CAPACITY) : DEFAULT_CAPACITY;
 }
 
-export async function isChatAdmin(env, chatId, from) {
+// Once OWNER_USER_ID pins the organiser to an account, the handle stops
+// counting: a username can be given up and claimed by somebody else, and
+// matching on it would hand that person admin. Without the id, the handle
+// is all there is to go on. Two missing ids are never a match.
+export function isOwner(env, from) {
   if (!from || !from.id) return false;
   const owner = ownerIdentity(env);
   const who = identity(from);
-  // Once OWNER_USER_ID pins the organiser to an account, the handle stops
-  // counting: a username can be given up and claimed by somebody else, and
-  // matching on it would hand that person admin. Without the id, the handle
-  // is all there is to go on. Two missing ids are never a match.
-  if (owner && (owner.userId
+  return Boolean(owner && (owner.userId
     ? owner.userId === who.userId
-    : owner.slug === who.slug)) return true;
+    : owner.slug === who.slug));
+}
+
+export async function isChatAdmin(env, chatId, from) {
+  if (!from || !from.id) return false;
+  if (isOwner(env, from)) return true;
   const key = `${chatId}:${from.id}`;
   const now = Date.now();
   const cached = adminCache.get(key);

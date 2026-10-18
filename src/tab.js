@@ -516,6 +516,46 @@ export async function adjustBalance(env, chatId, player, cents, reason, actor) {
   };
 }
 
+// "+5" and "-5" are one keystroke apart and mean opposite things, and the sign
+// is the one part of an entry nobody rereads. So /debt writes nothing at
+// first: it parks the entry here and shows the admin what it means in words,
+// and only their Confirm turns it into a ledger row. The reason is too long
+// for callback data, which is why the draft lives in a table at all.
+const DRAFT_TTL_MS = 24 * 60 * 60 * 1000;
+
+// Returns the draft's id and the balance as it stands now, which the preview
+// needs to say where the entry would leave them.
+export async function draftAdjustment(env, chatId, player, cents, reason, actor) {
+  const dataChat = dataChatId(env, chatId);
+  const now = Date.now();
+  const account = await ledgerAccount(env, dataChat, player);
+  const [inserted, total] = await Promise.all([
+    env.DB.prepare(
+      `INSERT INTO debt_drafts
+        (chat_id, actor_id, slug, user_id, name, amount_cents, reason, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      dataChat, actor.id, player.slug, player.user_id || null, player.name, cents, reason, now
+    ).run(),
+    env.DB.prepare(
+      'SELECT COALESCE(SUM(amount_cents), 0) AS balance FROM ledger WHERE chat_id = ? AND slug = ?'
+    ).bind(dataChat, account.slug).first(),
+    // Abandoned drafts are swept as new ones arrive; nothing else reads them.
+    env.DB.prepare('DELETE FROM debt_drafts WHERE created_at < ?').bind(now - DRAFT_TTL_MS).run(),
+  ]);
+  return { id: inserted.meta.last_row_id, balance: (total && total.balance) || 0 };
+}
+
+// Taken, not read: the delete is what makes a second Confirm tap find nothing
+// rather than write the entry twice. Only the admin who typed it may confirm
+// it, since the preview was shown to them alone. Null means it has gone.
+export async function takeDraft(env, chatId, id, actor) {
+  return env.DB.prepare(
+    `DELETE FROM debt_drafts WHERE id = ? AND chat_id = ? AND actor_id = ? AND created_at > ?
+     RETURNING *`
+  ).bind(Number(id), dataChatId(env, chatId), actor.id, Date.now() - DRAFT_TTL_MS).first();
+}
+
 // A typo'd /debt used to be fixable only by typing its opposite, which left
 // the player reading a charge and a refund that between them meant nothing —
 // and an admin who mistyped the fix as well had three lines to explain. Undo
