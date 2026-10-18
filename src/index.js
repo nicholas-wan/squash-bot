@@ -14,9 +14,9 @@ import { looksLikeBooking } from './parser.js';
 import { allowedChats } from './scope.js';
 import { formatMoney } from './pricing.js';
 import {
-  adjustBalance, confirmSettleMarkup, matchAccount, myTabView,
-  parseDebtAdjustment, settleMarkup, settleUser, tabBalances, theirTabView,
-  updateTab,
+  adjustBalance, adjustmentNote, confirmSettleMarkup, matchAccount, myTabView,
+  parseDebtAdjustment, recentAdjustments, settleMarkup, settleUser, tabBalances,
+  theirTabView, undoAdjustment, updateTab,
 } from './tab.js';
 import {
   answerCallback, armWebhookAnswer, botUsername, deleteEphemeralMessage,
@@ -59,6 +59,7 @@ function helpHtml(env) {
     '/courts — refresh the pinned board\n' +
     '/tab — refresh the pinned money tab\n' +
     '/debt +2 player reason — admins: add to or take off a debt\n' +
+    '/debt undo — admins: remove a /debt entry made by mistake\n' +
     '/cancel ID — remove a booking\n' +
     '/book [details] [@player or +1] — book with a player or guest';
 }
@@ -554,6 +555,7 @@ async function dismissMessage(env, callback) {
 // Everything under it settles money or reads somebody else's, which is admin
 // work — the same table shape as the board's, gated the same way.
 const SETTLE_ADMIN = 'Only group admins can settle the tab.';
+const DEBT_ADMIN = 'Only group admins can change what someone owes.';
 const tabRoutes = [
   { pattern: /^tb:mine$/, handler: openMyTab },
   { pattern: /^tb:mine:(.+)$/, admin: 'Only group admins can read another tab.', handler: openTheirTab },
@@ -564,6 +566,7 @@ const tabRoutes = [
   // the admin agreed to clear, so it only redraws the confirmation.
   { pattern: /^tb:paid:(.+)$/, admin: SETTLE_ADMIN, handler: confirmSettle },
   { pattern: /^tb:pay:(.+)$/, admin: SETTLE_ADMIN, handler: confirmSettle },
+  { pattern: /^tb:undo:(\d+)$/, admin: DEBT_ADMIN, handler: undoTapped },
 ];
 
 function handleTabCallback(env, callback) {
@@ -656,6 +659,46 @@ async function confirmSettle(env, callback, match) {
   await answerCallback(env, callback.id);
 }
 
+// Undo is immediate rather than confirmed: what it removes is one line an
+// admin typed moments ago, and getting it back is retyping that line. The
+// player was sent a receipt for the entry, so they hear that it has gone.
+async function undoTapped(env, callback, match) {
+  const chatId = callback.message.chat.id;
+  const undone = await undoAdjustment(env, chatId, match[1]);
+  if (!undone) {
+    await answerCallback(env, callback.id,
+      'That entry has already been undone, or is too old to undo.', true);
+    return;
+  }
+  const amount = signedMoney(undone.cents);
+  let told = '';
+  if (undone.userId) {
+    const receipt = await deliverPrivately(env, chatId, undone.userId,
+      `↩️ <b>The ${amount} entry on your squash tab was undone</b>\n\n`
+      + `${escapeHtml(undone.note)} — it was a mistake and has been removed.\n\n`
+      + standingLine('You', undone.balance, true),
+      { replyMarkup: OK_MARKUP });
+    if (receipt.status !== 'private') {
+      told = '\n\nThey could not be told privately, so let them know yourself.';
+    }
+  }
+  await showPanel(env, callback, {
+    html: `↩️ <b>Undid ${amount} on ${escapeHtml(undone.name)}'s tab</b> — `
+      + `${escapeHtml(undone.note)}.\n\n`
+      + standingLine(escapeHtml(undone.name), undone.balance) + told,
+    replyMarkup: OK_MARKUP,
+  });
+  await answerCallback(env, callback.id);
+}
+
+function signedMoney(cents) {
+  return `${cents < 0 ? '−' : '+'}${formatMoney(Math.abs(cents))}`;
+}
+
+function undoButton(id) {
+  return { text: '↩️ Undo', callback_data: `tb:undo:${id}` };
+}
+
 // Every command answers whoever sent it and nobody else, which is the whole
 // point of the bot: the group keeps the pinned board and tab, not the traffic.
 function privateReply(env, msg, html, replyMarkup = OK_MARKUP) {
@@ -677,7 +720,8 @@ function standingLine(subject, balance, secondPerson = false) {
 
 const DEBT_USAGE = 'Use <code>/debt +AMOUNT player reason</code>.\n\n'
   + '<code>/debt +2 jared mcdonalds ice cream</code> — adds $2 to what Jared owes\n'
-  + '<code>/debt -1 jared played only 30 mins</code> — takes $1 off\n\n'
+  + '<code>/debt -1 jared played only 30 mins</code> — takes $1 off\n'
+  + '<code>/debt undo</code> — removes an entry made by mistake\n\n'
   + 'The reason is required — it is what they read on their own tab.';
 const DEBT_ERRORS = {
   usage: DEBT_USAGE,
@@ -903,6 +947,23 @@ async function dispatchUpdate(env, update) {
         await privateReply(env, msg, 'Only group admins can change what someone owes.');
         return;
       }
+      // The Undo button on a confirmation is gone once it is dismissed, so
+      // this is the way back to an entry noticed late.
+      if (/^undo$/i.test(args.trim())) {
+        const recent = await recentAdjustments(env, msg.chat.id);
+        await privateReply(env, msg, recent.length
+          ? '↩️ <b>Undo a /debt entry</b>\n\nTap the one made by mistake. It comes off '
+            + 'their tab as though it was never written, and they are told.'
+          : 'There is no /debt entry from the last 7 days to undo.',
+        recent.length ? { inline_keyboard: [
+          ...recent.map((row) => [{
+            ...undoButton(row.id),
+            text: `↩️ ${row.name} ${signedMoney(row.amount_cents)} · ${adjustmentNote(row)}`,
+          }]),
+          ...OK_MARKUP.inline_keyboard,
+        ] } : OK_MARKUP);
+        return;
+      }
       const parsed = parseDebtAdjustment(args);
       if (parsed.error) {
         await privateReply(env, msg, DEBT_ERRORS[parsed.error]);
@@ -953,7 +1014,10 @@ async function dispatchUpdate(env, update) {
       await privateReply(env, msg,
         `✅ <b>${moved} ${escapeHtml(entry.name)}'s tab</b> — `
         + `${escapeHtml(parsed.reason)}.\n\n`
-        + standingLine(escapeHtml(entry.name), entry.balance) + told);
+        + standingLine(escapeHtml(entry.name), entry.balance) + told,
+        entry.id
+          ? { inline_keyboard: [[undoButton(entry.id), ...OK_MARKUP.inline_keyboard[0]]] }
+          : OK_MARKUP);
       return;
     }
     if (command === 'cancel') {
