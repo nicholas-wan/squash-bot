@@ -263,6 +263,15 @@ the group is taken down rather than left there, and either way the admin's
 confirmation says whether the player was told, so nobody finds a charge on
 their tab that nobody mentioned.
 
+Nothing is written until the admin who typed it confirms. `+5` and `-5` are one
+keystroke apart and mean opposite things, so `/debt` first answers privately
+with what the entry means in words — "Jared owes you $5" or "You owe Jared $5"
+(the organiser's name in place of "you" when another admin typed it) — with
+the reason, the balance now and the balance after. **✅ Confirm** writes it and
+sends the receipt; **✖️ Cancel** drops it. The pending entry waits in
+`debt_drafts`, since the reason is too long for a button, and only the admin
+who drafted it can confirm it.
+
 ```text
 /debt +2 jared mcdonalds ice cream
 /debt -1 jared played only 30 mins last time
@@ -410,12 +419,14 @@ npm run db:migrate:013
 npm run db:migrate:014
 npm run db:migrate:015
 npm run db:migrate:016
+npm run db:migrate:017
 npm run db:verify
 ```
 
 Run them in that order. Everything the migrations used to create now lives in
 `schema.sql`, leaving 002, 003, 005, 006, and 016 (free courts) as `ALTER TABLE` alone, 004 as a
-no-op, and 007–013 and 015 as idempotent table/index/trigger migrations. 015
+no-op, and 007–013, 015 and 017 (pending `/debt` drafts) as idempotent
+table/index/trigger migrations. 015
 adds the table that records every Telegram update id once, so an update
 Telegram redelivers is answered and dropped rather than handled twice — the
 guard that keeps a redelivered `/debt` from writing a second row. 014 replaces

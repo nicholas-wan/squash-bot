@@ -6,17 +6,17 @@ import {
   removePlayerView, restoreBoardButtons, runMaintenance, joinPickerView, updateBoard,
 } from './bookings.js';
 import {
-  adminAddPlayer, defaultCapacity, isChatAdmin, isHouseholdPlayer, knownPlayers,
-  MAX_CAPACITY, raiseCapacity, rememberPlayer, togglePlusOne,
+  adminAddPlayer, defaultCapacity, isChatAdmin, isHouseholdPlayer, isOwner, knownPlayers,
+  MAX_CAPACITY, ownerName, raiseCapacity, rememberPlayer, togglePlusOne,
   joinBooking, leaveBooking, removeBookingPlayer, toggleBooking,
 } from './players.js';
 import { looksLikeBooking } from './parser.js';
 import { allowedChats } from './scope.js';
 import { formatMoney } from './pricing.js';
 import {
-  adjustBalance, adjustmentNote, confirmSettleMarkup, matchAccount, myTabView,
-  parseDebtAdjustment, recentAdjustments, settleMarkup, settleUser, tabBalances,
-  theirTabView, undoAdjustment, updateTab,
+  adjustBalance, adjustmentNote, confirmSettleMarkup, draftAdjustment, matchAccount,
+  myTabView, parseDebtAdjustment, recentAdjustments, settleMarkup, settleUser,
+  tabBalances, takeDraft, theirTabView, undoAdjustment, updateTab,
 } from './tab.js';
 import {
   answerCallback, armWebhookAnswer, botUsername, deleteEphemeralMessage,
@@ -567,6 +567,8 @@ const tabRoutes = [
   { pattern: /^tb:paid:(.+)$/, admin: SETTLE_ADMIN, handler: confirmSettle },
   { pattern: /^tb:pay:(.+)$/, admin: SETTLE_ADMIN, handler: confirmSettle },
   { pattern: /^tb:undo:(\d+)$/, admin: DEBT_ADMIN, handler: undoTapped },
+  { pattern: /^tb:debt:(\d+)$/, admin: DEBT_ADMIN, handler: confirmDebtTapped },
+  { pattern: /^tb:nodebt:(\d+)$/, admin: DEBT_ADMIN, handler: cancelDebtTapped },
 ];
 
 function handleTabCallback(env, callback) {
@@ -686,6 +688,95 @@ async function undoTapped(env, callback, match) {
     html: `↩️ <b>Undid ${amount} on ${escapeHtml(undone.name)}'s tab</b> — `
       + `${escapeHtml(undone.note)}.\n\n`
       + standingLine(escapeHtml(undone.name), undone.balance) + told,
+    replyMarkup: OK_MARKUP,
+  });
+  await answerCallback(env, callback.id);
+}
+
+// Who owes whom, in words, from the side of whoever is owed: the organiser,
+// who is "you" when they are the one reading. Each player's balance is what
+// they owe the organiser, so a negative one is the organiser owing them.
+function owingText(env, reader, name, cents, { will = false } = {}) {
+  const you = isOwner(env, reader);
+  const owner = you ? 'you' : escapeHtml(ownerName(env));
+  if (!cents) return `${name} and ${owner} ${will ? 'will be' : 'are'} all square`;
+  const amount = `<b>${formatMoney(Math.abs(cents))}</b>`;
+  const ownerVerb = will ? 'will owe' : (you ? 'owe' : 'owes');
+  return cents > 0
+    ? `${name} ${will ? 'will owe' : 'owes'} ${owner} ${amount}`
+    : `${owner} ${ownerVerb} ${name} ${amount}`;
+}
+
+function sentence(text) {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+// "+5" and "-5" look alike; "Wei Shen owes you $5" and "You owe Wei Shen $5"
+// do not. The preview says which one the entry is, why, and where it leaves
+// the balance, so a sign typed the wrong way round is caught before it is
+// written rather than undone after the player has been told about it.
+function debtPreviewHtml(env, reader, name, cents, reason, balance) {
+  const who = escapeHtml(name);
+  return '🧾 <b>Check this before it goes on the tab</b>\n\n'
+    + `${sentence(owingText(env, reader, who, cents))}\n`
+    + `Reason: ${escapeHtml(reason)}\n\n`
+    + `Now: ${owingText(env, reader, who, balance)}.\n`
+    + `After: ${owingText(env, reader, who, balance + cents, { will: true })}.\n\n`
+    + 'Confirm if that is the right way round.';
+}
+
+async function confirmDebtTapped(env, callback, match) {
+  const chatId = callback.message.chat.id;
+  const draft = await takeDraft(env, chatId, match[1], callback.from);
+  if (!draft) {
+    await answerCallback(env, callback.id,
+      'That entry was already written or cancelled, or is over a day old. '
+      + 'Send /debt again.', true);
+    return;
+  }
+  const entry = await adjustBalance(env, chatId,
+    { slug: draft.slug, user_id: draft.user_id, name: draft.name },
+    draft.amount_cents, draft.reason, callback.from);
+  const moved = `${formatMoney(Math.abs(entry.cents))} `
+    + `${entry.cents > 0 ? 'added to' : 'taken off'}`;
+  // The ledger just moved for somebody who was not in the conversation, so
+  // they hear it from the bot with the reason attached — the same receipt
+  // a settlement sends, and for the same reason. Reachable only once they
+  // have posted at least once, which is what gives them a numeric id. The
+  // receipt names a balance and a reason, so it goes through the gate
+  // that keeps it out of the group, and the admin is told when it did not
+  // land: an unprompted ephemeral is the kind Telegram is likeliest to
+  // drop, and the entry is only fair once the person knows about it.
+  let told = '';
+  if (entry.userId) {
+    const receipt = await deliverPrivately(env, chatId, entry.userId,
+      `🧾 <b>${moved} your squash tab</b>\n\n${escapeHtml(draft.reason)}\n\n`
+      + standingLine('You', entry.balance, true),
+      { replyMarkup: OK_MARKUP });
+    if (receipt.status !== 'private') {
+      told = '\n\nThey could not be told privately, so let them know yourself.';
+    }
+  } else {
+    told = '\n\nThey have never posted here, so they were not told.';
+  }
+  await showPanel(env, callback, {
+    html: `✅ <b>${moved} ${escapeHtml(entry.name)}'s tab</b> — `
+      + `${escapeHtml(draft.reason)}.\n\n`
+      + `${sentence(owingText(env, callback.from, escapeHtml(entry.name), entry.balance))}.`
+      + told,
+    replyMarkup: entry.id
+      ? { inline_keyboard: [[undoButton(entry.id), ...OK_MARKUP.inline_keyboard[0]]] }
+      : OK_MARKUP,
+  });
+  await answerCallback(env, callback.id);
+}
+
+async function cancelDebtTapped(env, callback, match) {
+  const draft = await takeDraft(env, callback.message.chat.id, match[1], callback.from);
+  await showPanel(env, callback, {
+    html: draft
+      ? `✖️ <b>Cancelled</b> — nothing was written to ${escapeHtml(draft.name)}'s tab.`
+      : '✖️ <b>Nothing to cancel</b> — that entry was already written or has expired.',
     replyMarkup: OK_MARKUP,
   });
   await answerCallback(env, callback.id);
@@ -986,38 +1077,18 @@ async function dispatchUpdate(env, update) {
           `<b>${escapeHtml(matched.player.name)}</b> plays for free and is never on the tab.`);
         return;
       }
-      const entry = await adjustBalance(
+      // Nothing is written yet: the admin reads back what the sign means and
+      // confirms it. See draftAdjustment.
+      const draft = await draftAdjustment(
         env, msg.chat.id, matched.player, parsed.cents, parsed.reason, msg.from
       );
-      const moved = `${formatMoney(Math.abs(entry.cents))} `
-        + `${entry.cents > 0 ? 'added to' : 'taken off'}`;
-      // The ledger just moved for somebody who was not in the conversation, so
-      // they hear it from the bot with the reason attached — the same receipt
-      // a settlement sends, and for the same reason. Reachable only once they
-      // have posted at least once, which is what gives them a numeric id. The
-      // receipt names a balance and a reason, so it goes through the gate
-      // that keeps it out of the group, and the admin is told when it did not
-      // land: an unprompted ephemeral is the kind Telegram is likeliest to
-      // drop, and the entry is only fair once the person knows about it.
-      let told = '';
-      if (entry.userId) {
-        const receipt = await deliverPrivately(env, msg.chat.id, entry.userId,
-          `🧾 <b>${moved} your squash tab</b>\n\n${escapeHtml(parsed.reason)}\n\n`
-          + standingLine('You', entry.balance, true),
-          { replyMarkup: OK_MARKUP });
-        if (receipt.status !== 'private') {
-          told = '\n\nThey could not be told privately, so let them know yourself.';
-        }
-      } else {
-        told = '\n\nThey have never posted here, so they were not told.';
-      }
       await privateReply(env, msg,
-        `✅ <b>${moved} ${escapeHtml(entry.name)}'s tab</b> — `
-        + `${escapeHtml(parsed.reason)}.\n\n`
-        + standingLine(escapeHtml(entry.name), entry.balance) + told,
-        entry.id
-          ? { inline_keyboard: [[undoButton(entry.id), ...OK_MARKUP.inline_keyboard[0]]] }
-          : OK_MARKUP);
+        debtPreviewHtml(env, msg.from, matched.player.name, parsed.cents, parsed.reason,
+          draft.balance),
+        { inline_keyboard: [[
+          { text: '✅ Confirm', callback_data: `tb:debt:${draft.id}` },
+          { text: '✖️ Cancel', callback_data: `tb:nodebt:${draft.id}` },
+        ]] });
       return;
     }
     if (command === 'cancel') {
