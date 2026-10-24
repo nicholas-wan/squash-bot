@@ -2579,3 +2579,42 @@ describe('Telegram commands', () => {
     expect(answer.body.text).toContain('Only group admins');
   });
 });
+
+describe('pin notices', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  function pinNotice(fromId) {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify({ ok: true, result: true }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const db = { prepare() { return { bind() { return {
+      async first() { return null; },
+      async all() { return { results: [] }; },
+      async run() { return { meta: { changes: 0 } }; },
+    }; } }; } };
+    const update = { message: {
+      message_id: 66, chat: { id: -123456789 },
+      from: { id: fromId, is_bot: fromId === 999 },
+      pinned_message: { message_id: 65, text: 'Upcoming squash courts' },
+    } };
+    return { requests, run: () => handleUpdate(
+      { BOT_TOKEN: '999:secret', ALLOWED_CHATS: '-123456789', DB: db }, update) };
+  }
+
+  it('deletes the notice Telegram posts when the bot pins its board', async () => {
+    const { requests, run } = pinNotice(999);
+    await run();
+    const deletes = requests.filter((request) => request.url.endsWith('/deleteMessage'));
+    expect(deletes.map((request) => request.body)).toEqual([{ chat_id: -123456789, message_id: 66 }]);
+  });
+
+  it('leaves the notice alone when a person pinned something', async () => {
+    const { requests, run } = pinNotice(7);
+    await run();
+    expect(requests.some((request) => request.url.endsWith('/deleteMessage'))).toBe(false);
+  });
+});

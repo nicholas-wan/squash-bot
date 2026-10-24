@@ -19,7 +19,7 @@ import {
   tabBalances, takeDraft, theirTabView, undoAdjustment, updateTab,
 } from './tab.js';
 import {
-  answerCallback, armWebhookAnswer, botUsername, deleteEphemeralMessage,
+  answerCallback, armWebhookAnswer, botId, botUsername, deleteEphemeralMessage,
   deleteMessage, editEphemeralMessage, editReplyMarkup, escapeHtml, OK_MARKUP,
   sendMessage, setBotProfilePhoto, telegram,
 } from './telegram.js';
@@ -916,6 +916,13 @@ async function dispatchUpdate(env, update) {
   }
 
   const msg = update.message;
+  // Pinning a freshly posted board or tab makes Telegram add a "SquashBot
+  // pinned …" notice, which lands below the announcement and says nothing the
+  // pin itself does not. The bot's own notices go; a person's pins are theirs.
+  if (msg && msg.pinned_message && msg.from && msg.from.id === botId(env)) {
+    if (chatAllowed(env, msg.chat)) await deleteMessage(env, msg.chat.id, msg.message_id);
+    return;
+  }
   if (!msg || !msg.text || !chatAllowed(env, msg.chat)) return;
   const text = msg.text.trim();
   // Set once the original has been cleared, so a failure further down can hand
