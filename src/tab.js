@@ -1,3 +1,4 @@
+import { syncAnnouncements } from './announcements.js';
 import { courtName } from './format.js';
 import { courtCostCents, formatMoney, publicHolidays, shareCents } from './pricing.js';
 import { identity, isHouseholdPlayer, ownerName } from './players.js';
@@ -294,12 +295,19 @@ export async function updateTab(env, chatId) {
   // Shared tabs are independent Telegram calls, just like shared boards. A
   // slow or kicked sibling should not add its full round trip to every /tab.
   const outcomes = await Promise.all(boardChats(env, chatId).map(async (chat) => {
+    let outcome;
     try {
       const id = await updatePinnedMessage(env, chat, 'tab_message_id', html, markup, 'squash tab');
-      return { chat, id };
+      outcome = { chat, id };
     } catch (error) {
-      return { chat, error };
+      outcome = { chat, error };
     }
+    // A tab posted afresh lands below the announcement; the sync sees that
+    // and moves the announcement back to the bottom. Its errors are retried
+    // by maintenance and never fail the tab.
+    try { await syncAnnouncements(env, chat); }
+    catch (error) { console.log(`Announcement refresh failed: ${error.message || error}`); }
+    return outcome;
   }));
   for (const outcome of outcomes.filter((item) => item.error)) {
     try {

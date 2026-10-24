@@ -7,7 +7,7 @@ import {
 } from './bookings.js';
 import {
   adminAddPlayer, defaultCapacity, isChatAdmin, isHouseholdPlayer, isOwner, knownPlayers,
-  MAX_CAPACITY, ownerName, raiseCapacity, rememberPlayer, togglePlusOne,
+  MAX_CAPACITY, ownerName, raiseCapacity, rememberPlayer, toggleOwnerGuest, togglePlusOne,
   joinBooking, leaveBooking, removeBookingPlayer, toggleBooking,
 } from './players.js';
 import { looksLikeBooking } from './parser.js';
@@ -114,6 +114,7 @@ const boardRoutes = [
   // The head count comes before the slug and is a bare 1 or 2, which is what
   // keeps this apart from the picker's own :h1 / :h2 rows — a slug can start
   // with anything, so the digit has to be matched first and anchored.
+  { pattern: /^sb:addp:(\d+):guest$/, admin: SEAT_ADMIN, handler: flipOwnerGuest },
   { pattern: /^sb:addp:(\d+):([12]):(.+)$/, admin: SEAT_ADMIN, handler: seatPickedPlayer },
   { pattern: /^sb:addp:(\d+)(?::h([12]))?$/, admin: SEAT_ADMIN, handler: openSeatPicker },
   { pattern: /^sb:plus:(\d+):(\d+)$/, admin: PLUS_ADMIN, handler: flipPlusOne },
@@ -398,6 +399,37 @@ async function flipPlusOne(env, callback, match) {
       + delivery, false],
     full: ['No free slot for a +1. Open another slot first.', true],
     gone: ['That player or booking has already gone.', true],
+  };
+  await answerCallback(env, callback.id, ...replies[result.status]);
+}
+
+// The organiser's free guest, flipped from the seat picker: somebody seated
+// on the organiser's +1 is charged to nobody. The picker is redrawn rather
+// than left for the booking panel, since seating the rest usually follows.
+async function flipOwnerGuest(env, callback, match) {
+  const chatId = callback.message.chat.id;
+  const bookingId = Number(match[1]);
+  const result = await toggleOwnerGuest(env, chatId, bookingId, callback.from.id);
+  const host = ownerName(env);
+  let allTold = false;
+  if (result.status === 'plus' || result.status === 'minus') {
+    ({ allTold } = await notifyRosterOfChange(env, chatId, result.booking, {
+      id: result.player.user_id || null,
+      username: result.player.slug.startsWith('@') ? result.player.slug.slice(1) : null,
+      first_name: host,
+    }, result.status));
+    await updateBoard(env, chatId);
+    const view = await addPlayerView(env, chatId, bookingId);
+    if (view) await showPanel(env, callback, view);
+  }
+  const delivery = allTold
+    ? 'Everyone has been told.' : 'Some players could not be notified.';
+  const replies = {
+    plus: [`${host} +1 is on — the guest is not charged. ${delivery}`, false],
+    minus: [`${host}'s guest is off. ${delivery}`, false],
+    full: ['No free slot for a guest. Open another slot first.', true],
+    already: ['That court has changed — open the picker again.', true],
+    gone: ['That booking has already gone.', true],
   };
   await answerCallback(env, callback.id, ...replies[result.status]);
 }

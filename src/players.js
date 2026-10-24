@@ -496,6 +496,32 @@ export async function togglePlusOne(env, chatId, bookingId, playerRowId) {
     : { status: 'full', booking };
 }
 
+// The organiser's row on a roster, by id where config pins one, else by slug.
+export function ownerRow(env, roster) {
+  const owner = ownerIdentity(env);
+  if (!owner) return null;
+  return roster.find((player) => (owner.userId && player.user_id
+    ? Number(owner.userId) === Number(player.user_id)
+    : player.slug === owner.slug)) || null;
+}
+
+// The organiser bringing a guest nobody is charged for. The organiser's own
+// shares never reach the tab, so a +1 on their row is a seat that costs the
+// guest nothing: the organiser absorbs it, exactly as they absorb the
+// household's. Flips the +1 when they are seated; seats them with it when an
+// admin took them off.
+export async function toggleOwnerGuest(env, chatId, bookingId, addedByUserId) {
+  const owner = ownerIdentity(env);
+  if (!owner) return { status: 'gone' };
+  const booking = await openBooking(env, chatId, bookingId);
+  if (!booking) return { status: 'gone' };
+  const row = ownerRow(env, await rosterFor(env, bookingId));
+  if (row) return togglePlusOne(env, chatId, bookingId, row.id);
+  const player = { slug: owner.slug, user_id: owner.userId || null, name: owner.name };
+  const added = await adminAddPlayer(env, chatId, bookingId, player, addedByUserId, 2);
+  return added.status === 'added' ? { status: 'plus', booking, player } : added;
+}
+
 export async function raiseCapacity(env, chatId, bookingId) {
   const result = await env.DB.prepare(
     `UPDATE bookings SET capacity = capacity + 1

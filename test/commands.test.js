@@ -1379,7 +1379,7 @@ describe('Telegram commands', () => {
       OWNER_USER_ID: '7', DB: emptyDb(),
     };
     for (const data of ['sb:cap:3', 'sb:kick:3', 'sb:kick:3:4', 'sb:addp:3',
-      'sb:addp:3:h2', 'sb:addp:3:1:@bo', 'sb:addp:3:2:@bo', 'sb:plus:3',
+      'sb:addp:3:h2', 'sb:addp:3:1:@bo', 'sb:addp:3:2:@bo', 'sb:addp:3:guest', 'sb:plus:3',
       'sb:plus:3:8', 'tb:pay']) {
       requests.length = 0;
       await handleUpdate(env, {

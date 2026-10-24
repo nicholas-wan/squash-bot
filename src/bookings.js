@@ -1,7 +1,7 @@
 import {
   clearRoster, defaultCapacity, DEFAULT_CAPACITY, identity, isChatAdmin,
-  knownPlayers, matchesPlayer, MAX_CAPACITY, openBooking, ownerIdentity, rosterFor, rostersFor,
-  seedRoster,
+  isHouseholdPlayer, knownPlayers, matchesPlayer, MAX_CAPACITY, openBooking, ownerIdentity,
+  ownerName, ownerRow, rosterFor, rostersFor, seedRoster,
 } from './players.js';
 import {
   compactTimeRange, courtName, formatCountdown, playerHeads, playerTags, rosterHeads, shortClock,
@@ -618,17 +618,22 @@ export async function updateBoard(env, chatId, now = Date.now()) {
   // dead sibling from adding one full network round trip per group, while the
   // acting chat still decides whether the operation itself succeeds.
   const outcomes = await Promise.all(boardChats(env, chatId).map(async (chat) => {
+    // The board goes first so that a board posted afresh — the first booking
+    // after an empty spell — lands above the announcement rather than below
+    // it. Announcement errors are retried by maintenance and do not block the
+    // board, and a failed board still lets the announcement move on.
+    let outcome;
     try {
-      // Announcement errors are retried by maintenance and do not block the board.
-      try { await syncAnnouncements(env, chat, now); }
-      catch (error) { console.log(`Announcement refresh failed: ${error.message || error}`); }
       const id = await updatePinnedMessage(
         env, chat, 'board_message_id', board.html, board.replyMarkup, 'court board'
       );
-      return { chat, id };
+      outcome = { chat, id };
     } catch (error) {
-      return { chat, error };
+      outcome = { chat, error };
     }
+    try { await syncAnnouncements(env, chat, now); }
+    catch (error) { console.log(`Announcement refresh failed: ${error.message || error}`); }
+    return outcome;
   }));
   for (const outcome of outcomes.filter((item) => item.error)) {
     try {
@@ -742,7 +747,22 @@ export async function addPlayerView(env, chatId, bookingId, heads = 1) {
   if (!booking) return null;
   const roster = await rosterFor(env, bookingId);
   const capacity = booking.capacity || DEFAULT_CAPACITY;
-  if (rosterHeads(roster) + heads > capacity) return null;
+  const free = capacity - rosterHeads(roster);
+  // The organiser's free guest, under the names: a seat for somebody they are
+  // not charging. It takes one slot when the organiser is seated and two when
+  // an admin took them off, and the same row turns it off again.
+  const owner = ownerIdentity(env);
+  const host = ownerRow(env, roster);
+  const guestOn = Boolean(host) && playerHeads(host) > 1;
+  const guestRow = owner && (guestOn || free >= (host ? 1 : 2))
+    ? [{
+      text: guestOn
+        ? `➖ ${ownerName(env)} +1 — guest off`
+        : `🎁 ${ownerName(env)} +1 — free guest`,
+      callback_data: `sb:addp:${bookingId}:guest`,
+    }]
+    : null;
+  if (heads > free && !guestRow) return null;
   // One person can be known under two keys — their @handle, and the numeric
   // account their charges are filed under — and offering both let an admin
   // seat them twice, splitting the court over a head that was never there.
@@ -763,7 +783,7 @@ export async function addPlayerView(env, chatId, bookingId, heads = 1) {
   const seated = new Set(roster.flatMap((player) => [player.slug, accountOf(player)]));
   const offered = new Set();
   const encoder = new TextEncoder();
-  const candidates = known
+  const candidates = heads > free ? [] : known
     .filter((player) => !seated.has(player.slug) && !seated.has(accountOf(player)))
     // Telegram caps callback_data at 64 bytes; a slug that will not fit
     // cannot be offered as a button.
@@ -775,7 +795,7 @@ export async function addPlayerView(env, chatId, bookingId, heads = 1) {
     .filter((player) => !offered.has(accountOf(player)) && offered.add(accountOf(player)))
     .sort((a, b) => a.name.localeCompare(b.name))
     .slice(0, MAX_JOIN_BUTTONS);
-  if (!candidates.length) return null;
+  if (!candidates.length && !guestRow) return null;
   const tz = await getTimezone(env, chatId);
   // The toggle sits above the names because it changes what tapping one of them
   // does, and a switch read after the fact is a switch nobody read.
@@ -794,6 +814,7 @@ export async function addPlayerView(env, chatId, bookingId, heads = 1) {
       callback_data: `sb:addp:${bookingId}:${heads}:${player.slug}`,
     }]);
   }
+  if (guestRow) rows.push(guestRow);
   rows.push([{ text: '← Back', callback_data: `sb:pick:${bookingId}` }]);
   return {
     html: `➕ <b>Seat somebody on ${escapeHtml(bookingLabel(booking, tz))}</b>\n\n`
@@ -922,7 +943,12 @@ export async function notifyRosterOfChange(
   // The sponsor hears about both shares from the bot itself, not first from
   // the tab: a doubled charge nobody warned them about reads as a mistake.
   const name = escapeHtml(actor.name);
-  const twoShares = '\nYour +1 plays on your tab — this court counts as two shares for you.';
+  // The organiser and household never reach the tab, so for them a +1 is free
+  // and talk of shares would be wrong.
+  const unbilled = isHouseholdPlayer(env, actor);
+  const twoShares = unbilled
+    ? '\nYour +1 plays free — nobody is charged for them.'
+    : '\nYour +1 plays on your tab — this court counts as two shares for you.';
   const toOthers = {
     joined: `🙋 <b>${name}</b> joined ${where}`,
     left: `🚪 <b>${name}</b> left ${where}`,
@@ -936,7 +962,7 @@ export async function notifyRosterOfChange(
     left: `🚪 <b>You are off</b> ${where}`,
     added: `✅ <b>You are on</b> ${where}` + (heads > 1 ? twoShares : ''),
     plus: `👥 <b>Your +1 is on</b> ${where}${twoShares}`,
-    minus: `👥 <b>Your +1 is off</b> ${where}\nBack to one share for you.`,
+    minus: `👥 <b>Your +1 is off</b> ${where}${unbilled ? '' : '\nBack to one share for you.'}`,
   }[action];
   // The actor's copy is planned first whichever way the slot went — a leaver's
   // row is already deleted, so the roster could never produce it, and one path
