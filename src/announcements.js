@@ -82,8 +82,18 @@ export async function syncAnnouncements(env, chatId, now = Date.now()) {
   try {
     const current = await env.DB.prepare('SELECT * FROM availability_notices WHERE chat_id = ?')
       .bind(chatId).first() || { booking_id: null, message_id: null, html: null };
-    const next = await nextOpenBooking(env, chatId, now);
-    if (current.message_id && current.booking_id !== (next?.booking.id ?? null)) {
+    const [next, pinned] = await Promise.all([
+      nextOpenBooking(env, chatId, now),
+      env.DB.prepare('SELECT board_message_id, tab_message_id FROM settings WHERE chat_id = ?')
+        .bind(chatId).first(),
+    ]);
+    // Message ids only grow within a chat, so a pinned board or tab with a
+    // higher id was posted after this message and sits below it. The bot's
+    // last word is meant to be the next open court; one buried under a freshly
+    // posted board reads as stale, so it is retired and posted again.
+    const buried = Boolean(current.message_id) && current.message_id
+      < Math.max(Number(pinned?.board_message_id) || 0, Number(pinned?.tab_message_id) || 0);
+    if (current.message_id && (buried || current.booking_id !== (next?.booking.id ?? null))) {
       // The tracked court is no longer the one to point at. Whether it filled,
       // started, was cancelled, or was overtaken by a nearer booking, the
       // message goes so that a fresh one can land at the bottom of the chat.

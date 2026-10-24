@@ -35,7 +35,9 @@ that court's time or court number change the message in place. When a different
 court becomes the one to point at — a nearer court is booked, the current one
 fills, starts, or is cancelled — the old message is deleted and a fresh one is
 posted at the bottom of the chat; when no open court remains, it is deleted
-and nothing replaces it. A message Telegram refuses to delete — one older than
+and nothing replaces it. The pinned board and tab are drawn before it, and
+should either have to be posted afresh — the first booking after an empty
+spell, say — the message sees it is no longer last and moves back below them. A message Telegram refuses to delete — one older than
 48 hours in a group where the bot lacks the Delete Messages right — is kept and
 rewritten in place for the next court instead, or, when no court is open,
 closed as a one-line record of what became of its court (full, played, or
@@ -91,6 +93,10 @@ admins open extra slots, seat a player the bot already knows — billed as if
 they joined themselves, or with a friend who costs them a second slot and a
 second share, and refused when the court has no room — flip a +1 on or off
 somebody already seated under the same capacity rule, or take a player off.
+The seat picker also carries **🎁 Nicholas +1 — free guest** (named from
+`OWNER_NAME`): a +1 on the organiser, whose shares never reach the tab, so
+the guest is charged to nobody — the organiser absorbs it. It seats the
+organiser too if they had been taken off, and the same row turns it off.
 Every active court is listed, the
 same as the board. Those two admin actions stay open until the court ends,
 which is how a no-show is kept off the tab, while joining and leaving close the

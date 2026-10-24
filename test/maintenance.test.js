@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { addPlayerView, runMaintenance } from '../src/bookings.js';
-import { adminAddPlayer } from '../src/players.js';
+import { adminAddPlayer, toggleOwnerGuest } from '../src/players.js';
 
 let db, env, requests, reply;
 const now = Date.UTC(2026, 8, 10); // Thu 10 Sep 2026, 8am SGT
@@ -151,4 +151,52 @@ it('offers every known player once when nobody overlaps', async () => {
   const names = view.replyMarkup.inline_keyboard.flat().map((button) => button.text)
     .filter((text) => text.startsWith('➕'));
   expect(names).toEqual(['➕ @bar', '➕ @baz']);
+});
+
+const host = { OWNER: '@nick', OWNER_USER_ID: '7', OWNER_NAME: 'Nicholas' };
+const guestButton = (view) => view.replyMarkup.inline_keyboard.flat()
+  .find((button) => button.callback_data === 'sb:addp:1:guest');
+
+it('lets the organiser bring a guest from the seat picker, and take it back', async () => {
+  Object.assign(env, host);
+  book(1, now + 3 * DAY);
+  seat(1, 7, '@nick', '@nick');
+  seat(1, 5);
+  expect(guestButton(await addPlayerView(env, -123, 1)).text).toBe('🎁 Nicholas +1 — free guest');
+  expect((await toggleOwnerGuest(env, -123, 1, 9)).status).toBe('plus');
+  expect(db.prepare('SELECT heads FROM booking_players WHERE user_id = 7').get().heads).toBe(2);
+  // The court is full now, but the picker still opens to turn the guest off.
+  expect(guestButton(await addPlayerView(env, -123, 1)).text).toBe('➖ Nicholas +1 — guest off');
+  expect((await toggleOwnerGuest(env, -123, 1, 9)).status).toBe('minus');
+  expect(db.prepare('SELECT heads FROM booking_players WHERE user_id = 7').get().heads).toBe(1);
+});
+
+it('seats the organiser with their guest when an admin had taken them off', async () => {
+  Object.assign(env, host);
+  book(1, now + 3 * DAY);
+  seat(1, 5);
+  seat(1, 6);
+  // One slot left: the organiser alone is offered, but with a guest they
+  // would need two, so there is no guest button.
+  expect(guestButton(await addPlayerView(env, -123, 1))).toBeUndefined();
+  db.prepare('DELETE FROM booking_players WHERE user_id = 6').run();
+  expect(guestButton(await addPlayerView(env, -123, 1))).toBeDefined();
+  expect((await toggleOwnerGuest(env, -123, 1, 9)).status).toBe('plus');
+  expect(db.prepare('SELECT slug, heads FROM booking_players WHERE user_id = 7').get())
+    .toEqual({ slug: '@nick', heads: 2 });
+});
+
+it('never charges the organiser\'s guest, only the members beside them', async () => {
+  Object.assign(env, host);
+  book(1, now - HOUR / 2, { endsAt: now + HOUR / 2 });
+  seat(1, 7, '@nick', '@nick');
+  seat(1, 5);
+  expect((await toggleOwnerGuest(env, -123, 1, 9)).status).toBe('plus');
+  vi.setSystemTime(now + HOUR);
+  await runMaintenance(env, now + HOUR);
+  // $3 off-peak over three heads: the member pays one share, and neither the
+  // organiser nor the guest reaches the tab.
+  const charges = db.prepare('SELECT slug, amount_cents FROM ledger').all()
+    .map((row) => ({ ...row }));
+  expect(charges).toEqual([{ slug: 'u5', amount_cents: 100 }]);
 });

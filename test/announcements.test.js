@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
-import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, onTestFinished, vi } from 'vitest';
 import { syncAnnouncements } from '../src/announcements.js';
 import { addBooking, runMaintenance, updateBoard } from '../src/bookings.js';
 
@@ -292,6 +292,12 @@ it('reconciles through a real booking and board refresh', async () => {
 
 it('moves on to the next court through end-of-booking maintenance without reposting', async () => {
   book(90, now - 3600000, '1');
+  // A board already pinned, so it is edited in place rather than posted below.
+  // The daily redraw reads the clock, so the clock is the test's own.
+  db.prepare('INSERT INTO settings (chat_id, board_message_id) VALUES (-123, 50)').run();
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(now);
+  onTestFinished(() => vi.useRealTimers());
   // Reminders for booking 1 fall due in the same sweep; only notices count here.
   const notices = () => sends().filter(r => r.text?.includes('Next available court'));
   expect((await runMaintenance(env, now)).ok).toBe(true);
@@ -325,4 +331,41 @@ it('hands messages tracked by the old tables to the cleanup sweep when migrating
   expect(legacy.prepare("SELECT name FROM sqlite_master WHERE name IN ('booking_announcements', 'booking_followups')").all())
     .toHaveLength(0);
   legacy.close();
+});
+
+it('posts the board above the announcement when both are new', async () => {
+  seat(1);
+  await updateBoard(env, -123, now);
+  const posted = sends().map(r => r.text.includes('Next available court') ? 'notice' : 'board');
+  expect(posted).toEqual(['board', 'notice']);
+});
+
+it('moves an announcement buried under a freshly posted board back to the bottom', async () => {
+  seat(1);
+  await syncAnnouncements(env, -123, now);
+  expect(notice().message_id).toBe(101);
+  // A tab posted afresh after the announcement now sits below it.
+  db.prepare('INSERT INTO settings (chat_id, tab_message_id) VALUES (-123, 102)').run();
+  requests.push({ method: 'sendMessage', text: 'tab' });
+  const before = requests.length;
+  expect(await syncAnnouncements(env, -123, now)).toBe(0);
+  expect(requests.slice(before).map(r => r.method)).toEqual(['deleteMessage', 'sendMessage']);
+  expect(requests[before]).toMatchObject({ message_id: 101 });
+  expect(notice().message_id).toBeGreaterThan(102);
+  // Below everything pinned again: nothing more to do.
+  const settled = requests.length;
+  await syncAnnouncements(env, -123, now);
+  expect(requests.length).toBe(settled);
+});
+
+it('keeps a buried announcement in place when Telegram will not delete it', async () => {
+  seat(1);
+  await syncAnnouncements(env, -123, now);
+  db.prepare('INSERT INTO settings (chat_id, board_message_id) VALUES (-123, 150)').run();
+  failure = method => method === 'deleteMessage'
+    ? { ok: false, description: "Bad Request: message can't be deleted" } : null;
+  requests = [];
+  expect(await syncAnnouncements(env, -123, now)).toBe(0);
+  expect(requests.map(r => r.method)).toEqual(['deleteMessage']);
+  expect(notice().message_id).toBe(101);
 });
