@@ -37,7 +37,9 @@ fills, starts, or is cancelled — the old message is deleted and a fresh one is
 posted at the bottom of the chat; when no open court remains, it is deleted
 and nothing replaces it. The pinned board and tab are drawn before it, and
 should either have to be posted afresh — the first booking after an empty
-spell, say — the message sees it is no longer last and moves back below them. A message Telegram refuses to delete — one older than
+spell, say — the message sees it is no longer last and moves back below them.
+The "SquashBot pinned …" notice Telegram adds for each of the bot's own pins
+is deleted as it arrives; pins made by people are left alone. A message Telegram refuses to delete — one older than
 48 hours in a group where the bot lacks the Delete Messages right — is kept and
 rewritten in place for the next court instead, or, when no court is open,
 closed as a one-line record of what became of its court (full, played, or

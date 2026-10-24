@@ -180,6 +180,13 @@ export async function botUsername(env) {
   return username;
 }
 
+// The bot's own numeric id is the part of its token before the colon, so it
+// needs no getMe round trip.
+export function botId(env) {
+  const id = Number(String(env.BOT_TOKEN || '').trim().split(':')[0]);
+  return Number.isFinite(id) && id > 0 ? id : null;
+}
+
 export function clearBotUsernameCache() {
   botUsernames.clear();
 }
