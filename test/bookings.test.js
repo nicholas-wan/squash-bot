@@ -648,7 +648,7 @@ describe('public booking announcements', () => {
     const view = await addPlayerView({ DB: db }, -123, 3);
     const labels = view.replyMarkup.inline_keyboard.flat().map((button) => button.text);
     // The friend toggle leads, because it changes what tapping a name does.
-    expect(labels).toEqual(['👥 Bringing a friend: no', '➕ @bo', '← Back']);
+    expect(labels).toEqual(['👥 Bringing a friend: no', '➕ @bo', '← Back', '✕ Close']);
     expect(view.replyMarkup.inline_keyboard[0][0].callback_data).toBe('sb:addp:3:h2');
     expect(view.replyMarkup.inline_keyboard[1][0].callback_data).toBe('sb:addp:3:1:@bo');
     expect(view.html).toContain('billed like anyone');
@@ -730,7 +730,7 @@ describe('public booking announcements', () => {
     expect(labels).toEqual([
       '➕ Nick — bring a friend, pays double',
       '➖ @jarhead +1 — back to one share',
-      '← Back',
+      '← Back', '✕ Close',
     ]);
     expect(view.replyMarkup.inline_keyboard[1][0].callback_data).toBe('sb:plus:3:8');
   });
