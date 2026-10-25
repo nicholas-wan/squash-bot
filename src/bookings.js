@@ -660,6 +660,11 @@ function bookingLabel(booking, tz) {
   return `${courtName(booking)} · ${shortDate(booking.starts_at, tz)} · ${formatTime(booking.starts_at, tz)}`;
 }
 
+// Every panel below the manager sits beside a Close, not only a Back: once a
+// player is seated or a court edited the admin is usually done, and walking
+// Back through the panel, then the list, to reach Close was three taps to leave.
+const CLOSE_BUTTON = { text: '✕ Close', callback_data: 'sb:close' };
+
 // Manage used to redraw the pinned message's keyboard, one shared surface that
 // any tap republished to the group. It is a private panel now. It lists every
 // active court, matching the board — hiding full ones here would protect
@@ -718,7 +723,7 @@ export async function bookingPanelView(env, chatId, bookingId) {
     }]);
   }
   rows.push([{ text: '🗑 Delete booking', callback_data: `sb:delete:${booking.id}` }]);
-  rows.push([{ text: '← Back to bookings', callback_data: 'sb:manage' }]);
+  rows.push([{ text: '← Back to bookings', callback_data: 'sb:manage' }, CLOSE_BUTTON]);
   // The board cannot name the roster without repeating the same handles on
   // every row, but this panel is private and about one court, so it is the
   // place to answer who is playing.
@@ -815,7 +820,7 @@ export async function addPlayerView(env, chatId, bookingId, heads = 1) {
     }]);
   }
   if (guestRow) rows.push(guestRow);
-  rows.push([{ text: '← Back', callback_data: `sb:pick:${bookingId}` }]);
+  rows.push([{ text: '← Back', callback_data: `sb:pick:${bookingId}` }, CLOSE_BUTTON]);
   return {
     html: `➕ <b>Seat somebody on ${escapeHtml(bookingLabel(booking, tz))}</b>\n\n`
       + (heads > 1
@@ -842,7 +847,7 @@ export async function plusOneView(env, chatId, bookingId) {
       : `➕ ${player.name} — bring a friend, pays double`,
     callback_data: `sb:plus:${bookingId}:${player.id}`,
   }]);
-  rows.push([{ text: '← Back', callback_data: `sb:pick:${bookingId}` }]);
+  rows.push([{ text: '← Back', callback_data: `sb:pick:${bookingId}` }, CLOSE_BUTTON]);
   return {
     html: `👥 <b>+1 on ${escapeHtml(bookingLabel(booking, tz))}</b>\n\n`
       + 'A friend takes a slot and a share, both carried by whoever brings them.',
@@ -860,7 +865,7 @@ export async function removePlayerView(env, chatId, bookingId) {
     text: `🚪 ${player.name}`,
     callback_data: `sb:kick:${bookingId}:${player.id}`,
   }]);
-  rows.push([{ text: '← Back', callback_data: `sb:pick:${bookingId}` }]);
+  rows.push([{ text: '← Back', callback_data: `sb:pick:${bookingId}` }, CLOSE_BUTTON]);
   return {
     html: `🚪 <b>Take somebody off ${escapeHtml(bookingLabel(booking, tz))}</b>`,
     replyMarkup: { inline_keyboard: rows },
@@ -1028,7 +1033,7 @@ export async function deletePanelView(env, chatId, bookingId, now = Date.now()) 
         : ''),
     replyMarkup: { inline_keyboard: [
       [{ text: '🗑 Confirm delete', callback_data: `sb:cancel:${booking.id}` }],
-      [{ text: '← Keep booking', callback_data: `sb:pick:${booking.id}` }],
+      [{ text: '← Keep booking', callback_data: `sb:pick:${booking.id}` }, CLOSE_BUTTON],
     ] },
   };
 }
