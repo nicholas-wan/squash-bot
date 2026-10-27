@@ -10,7 +10,14 @@ import { courtName, compactTimeRange, shortDate } from './format.js';
 import { verifyInitData } from './miniapp-auth.js';
 import { BookingParseError, bookingFromDraft, extractCourt } from './parser.js';
 import { rememberLedgerIdentity } from './ledger-identity.js';
-import { isChatAdmin, knownPlayers, rememberPlayer, RosterCapacityError } from './players.js';
+import {
+  isChatAdmin, knownPlayers, ownerName, rememberPlayer, RosterCapacityError,
+} from './players.js';
+import { formatMoney } from './pricing.js';
+import {
+  accountRows, adminTabEntries, ledgerRowsFor, paymentReceiptHtml, recordPayment,
+  sendPrivateNote, tabStory, undoEntry,
+} from './tab.js';
 import { allowedChats } from './scope.js';
 
 // The Mini App's API. The page is only a drawing of these answers: who is
@@ -34,7 +41,7 @@ function json(body, status = 200) {
 
 // "g-1001234567890", optionally "_b42" for a link straight to one court.
 function chatFromStartParam(env, startParam) {
-  const match = String(startParam).match(/^g(-?\d+)(?:_b\d+)?$/);
+  const match = String(startParam).match(/^g(-?\d+)(?:_b\d+|_tab)?$/);
   if (!match) return null;
   const chatId = Number(match[1]);
   return allowedChats(env).includes(chatId) ? chatId : null;
@@ -213,7 +220,81 @@ const routes = [
     }
     return savedReply(env, chatId, bookingId, user, admin, '✅ Booking added');
   }, { member: true }],
+
+  // The tab. Everyone reads their own; an admin also reads everybody's,
+  // records payments of any size, and takes back a /debt entry or a payment
+  // recorded by mistake. Slugs travel URL-encoded: a handle starts with @.
+  ['GET', /^tab$/, async ({ env, chatId, user, admin }) => {
+    const tz = await getTimezone(env, chatId);
+    const [mine, people] = await Promise.all([
+      ledgerRowsFor(env, chatId, user), admin ? adminTabEntries(env, chatId) : [],
+    ]);
+    return json({
+      ok: true, admin, owner: ownerName(env),
+      me: tabStory(mine, tz),
+      people: people.map((entry) => ({ slug: entry.slug, name: entry.name, balance: entry.balance })),
+    });
+  }, { member: true }],
+  ['GET', /^tab\/person\/([^/]+)$/, async ({ env, chatId, match }) =>
+    personReply(env, chatId, decodeURIComponent(match[1]))],
+  ['POST', /^tab\/person\/([^/]+)\/pay$/, async ({ env, chatId, match, body, user }) => {
+    const slug = decodeURIComponent(match[1]);
+    const cents = Math.round(Number(body.cents));
+    const result = await recordPayment(env, chatId, slug, cents, user, Number(body.expected));
+    if (result.status === 'amount') {
+      return json({ ok: false, message: 'Enter an amount between $0.01 and $1,000.' });
+    }
+    if (result.status === 'stale') {
+      return personReply(env, chatId, slug, {
+        ok: false,
+        message: `Their balance changed to ${formatMoney(result.balance)} while this was open. `
+          + 'Check the amount and record it again.',
+      });
+    }
+    if (result.status !== 'paid') return json({ ok: false, message: 'Nothing on that tab any more.' });
+    const told = result.userId
+      ? await sendPrivateNote(env, chatId, result.userId, paymentReceiptHtml(result.paid, result.balance))
+      : 'failed';
+    return personReply(env, chatId, slug, {
+      ok: true,
+      message: `${formatMoney(result.paid)} from ${result.name} recorded.`
+        + (told === 'private' ? ' They have a receipt.' : ' They could not be sent a receipt.'),
+    });
+  }],
+  ['POST', /^tab\/entry\/(\d+)\/undo$/, async ({ env, chatId, match }) => {
+    const undone = await undoEntry(env, chatId, Number(match[1]));
+    if (!undone) {
+      return json({ ok: false, message: 'That entry has already gone, or is too old to undo.' });
+    }
+    const amount = formatMoney(Math.abs(undone.cents));
+    const what = undone.payment ? `The ${amount} payment` : `The ${amount} entry`;
+    const standing = undone.balance > 0 ? `You now owe <b>${formatMoney(undone.balance)}</b>.`
+      : undone.balance < 0 ? `You are <b>${formatMoney(-undone.balance)}</b> in credit.`
+        : 'You are all settled.';
+    const told = undone.userId
+      ? await sendPrivateNote(env, chatId, undone.userId,
+        `↩️ <b>${what} on your squash tab was undone</b> — it was recorded by mistake.\n\n${standing}`)
+      : 'failed';
+    return personReply(env, chatId, undone.slug, {
+      ok: true,
+      message: `Undone: ${what.toLowerCase()} on ${undone.name}'s tab.`
+        + (told === 'private' ? ' They have been told.' : ' They could not be told privately.'),
+    });
+  }],
 ];
+
+// One person's tab for an admin, with whatever the action before it has to say.
+async function personReply(env, chatId, slug, extra = { ok: true }) {
+  const rows = await accountRows(env, chatId, slug);
+  if (!rows.length) return json({ ok: false, message: 'Nothing on that tab any more.' });
+  return json({
+    ...extra,
+    person: {
+      slug, name: rows[rows.length - 1].name,
+      ...tabStory(rows, await getTimezone(env, chatId)),
+    },
+  });
+}
 
 export async function handleMiniAppApi(request, env, path, now = Date.now()) {
   const header = request.headers.get('Authorization') || '';
