@@ -127,16 +127,19 @@ export async function syncAnnouncements(env, chatId, now = Date.now()) {
       }
       return 0;
     }
-    const { booking, capacity, free, roster } = next;
+    const { booking, free, roster } = next;
     const tz = await getTimezone(env, chatId);
-    const html = '🎾 <b>Next available court</b>\n\n'
-      + `${formatCountdown(booking.starts_at, tz, now)}\n`
-      + `${compactTimeRange(booking.starts_at, booking.ends_at, tz)} · `
-      + `<b>${escapeHtml(courtName(booking))}</b> · `
-      + `${free} slot${free === 1 ? '' : 's'} · ${capacity - free}/${capacity}\n`
-      // Who is already on it, so "should I join" can be answered from the
-      // message itself. The booker stays off: the roster is the news.
-      + `👥 ${playerTags(roster)}`;
+    // An invitation, not a listing: the pinned board is the schedule, and this
+    // used to repeat one of its lines under a near-identical heading. It leads
+    // with the one thing it is for — a slot you can take — then when, then who
+    // is already on it, so "should I join" is answered from the message
+    // itself. The booker stays off: the roster is the news.
+    const when = formatCountdown(booking.starts_at, tz, now);
+    const html = `🙋 <b>${free} slot${free === 1 ? '' : 's'} left on `
+      + `${escapeHtml(courtName(booking))}</b>\n`
+      + `${when.charAt(0).toUpperCase()}${when.slice(1)} · `
+      + `${compactTimeRange(booking.starts_at, booking.ends_at, tz)}\n`
+      + (roster.length ? `Playing: ${playerTags(roster)}` : 'Nobody on it yet.');
     // The keyboard is shared, so the admin row is drawn for everyone; what is
     // behind it refuses a member. With the Mini App registered it is one
     // button that opens this court's screen over the chat, where seating and

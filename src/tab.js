@@ -119,9 +119,10 @@ export function settleable(balances) {
 //
 // With the Mini App registered the pinned tab gets one button into it instead,
 // which opens over the chat wherever the tapper is: the breakdown it replaces
-// could only land at the bottom of the chat. Admins settle from inside it.
+// could only land at the bottom of the chat. Admins settle from inside it; the
+// label is for everyone, so it names nothing only an admin can do.
 export function tabMarkup(balances, appLink = null) {
-  if (appLink) return { inline_keyboard: [[{ text: '🧾 My tab · 💵 Settle', url: appLink }]] };
+  if (appLink) return { inline_keyboard: [[{ text: '🧾 Tab', url: appLink }]] };
   const rows = [[{ text: '🧾 My tab', callback_data: 'tb:mine' }]];
   if (settleable(balances).length) {
     rows.push([{ text: '⚙️ Manage tab', callback_data: 'tb:pay' }]);

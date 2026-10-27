@@ -417,7 +417,7 @@ describe('public booking announcements', () => {
     expect(confirmation.replyMarkup.inline_keyboard[0][0].callback_data).toBe('sb:cancel:3');
   });
 
-  it('renders each pinned booking on two short lines that will not wrap', async () => {
+  it('renders the board as a schedule, one short line per court', async () => {
     const roster = [
       { id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick' },
       {
@@ -425,25 +425,24 @@ describe('public booking announcements', () => {
         slug: '@dodgerblueee', name: '@Dodgerblueee',
       },
     ];
-    // A nearer court in front, so this one is not the board's nearest.
     const earlier = {
       ...storedBooking, id: 2, starts_at: startsAt - 86400000, ends_at: endsAt - 86400000,
     };
     const html = await boardHtml(
       { DB: bookingDb([earlier, storedBooking], roster) }, -123, Date.UTC(2026, 7, 12, 12, 0)
     );
-    expect(html).toContain('in 7 days · Wed 19 Aug\n9pm · <b>Court 4</b> · 1 slot · 2/3');
-    // The roster repeats the same handles on every row, so it moved behind Join.
+    expect(html.startsWith('📌 <b>Court schedule</b>')).toBe(true);
+    expect(html).toContain('Wed 19 Aug · 9pm · <b>C4</b> · 1 slot');
+    // Who is playing is the announcement's to say; the schedule names nobody.
     expect(html).not.toContain('👥');
     expect(html).not.toContain('@Dodgerblueee');
     expect(html).not.toContain('$');
-    // Nothing a phone would wrap: the tags are markup, not visible characters.
     const widest = Math.max(...html.replace(/<[^>]+>/g, '').split('\n')
       .map((line) => line.length));
-    expect(widest).toBeLessThanOrEqual(30);
+    expect(widest).toBeLessThanOrEqual(32);
   });
 
-  it('names who is on the nearest court, and only that one', async () => {
+  it('names nobody on the schedule, not even on the nearest court', async () => {
     const soon = {
       ...storedBooking, id: 2, starts_at: startsAt - 86400000, ends_at: endsAt - 86400000,
     };
@@ -455,43 +454,24 @@ describe('public booking announcements', () => {
     const html = await boardHtml(
       { DB: bookingDb([soon, storedBooking], roster) }, -123, Date.UTC(2026, 7, 12, 12, 0)
     );
-    // The court people are deciding about tonight answers "who is on it"
-    // right on the board; the ones further out still keep it behind Join.
-    expect(html).toContain(
-      'in 6 days · Tue 18 Aug\n9pm · <b>Court 4</b> · 1 slot · 2/3\n'
-      + '👥 <a href="tg://user?id=7">Nick</a>, @Bo'
-    );
-    expect(html).not.toContain('@alice');
+    expect(html).toContain('Tue 18 Aug · 9pm · <b>C4</b> · 1 slot\nWed 19 Aug · 9pm · <b>C4</b> · 2 slots');
+    for (const name of ['Nick', '@Bo', '@alice']) expect(html).not.toContain(name);
   });
 
-  it('names the next court to start, not the one already in play', async () => {
+  it('marks a court in play as playing, with no slots on offer', async () => {
     const now = Date.UTC(2026, 7, 12, 12, 30);
     const playing = { ...storedBooking, id: 2, starts_at: now - 1800000, ends_at: now + 1800000 };
-    const roster = [
-      { id: 1, booking_id: 2, user_id: null, slug: '@bo', name: '@Bo' },
-      { id: 2, booking_id: 3, user_id: null, slug: '@alice', name: '@alice' },
-    ];
-    const html = await boardHtml({ DB: bookingDb([playing, storedBooking], roster) }, -123, now);
-    // The court in play is locked; the roster worth reading is the next one.
-    expect(html).not.toContain('@Bo');
-    expect(html).toContain('👥 @alice');
-
-    // With nothing ahead of it, the court in play is all there is to name.
-    const alone = await boardHtml({ DB: bookingDb([playing], roster.slice(0, 1)) }, -123, now);
-    expect(alone).toContain('👥 @Bo');
+    const html = await boardHtml({ DB: bookingDb([playing, storedBooking], []) }, -123, now);
+    expect(html).toContain('Today · 8pm · <b>C4</b> · playing now');
+    expect(html).toContain('Wed 19 Aug · 9pm · <b>C4</b> · 3 slots');
   });
 
-  it('names the roster of every court sharing the earliest start', async () => {
-    const twin = { ...storedBooking, id: 4, court: '5' };
-    const roster = [
-      { id: 1, booking_id: 3, user_id: null, slug: '@bo', name: '@Bo' },
-      { id: 2, booking_id: 4, user_id: null, slug: '@alice', name: '@alice' },
-    ];
-    const html = await boardHtml(
-      { DB: bookingDb([storedBooking, twin], roster) }, -123, Date.UTC(2026, 7, 12, 12, 0)
-    );
-    expect(html).toContain('<b>Court 4</b> · 2 slots · 1/3\n👥 @Bo');
-    expect(html).toContain('<b>Court 5</b> · 2 slots · 1/3\n👥 @alice');
+  it('says Tomorrow for a court tomorrow', async () => {
+    const tomorrow = Date.UTC(2026, 7, 13, 13, 0);
+    const html = await boardHtml({
+      DB: bookingDb([{ ...storedBooking, starts_at: tomorrow, ends_at: tomorrow + 3600000 }], []),
+    }, -123, Date.UTC(2026, 7, 12, 12, 0));
+    expect(html).toContain('Tomorrow · 9pm · <b>C4</b> · 3 slots');
   });
 
   it('names the booker on the board unless the organiser booked it', async () => {
@@ -500,7 +480,7 @@ describe('public booking announcements', () => {
     const html = await boardHtml(
       { ...env, DB: bookingDb([byMember], []) }, -123, Date.UTC(2026, 7, 12, 12, 0)
     );
-    expect(html).toContain('9pm · <b>Court 4</b> · 3 slots · 0/3\n📝 Booked by @jared');
+    expect(html).toContain('9pm · <b>C4</b> · 3 slots\n↳ <i>booked by @jared</i>');
 
     // The organiser books most courts; naming them on each row is noise.
     for (const byOwner of [
@@ -513,7 +493,7 @@ describe('public booking announcements', () => {
       const quiet = await boardHtml(
         { ...env, DB: bookingDb([byOwner], []) }, -123, Date.UTC(2026, 7, 12, 12, 0)
       );
-      expect(quiet).not.toContain('Booked by');
+      expect(quiet).not.toContain('booked by');
     }
   });
 
@@ -691,7 +671,7 @@ describe('public booking announcements', () => {
     const env = { BOT_TOKEN: 'test', DB: bookingDb([storedBooking], roster) };
     // One row, two of the three slots: a friend is a head, not a name.
     const html = await boardHtml(env, -123, Date.UTC(2026, 7, 12, 12, 0));
-    expect(html).toContain('in 7 days · Wed 19 Aug\n9pm · <b>Court 4</b> · 1 slot');
+    expect(html).toContain('Wed 19 Aug · 9pm · <b>C4</b> · 1 slot');
     const panel = await bookingPanelView(env, -123, 3);
     expect(panel.html).toContain('<a href="tg://user?id=7">Nick +1</a>');
     expect(panel.html).toContain('1 slot');
@@ -705,7 +685,7 @@ describe('public booking announcements', () => {
     const html = await boardHtml(
       { DB: bookingDb([storedBooking], roster) }, -123, Date.UTC(2026, 7, 12, 12, 0)
     );
-    expect(html).toContain('in 7 days · Wed 19 Aug\n<s>9pm · <b>Court 4</b> · full</s>');
+    expect(html).toContain('<s>Wed 19 Aug · 9pm · <b>C4</b> · full</s>');
   });
 
   it('labels the +1 picker with which way each member flips', async () => {
@@ -743,11 +723,8 @@ describe('public booking announcements', () => {
       { DB: bookingDb([storedBooking], full) }, -123, Date.UTC(2026, 7, 12, 12, 0)
     );
     // A court missing from the board would read as a court nobody booked —
-    // it stays listed, struck through, so open slots pop at a glance — and,
-    // being the one court nobody can join, it names who took it.
-    expect(html).toContain(
-      'in 7 days · Wed 19 Aug\n<s>9pm · <b>Court 4</b> · full</s>\n👥 u7, @dodgerblueee, @alice'
-    );
+    // it stays listed, struck through, so open slots pop at a glance.
+    expect(html).toContain('<s>Wed 19 Aug · 9pm · <b>C4</b> · full</s>');
   });
 
   it('names nobody on the board for a later court with room', async () => {
@@ -760,7 +737,7 @@ describe('public booking announcements', () => {
     const html = await boardHtml(
       { DB: bookingDb([earlier, storedBooking], two) }, -123, Date.UTC(2026, 7, 12, 12, 0)
     );
-    expect(html).toContain('9pm · <b>Court 4</b> · 1 slot · 2/3');
+    expect(html).toContain('Wed 19 Aug · 9pm · <b>C4</b> · 1 slot');
     expect(html).not.toContain('👥');
   });
 
@@ -1294,7 +1271,7 @@ describe('public booking announcements', () => {
     const edits = requests.filter((request) => request.url.endsWith('/editMessageText'));
     expect(edits).toHaveLength(1);
     expect(edits[0].body.message_id).toBe(55);
-    expect(edits[0].body.text).toContain('Court 4');
+    expect(edits[0].body.text).toContain('Court schedule');
     // The hour is claimed before the redraw so a throw cannot retry every
     // minute; success trades it for the day's stamp, which ends the retrying.
     // cronNow is 20:00 Singapore time.

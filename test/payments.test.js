@@ -173,7 +173,7 @@ describe('The pinned tab’s button', () => {
     expect(tabMarkup(balances).inline_keyboard[0][0].callback_data).toBe('tb:mine');
     const markup = tabMarkup(balances, 'https://t.me/squash_book_bot/manage?startapp=g-123_tab');
     expect(markup).toEqual({ inline_keyboard: [[{
-      text: '🧾 My tab · 💵 Settle', url: 'https://t.me/squash_book_bot/manage?startapp=g-123_tab',
+      text: '🧾 Tab', url: 'https://t.me/squash_book_bot/manage?startapp=g-123_tab',
     }]] });
   });
 });

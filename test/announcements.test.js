@@ -109,17 +109,17 @@ it('posts one silent message for the next open court, edits its slot count, and 
       ],
     ] } });
   expect(requests[0].receiver_user_id).toBeUndefined();
-  expect(requests[0].text).toContain('Next available court');
-  expect(requests[0].text).toContain('in 3 days');
-  expect(requests[0].text).toContain('2 slots · 1/3');
-  // Who is on it already, tagged where the id is known.
-  expect(requests[0].text).toContain('\n👥 <a href="tg://user?id=1">Player</a>');
+  // An invitation: the free slots lead, then when, then who is on it already,
+  // tagged where the id is known.
+  expect(requests[0].text).toMatch(new RegExp('^🙋 <b>2 slots left on Court 4</b>\\n'
+    + 'In 3 days · Sun 13 Sept? · 8am\\n'
+    + 'Playing: <a href="tg://user\\?id=1">Player</a>$'));
   await syncAnnouncements(env, -123, now);
   expect(requests).toHaveLength(1);
   seat(2);
   await syncAnnouncements(env, -123, now);
   expect(requests[1]).toMatchObject({ method: 'editMessageText', message_id: 101 });
-  expect(requests[1].text).toContain('1 slot · 2/3');
+  expect(requests[1].text).toContain('<b>1 slot left on Court 4</b>');
   expect(requests[1].text).toContain('Player</a>, <a href="tg://user?id=2">Player</a>');
   seat(3);
   await syncAnnouncements(env, -123, now);
@@ -140,7 +140,7 @@ it('replaces the message when a nearer court is booked, so the latest message is
   expect(requests.slice(1).map(r => r.method)).toEqual(['deleteMessage', 'sendMessage']);
   expect(requests[1].message_id).toBe(101);
   expect(joinTarget(requests[2])).toBe('sb:join:2');
-  expect(requests[2].text).toContain('tomorrow');
+  expect(requests[2].text).toContain('Tomorrow');
   expect(notice()).toMatchObject({ booking_id: 2, message_id: 103 });
 });
 
@@ -292,7 +292,7 @@ it('reconciles through a real booking and board refresh', async () => {
   const id = await addBooking(env, -123, {
     court: '2', startsAt, endsAt: startsAt + 3600000, reminderAt: startsAt - 7200000,
   }, { id: 9, first_name: 'Booker' });
-  const posted = sends().filter(r => r.text.includes('Next available court'));
+  const posted = sends().filter(r => r.text.includes('left on Court'));
   expect(posted).toHaveLength(2);
   expect(joinTarget(posted[1])).toBe(`sb:join:${id}`);
   expect(posted[1]).toMatchObject({ disable_notification: true });
@@ -300,7 +300,7 @@ it('reconciles through a real booking and board refresh', async () => {
   db.prepare('UPDATE bookings SET capacity = 1 WHERE id = ?').run(id);
   await updateBoard(env, -123);
   expect(notice().booking_id).toBe(1);
-  expect(requests.at(-1).text).toContain('in 3 days');
+  expect(requests.at(-1).text).toContain('In 3 days');
 });
 
 it('moves on to the next court through end-of-booking maintenance without reposting', async () => {
@@ -312,7 +312,7 @@ it('moves on to the next court through end-of-booking maintenance without repost
   vi.setSystemTime(now);
   onTestFinished(() => vi.useRealTimers());
   // Reminders for booking 1 fall due in the same sweep; only notices count here.
-  const notices = () => sends().filter(r => r.text?.includes('Next available court'));
+  const notices = () => sends().filter(r => r.text?.includes('left on Court'));
   expect((await runMaintenance(env, now)).ok).toBe(true);
   expect(db.prepare('SELECT * FROM bookings WHERE id = 90').get()).toBeUndefined();
   expect(notices()).toHaveLength(1);
@@ -349,7 +349,7 @@ it('hands messages tracked by the old tables to the cleanup sweep when migrating
 it('posts the board above the announcement when both are new', async () => {
   seat(1);
   await updateBoard(env, -123, now);
-  const posted = sends().map(r => r.text.includes('Next available court') ? 'notice' : 'board');
+  const posted = sends().map(r => r.text.includes('left on Court') ? 'notice' : 'board');
   expect(posted).toEqual(['board', 'notice']);
 });
 
