@@ -1,0 +1,132 @@
+import { notifyRemovedPlayer, notifyRosterOfChange, updateBoard } from './bookings.js';
+import {
+  adminAddPlayer, knownPlayers, MAX_CAPACITY, ownerName, raiseCapacity, removeBookingPlayer,
+  toggleOwnerGuest, togglePlusOne,
+} from './players.js';
+
+// The roster changes an admin makes from the Manage panels. Each one used to
+// live inside its callback handler, which left the Mini App two choices: call
+// the handler with a fake tap, or copy the notices and board refresh and let
+// them drift. Both surfaces now call these, and each answers with the words
+// its own toast shows: `changed` says the roster moved, `alert` that the
+// message is a refusal worth an alert rather than a passing toast.
+
+function subject(player, name = player.name) {
+  return {
+    id: player.user_id || null,
+    username: player.slug.startsWith('@') ? player.slug.slice(1) : null,
+    first_name: name,
+  };
+}
+
+function told(allTold, everyone = 'Everyone has been told.') {
+  return allTold ? everyone : 'Some players could not be notified.';
+}
+
+export async function seatPlayer(env, chatId, bookingId, slug, heads, actorId) {
+  // Resolved fresh rather than trusted from the caller, so a stale panel
+  // cannot seat somebody under an outdated name or id.
+  const candidate = (await knownPlayers(env, chatId)).find((player) => player.slug === slug);
+  if (!candidate) {
+    return { status: 'unknown', changed: false, alert: true, message: 'That player is no longer known.' };
+  }
+  const result = await adminAddPlayer(env, chatId, bookingId, candidate, actorId, heads);
+  if (result.status !== 'added') {
+    const refusals = {
+      already: 'They are already on that court.',
+      full: heads > 1
+        ? 'A +1 needs two free slots. Open another one first.'
+        : 'That court is full. Open another slot first.',
+      gone: 'That booking has already gone.',
+    };
+    return { status: result.status, changed: false, alert: true, message: refusals[result.status] };
+  }
+  // The seated player is the subject of the notice, not the admin tapping.
+  const { allTold } = await notifyRosterOfChange(
+    env, chatId, result.booking, subject(candidate), 'added', heads
+  );
+  await updateBoard(env, chatId);
+  const delivery = told(allTold, 'Everyone on it has been told.');
+  return {
+    status: 'added', changed: true, alert: false,
+    message: heads > 1
+      ? `${candidate.name} +1 are on this court — two shares on the tab. ${delivery}`
+      : `${candidate.name} is on this court. ${delivery}`,
+  };
+}
+
+export async function flipPlusOne(env, chatId, bookingId, playerRowId) {
+  const result = await togglePlusOne(env, chatId, bookingId, playerRowId);
+  if (result.status !== 'plus' && result.status !== 'minus') {
+    const refusals = {
+      full: 'No free slot for a +1. Open another slot first.',
+      gone: 'That player or booking has already gone.',
+    };
+    return { status: result.status, changed: false, alert: true, message: refusals[result.status] };
+  }
+  // The member whose share changed is the subject, not the tapping admin.
+  const { allTold } = await notifyRosterOfChange(
+    env, chatId, result.booking, subject(result.player), result.status
+  );
+  await updateBoard(env, chatId);
+  const name = result.player.name;
+  return {
+    status: result.status, changed: true, alert: false,
+    message: result.status === 'plus'
+      ? `${name} now brings a +1 — two shares. ${told(allTold)}`
+      : `${name}'s +1 is off — one share again. ${told(allTold)}`,
+  };
+}
+
+// The organiser's free guest: somebody seated on the organiser's +1 is charged
+// to nobody.
+export async function flipOwnerGuest(env, chatId, bookingId, actorId) {
+  const result = await toggleOwnerGuest(env, chatId, bookingId, actorId);
+  const host = ownerName(env);
+  if (result.status !== 'plus' && result.status !== 'minus') {
+    const refusals = {
+      full: 'No free slot for a guest. Open another slot first.',
+      already: 'That court has changed — open the picker again.',
+      gone: 'That booking has already gone.',
+    };
+    return { status: result.status, changed: false, alert: true, message: refusals[result.status] };
+  }
+  const { allTold } = await notifyRosterOfChange(
+    env, chatId, result.booking, subject(result.player, host), result.status
+  );
+  await updateBoard(env, chatId);
+  return {
+    status: result.status, changed: true, alert: false,
+    message: result.status === 'plus'
+      ? `${host} +1 is on — the guest is not charged. ${told(allTold)}`
+      : `${host}'s guest is off. ${told(allTold)}`,
+  };
+}
+
+export async function kickPlayer(env, chatId, bookingId, playerRowId) {
+  const removed = await removeBookingPlayer(env, chatId, bookingId, playerRowId);
+  if (!removed) {
+    return { status: 'gone', changed: false, alert: true, message: 'That player has already gone.' };
+  }
+  await updateBoard(env, chatId);
+  await notifyRemovedPlayer(env, chatId, removed.player, removed.booking);
+  return {
+    status: 'removed', changed: true, alert: false,
+    message: `${removed.player.name} is off this booking.`,
+  };
+}
+
+export async function addSlot(env, chatId, bookingId) {
+  const raised = await raiseCapacity(env, chatId, bookingId);
+  if (!raised) {
+    return {
+      status: 'refused', changed: false, alert: true,
+      message: `That booking has gone, or it is already at the ${MAX_CAPACITY} player limit.`,
+    };
+  }
+  await updateBoard(env, chatId);
+  return {
+    status: 'raised', changed: true, alert: false,
+    message: `This court now holds ${raised} players.`,
+  };
+}

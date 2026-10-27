@@ -131,6 +131,7 @@ export async function addBooking(
   env, chatId, parsed, from, sourceText = null,
   {
     allowConflict = false, callbackQueryId = null, bookedFor = null, free = false, companions = {},
+    receipt = true,
   } = {}
 ) {
   const now = Date.now();
@@ -199,8 +200,10 @@ export async function addBooking(
   }
   // Booked on behalf, the receipt is skipped: it would be an unprompted
   // ephemeral to somebody who tapped nothing — the kind Telegram drops.
-  // The attribution is for the record, and the board carries the news.
-  if (!bookedFor) {
+  // The attribution is for the record, and the board carries the news. The
+  // Mini App asks for none: it shows its own confirmation, and has no tap for
+  // Telegram to deliver an ephemeral receipt against.
+  if (!bookedFor && receipt) {
     try {
       await confirmToBooker(env, chatId, bookingId, parsed, capacity, from, callbackQueryId);
     } catch (error) {
@@ -458,9 +461,34 @@ function slotsLabel(roster, capacity) {
 // One button. Everything else — adding, managing, and the fuller picture an
 // admin needs — lives behind it, in a panel that is private and so can differ
 // per person, which a keyboard on a shared pinned message never can.
-function boardButtons(bookings) {
+function boardButtons(env, chatId, bookings) {
   if (!bookings.length) return { inline_keyboard: [] };
-  return { inline_keyboard: [[{ text: '🙋 Join', callback_data: 'sb:join' }]] };
+  const row = [{ text: '🙋 Join', callback_data: 'sb:join' }];
+  const manage = manageLink(env, chatId);
+  if (manage) row.push({ text: '⚙️ Manage', url: manage });
+  return { inline_keyboard: [row] };
+}
+
+// Manage opens the Mini App over the chat, wherever the tapper is scrolled to:
+// a private panel can only ever arrive at the bottom of the chat, which from
+// the pinned board is the far end of it. A group cannot carry a web_app
+// button, but a direct link to the app can, and startapp tells the app which
+// group it was opened from — the launch data Telegram signs does not.
+// Members see the button too, since the keyboard is shared; the app refuses
+// them with the same words the chat panels use. Unset until the app is
+// registered with BotFather, and then the board is exactly as it was.
+export function manageLink(env, chatId) {
+  if (!env.MINI_APP_URL) return null;
+  let link;
+  try {
+    link = new URL(env.MINI_APP_URL);
+  } catch {
+    console.log(`MINI_APP_URL is not a URL: ${env.MINI_APP_URL}`);
+    return null;
+  }
+  link.searchParams.set('startapp', `g${chatId}`);
+  link.searchParams.set('mode', 'compact');
+  return link.toString();
 }
 
 // A court's name on a button: as short as it can stay unambiguous, since a
@@ -556,7 +584,7 @@ async function renderBoard(env, chatId, now) {
   const [tz, bookings] = await Promise.all([
     getTimezone(env, chatId), activeBookings(env, chatId, now),
   ]);
-  if (!bookings.length) return { html: null, replyMarkup: null };
+  if (!bookings.length) return { html: null, bookings };
   const rosters = await rostersFor(env, chatId, bookings.map((booking) => booking.id));
 
   // Two short lines and a gap per booking. A phone wraps anything much past
@@ -596,10 +624,7 @@ async function renderBoard(env, chatId, now) {
     const bookedBy = bookedByLine(owner, booking);
     if (bookedBy) lines.push(bookedBy);
   }
-  return {
-    html: lines.join('\n'),
-    replyMarkup: boardButtons(bookings),
-  };
+  return { html: lines.join('\n'), bookings };
 }
 
 export async function boardHtml(env, chatId, now = Date.now()) {
@@ -625,7 +650,8 @@ export async function updateBoard(env, chatId, now = Date.now()) {
     let outcome;
     try {
       const id = await updatePinnedMessage(
-        env, chat, 'board_message_id', board.html, board.replyMarkup, 'court board'
+        env, chat, 'board_message_id', board.html,
+        board.html ? boardButtons(env, chat, board.bookings) : null, 'court board'
       );
       outcome = { chat, id };
     } catch (error) {
@@ -689,6 +715,70 @@ export async function managerView(env, chatId, now = Date.now()) {
   };
 }
 
+// The same courts and controls as the Manage panels, as plain data for the
+// Mini App: it draws its own screens, so it needs facts rather than keyboards.
+// Labels are formatted here, in the group's timezone, so the page never has to
+// know what that timezone is.
+function courtSummary(booking, roster, tz, now) {
+  return {
+    id: booking.id,
+    court: courtName(booking),
+    date: shortDate(booking.starts_at, tz),
+    time: compactTimeRange(booking.starts_at, booking.ends_at, tz),
+    heads: rosterHeads(roster),
+    capacity: booking.capacity || DEFAULT_CAPACITY,
+    free: Boolean(booking.free),
+    started: booking.starts_at <= now,
+    players: roster.map((player) => ({
+      id: player.id, name: player.name, heads: playerHeads(player),
+    })),
+  };
+}
+
+const pad = (value) => String(value).padStart(2, '0');
+const isoDate = ({ y, mo, d }) => `${y}-${pad(mo)}-${pad(d)}`;
+const isoClock = ({ h, mi }) => `${pad(h)}:${pad(mi)}`;
+
+export async function courtList(env, chatId, now = Date.now()) {
+  const [bookings, tz, known] = await Promise.all([
+    activeBookings(env, chatId, now), getTimezone(env, chatId), knownPlayers(env, chatId),
+  ]);
+  const rosters = await rostersFor(env, chatId, bookings.map((booking) => booking.id));
+  return {
+    courts: bookings.map((booking) =>
+      courtSummary(booking, rosters.get(booking.id) || [], tz, now)),
+    // For the add form: the earliest date it can offer, and who can be
+    // recorded as the booker.
+    today: isoDate(localParts(now, tz)),
+    players: known
+      .map((player) => ({ slug: player.slug, name: player.name }))
+      .sort((a, b) => a.name.localeCompare(b.name)),
+  };
+}
+
+export async function courtDetail(env, chatId, bookingId, now = Date.now()) {
+  const booking = await openBooking(env, chatId, bookingId);
+  if (!booking) return null;
+  const [roster, tz] = await Promise.all([rosterFor(env, bookingId), getTimezone(env, chatId)]);
+  const { free, guest, candidates } = await seatOptions(env, chatId, booking, roster);
+  const start = localParts(booking.starts_at, tz);
+  const end = localParts(booking.ends_at, tz);
+  return {
+    ...courtSummary(booking, roster, tz, now),
+    bookedBy: booking.created_by_name || null,
+    canRaise: (booking.capacity || DEFAULT_CAPACITY) < MAX_CAPACITY,
+    seat: {
+      free,
+      host: ownerName(env),
+      guest,
+      candidates: candidates.map((player) => ({ slug: player.slug, name: player.name })),
+    },
+    edit: {
+      date: isoDate(start), start: isoClock(start), end: isoClock(end), court: String(booking.court),
+    },
+  };
+}
+
 export async function bookingPanelView(env, chatId, bookingId) {
   const booking = await openBooking(env, chatId, bookingId);
   if (!booking) return null;
@@ -740,39 +830,24 @@ export async function bookingPanelView(env, chatId, bookingId) {
   };
 }
 
-// Who an admin can seat: everyone the bot knows who is not already on this
-// court, while a slot is free. Somebody the bot has never seen is not listed —
-// they are in the group anyway, and can tap 🙋 Join themselves.
+// What the seat picker can offer on one court, for the chat panel and the Mini
+// App alike. The organiser's free guest is a seat for somebody they are not
+// charging: it takes one slot when the organiser is seated and two when an
+// admin took them off, and the same control turns it off again.
 //
-// heads is what the toggle at the top of the keyboard is holding: 2 seats the
-// next person tapped with a friend, and needs two free slots rather than one,
-// so the whole panel is unavailable when only one is left.
-export async function addPlayerView(env, chatId, bookingId, heads = 1) {
-  const booking = await openBooking(env, chatId, bookingId);
-  if (!booking) return null;
-  const roster = await rosterFor(env, bookingId);
+// One person can be known under two keys — their @handle, and the numeric
+// account their charges are filed under — and offering both let an admin
+// seat them twice, splitting the court over a head that was never there.
+// Everyone is compared by account: their id where one is known, directly or
+// through the alias a handle was first charged under.
+export async function seatOptions(env, chatId, booking, roster, heads = 1) {
   const capacity = booking.capacity || DEFAULT_CAPACITY;
   const free = capacity - rosterHeads(roster);
-  // The organiser's free guest, under the names: a seat for somebody they are
-  // not charging. It takes one slot when the organiser is seated and two when
-  // an admin took them off, and the same row turns it off again.
   const owner = ownerIdentity(env);
   const host = ownerRow(env, roster);
   const guestOn = Boolean(host) && playerHeads(host) > 1;
-  const guestRow = owner && (guestOn || free >= (host ? 1 : 2))
-    ? [{
-      text: guestOn
-        ? `➖ ${ownerName(env)} +1 — guest off`
-        : `🎁 ${ownerName(env)} +1 — free guest`,
-      callback_data: `sb:addp:${bookingId}:guest`,
-    }]
-    : null;
-  if (heads > free && !guestRow) return null;
-  // One person can be known under two keys — their @handle, and the numeric
-  // account their charges are filed under — and offering both let an admin
-  // seat them twice, splitting the court over a head that was never there.
-  // Everyone is compared by account: their id where one is known, directly or
-  // through the alias a handle was first charged under.
+  const guest = owner && (guestOn || free >= (host ? 1 : 2)) ? { on: guestOn } : null;
+  if (heads > free) return { free, guest, candidates: [] };
   const [known, aliases] = await Promise.all([
     knownPlayers(env, chatId),
     env.DB.prepare(
@@ -788,18 +863,41 @@ export async function addPlayerView(env, chatId, bookingId, heads = 1) {
   const seated = new Set(roster.flatMap((player) => [player.slug, accountOf(player)]));
   const offered = new Set();
   const encoder = new TextEncoder();
-  const candidates = heads > free ? [] : known
+  const candidates = known
     .filter((player) => !seated.has(player.slug) && !seated.has(accountOf(player)))
     // Telegram caps callback_data at 64 bytes; a slug that will not fit
     // cannot be offered as a button.
     .filter((player) => encoder
-      .encode(`sb:addp:${bookingId}:${heads}:${player.slug}`).length <= 64)
+      .encode(`sb:addp:${booking.id}:${heads}:${player.slug}`).length <= 64)
     // The @handle spelling is the one an admin recognises, so it goes first
     // and is the one kept.
     .sort((a, b) => Number(!a.slug.startsWith('@')) - Number(!b.slug.startsWith('@')))
     .filter((player) => !offered.has(accountOf(player)) && offered.add(accountOf(player)))
     .sort((a, b) => a.name.localeCompare(b.name))
     .slice(0, MAX_JOIN_BUTTONS);
+  return { free, guest, candidates };
+}
+
+// Who an admin can seat: everyone the bot knows who is not already on this
+// court, while a slot is free. Somebody the bot has never seen is not listed —
+// they are in the group anyway, and can tap 🙋 Join themselves.
+//
+// heads is what the toggle at the top of the keyboard is holding: 2 seats the
+// next person tapped with a friend, and needs two free slots rather than one,
+// so the whole panel is unavailable when only one is left.
+export async function addPlayerView(env, chatId, bookingId, heads = 1) {
+  const booking = await openBooking(env, chatId, bookingId);
+  if (!booking) return null;
+  const roster = await rosterFor(env, bookingId);
+  const { free, guest, candidates } = await seatOptions(env, chatId, booking, roster, heads);
+  const guestRow = guest
+    ? [{
+      text: guest.on
+        ? `➖ ${ownerName(env)} +1 — guest off`
+        : `🎁 ${ownerName(env)} +1 — free guest`,
+      callback_data: `sb:addp:${bookingId}:guest`,
+    }]
+    : null;
   if (!candidates.length && !guestRow) return null;
   const tz = await getTimezone(env, chatId);
   // The toggle sits above the names because it changes what tapping one of them
@@ -1040,7 +1138,7 @@ export async function deletePanelView(env, chatId, bookingId, now = Date.now()) 
 
 export async function restoreBoardButtons(env, chatId, messageId, now = Date.now()) {
   const bookings = await activeBookings(env, chatId, now);
-  return editReplyMarkup(env, chatId, messageId, boardButtons(bookings));
+  return editReplyMarkup(env, chatId, messageId, boardButtons(env, chatId, bookings));
 }
 
 function reminderHtml(booking, roster, headline, tz) {

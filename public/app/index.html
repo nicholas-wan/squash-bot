@@ -1,0 +1,641 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SquashBot</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  /* Telegram hands the page its own theme as --tg-theme-* variables, so the
+     sheet matches the chat it opens over. The fallbacks are for the local
+     preview, which runs outside Telegram. */
+  :root {
+    --bg: var(--tg-theme-secondary-bg-color, #f0f0f4);
+    --section: var(--tg-theme-section-bg-color, var(--tg-theme-bg-color, #ffffff));
+    --text: var(--tg-theme-text-color, #111111);
+    --hint: var(--tg-theme-hint-color, #8a8a8e);
+    --link: var(--tg-theme-link-color, #2481cc);
+    --accent: var(--tg-theme-button-color, #2481cc);
+    --accent-text: var(--tg-theme-button-text-color, #ffffff);
+    --header: var(--tg-theme-section-header-text-color, #6d6d72);
+    --danger: var(--tg-theme-destructive-text-color, #e53935);
+    --separator: var(--tg-theme-section-separator-color, rgba(128, 128, 128, 0.22));
+    --radius: 12px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not(.tg) {
+      --bg: #101014; --section: #1c1c22; --text: #f2f2f5; --hint: #8d8d96;
+      --link: #5aa9ef; --accent: #3a8fd9; --header: #8d8d96;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body {
+    font: 16px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 12px 16px calc(24px + env(safe-area-inset-bottom));
+    -webkit-tap-highlight-color: transparent;
+  }
+  button, input, select { font: inherit; color: inherit; }
+  [hidden] { display: none !important; }
+
+  .top { display: flex; align-items: center; gap: 8px; min-height: 36px; margin: 2px 0 10px; }
+  .top h1 { font-size: 20px; margin: 0; flex: 1; letter-spacing: -0.01em; }
+  .back {
+    border: 0; background: none; color: var(--link); padding: 6px 4px 6px 0; cursor: pointer;
+  }
+  .sub { color: var(--hint); font-size: 14px; margin: -6px 0 12px; }
+
+  .label {
+    color: var(--header); font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em;
+    margin: 18px 4px 6px;
+  }
+  .section { background: var(--section); border-radius: var(--radius); overflow: hidden; }
+  .row {
+    display: flex; align-items: center; gap: 12px; width: 100%; min-height: 48px;
+    padding: 10px 14px; border: 0; background: none; text-align: left;
+  }
+  .row + .row { box-shadow: inset 0 1px 0 var(--separator); }
+  button.row { cursor: pointer; }
+  button.row:active { background: var(--separator); }
+  .row .main { flex: 1; min-width: 0; }
+  .row .title { font-weight: 600; }
+  .row .meta { color: var(--hint); font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row.link { color: var(--link); }
+  .row.danger { color: var(--danger); }
+  .row:disabled { opacity: 0.45; }
+  .note { color: var(--hint); font-size: 13px; margin: 6px 4px 0; }
+
+  .pill {
+    flex: none; font-size: 13px; font-weight: 600; padding: 3px 9px; border-radius: 999px;
+    background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent);
+  }
+  .pill.full { background: var(--separator); color: var(--hint); }
+  .tags { display: flex; flex-wrap: wrap; gap: 6px; margin: -4px 0 4px; }
+  .tag { font-size: 13px; padding: 3px 9px; border-radius: 999px; background: var(--section); color: var(--hint); }
+
+  .icon-btn {
+    flex: none; min-width: 40px; height: 32px; padding: 0 10px; border-radius: 8px; border: 0;
+    background: var(--separator); cursor: pointer; font-size: 14px; font-weight: 600;
+  }
+  .icon-btn.on { background: var(--accent); color: var(--accent-text); }
+  .icon-btn.remove { color: var(--danger); }
+
+  .switch { position: relative; flex: none; width: 46px; height: 28px; }
+  .switch input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
+  .switch span {
+    position: absolute; inset: 0; border-radius: 999px; background: var(--separator);
+    transition: background 0.15s;
+  }
+  .switch span::after {
+    content: ""; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px;
+    border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+    transition: transform 0.15s;
+  }
+  .switch input:checked + span { background: var(--accent); }
+  .switch input:checked + span::after { transform: translateX(18px); }
+
+  .field { display: flex; align-items: center; gap: 12px; min-height: 48px; padding: 6px 14px; }
+  .field + .field { box-shadow: inset 0 1px 0 var(--separator); }
+  .field label { flex: 1; }
+  .field input:not([type=checkbox]), .field select {
+    flex: none; width: 52%; min-height: 36px; padding: 4px 8px; text-align: right;
+    border: 0; border-radius: 8px; background: var(--bg);
+  }
+
+  .primary {
+    display: block; width: 100%; margin-top: 18px; min-height: 48px; border: 0;
+    border-radius: var(--radius); background: var(--accent); color: var(--accent-text);
+    font-weight: 600; cursor: pointer;
+  }
+  .primary:disabled { opacity: 0.55; }
+  .warning {
+    margin-top: 12px; padding: 10px 14px; border-radius: var(--radius); font-size: 14px;
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+  }
+
+  .empty { text-align: center; color: var(--hint); padding: 48px 12px; }
+  .empty .big { font-size: 40px; margin-bottom: 8px; }
+
+  .toast {
+    position: fixed; left: 16px; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom));
+    padding: 12px 14px; border-radius: var(--radius); font-size: 14px;
+    background: rgba(30, 30, 34, 0.94); color: #fff; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+    transform: translateY(140%); transition: transform 0.2s ease-out; z-index: 10;
+  }
+  .toast.show { transform: none; }
+  .busy { opacity: 0.6; pointer-events: none; }
+</style>
+</head>
+<body>
+<main id="app"></main>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script>
+'use strict';
+
+const tg = window.Telegram && window.Telegram.WebApp;
+const inTelegram = Boolean(tg && tg.initData);
+// Opened in a browser on this machine, the page draws sample courts so its
+// screens can be checked without Telegram. Nothing it does reaches the bot:
+// the API refuses any request Telegram did not sign.
+const preview = !inTelegram && /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
+if (inTelegram) {
+  document.documentElement.classList.add('tg');
+  tg.ready();
+}
+
+const app = document.getElementById('app');
+let state = { screen: 'loading' };
+let trail = [];
+
+// ---- Small DOM helper. Every name on screen arrives as text, never HTML.
+function h(tag, props, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(props || {})) {
+    if (value == null || value === false) continue;
+    if (key === 'class') node.className = value;
+    else if (key.startsWith('on')) node.addEventListener(key.slice(2), value);
+    else if (key in node && key !== 'list') node[key] = value;
+    else node.setAttribute(key, value === true ? '' : value);
+  }
+  for (const child of children.flat()) {
+    if (child == null || child === false) continue;
+    node.append(child.nodeType ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+
+// ---- Feedback
+let toastTimer;
+function toast(message, kind = 'success') {
+  if (!message) return;
+  const node = document.getElementById('toast');
+  node.textContent = message;
+  node.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => node.classList.remove('show'), 3200);
+  if (inTelegram && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred(kind);
+}
+
+function confirmAction(message) {
+  if (inTelegram && tg.showConfirm) {
+    return new Promise((resolve) => tg.showConfirm(message, resolve));
+  }
+  return Promise.resolve(window.confirm(message));
+}
+
+function closeApp() {
+  if (inTelegram) tg.close();
+  else toast('In Telegram this closes the sheet.');
+}
+
+// ---- API
+async function api(method, path, body) {
+  if (preview) return previewApi(method, path, body);
+  const response = await fetch(`/api/app/${path}`, {
+    method,
+    headers: {
+      Authorization: `tma ${inTelegram ? tg.initData : ''}`,
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  let data = {};
+  try { data = await response.json(); } catch { /* an empty body reads as a failure */ }
+  return { status: response.status, ...data };
+}
+
+async function run(button, work) {
+  document.body.classList.add('busy');
+  if (button) button.disabled = true;
+  try {
+    return await work();
+  } catch (error) {
+    toast('Could not reach SquashBot. Check your connection and try again.', 'error');
+    return null;
+  } finally {
+    document.body.classList.remove('busy');
+    if (button) button.disabled = false;
+  }
+}
+
+// ---- Navigation. Telegram's own back button in its header, an in-page one
+// in the preview.
+function go(screen, extra = {}, push = true) {
+  if (push && state.screen !== 'loading' && state.screen !== 'blocked') trail.push(state);
+  state = { screen, ...extra };
+  render();
+}
+function back() {
+  const previous = trail.pop();
+  if (!previous) return;
+  state = previous;
+  if (state.screen === 'list') return loadList(false);
+  if (state.screen === 'court') return openCourt(state.court.id, false);
+  render();
+}
+if (inTelegram) tg.BackButton.onClick(back);
+
+function header(title) {
+  const showBack = trail.length > 0;
+  if (inTelegram) {
+    if (showBack) tg.BackButton.show(); else tg.BackButton.hide();
+  }
+  return h('div', { class: 'top' },
+    !inTelegram && showBack ? h('button', { class: 'back', onclick: back }, '‹ Back') : null,
+    h('h1', null, title),
+    h('button', { class: 'back', onclick: closeApp, 'aria-label': 'Close' }, 'Close'));
+}
+
+// ---- Screens
+function render() {
+  const screens = { loading, blocked, list, court, form };
+  app.replaceChildren(...[].concat(screens[state.screen]()).flat(Infinity).filter(Boolean));
+  window.scrollTo(0, 0);
+}
+
+function loading() {
+  return h('div', { class: 'empty' }, 'Loading…');
+}
+
+function blocked() {
+  return [
+    h('div', { class: 'empty' },
+      h('div', { class: 'big' }, '🔒'),
+      h('div', null, state.message)),
+    h('button', { class: 'primary', onclick: closeApp }, 'Close'),
+  ];
+}
+
+function slotsPill(court) {
+  const room = court.capacity - court.heads;
+  return h('span', { class: room > 0 ? 'pill' : 'pill full' },
+    room > 0 ? `${room} left · ${court.heads}/${court.capacity}` : 'Full');
+}
+
+function playerNames(players) {
+  return players.map((player) => (player.heads > 1 ? `${player.name} +1` : player.name)).join(', ')
+    || 'Nobody yet';
+}
+
+function list() {
+  const { courts } = state.data;
+  return [
+    header('Manage courts'),
+    courts.length
+      ? h('div', { class: 'section' }, courts.map((court) =>
+        h('button', { class: 'row', onclick: () => openCourt(court.id) },
+          h('div', { class: 'main' },
+            h('div', { class: 'title' }, `${court.court} · ${court.date}`),
+            h('div', { class: 'meta' }, `${court.time} · ${playerNames(court.players)}`)),
+          slotsPill(court))))
+      : h('div', { class: 'empty' }, h('div', { class: 'big' }, '🎾'), 'Nothing booked yet.'),
+    h('button', { class: 'primary', onclick: () => openForm(null) }, '➕ Add booking'),
+  ];
+}
+
+function court() {
+  const c = state.court;
+  const room = c.capacity - c.heads;
+  const friend = Boolean(state.friend);
+  const seatable = c.seat.candidates.length && room >= (friend ? 2 : 1);
+  const tags = [
+    c.started && '▶ In progress',
+    c.free && '🆓 Free court — nobody is billed',
+    c.bookedBy && `📝 Booked by ${c.bookedBy}`,
+  ].filter(Boolean);
+
+  const roster = c.players.map((player) =>
+    h('div', { class: 'row' },
+      h('div', { class: 'main' },
+        h('div', null, player.name),
+        player.heads > 1 ? h('div', { class: 'meta' }, 'Bringing a friend · two shares') : null),
+      h('button', {
+        class: player.heads > 1 ? 'icon-btn on' : 'icon-btn',
+        'aria-label': player.heads > 1 ? `Take ${player.name}'s +1 off` : `Give ${player.name} a +1`,
+        disabled: player.heads < 2 && room < 1,
+        onclick: (event) => act(event.currentTarget, 'plus', { player: player.id }),
+      }, '+1'),
+      h('button', {
+        class: 'icon-btn remove', 'aria-label': `Remove ${player.name}`,
+        onclick: async (event) => {
+          const button = event.currentTarget;
+          if (await confirmAction(`Take ${player.name} off ${c.court}?`)) {
+            act(button, 'kick', { player: player.id });
+          }
+        },
+      }, '✕')));
+
+  const seatRows = [];
+  if (c.seat.candidates.length && room >= 1) {
+    seatRows.push(h('label', { class: 'row' },
+      h('div', { class: 'main' },
+        h('div', null, 'Bringing a friend'),
+        h('div', { class: 'meta' }, friend ? 'Takes two slots · pays two shares' : 'Off')),
+      h('span', { class: 'switch' },
+        h('input', {
+          type: 'checkbox', checked: friend, disabled: room < 2,
+          onchange: (event) => { state.friend = event.target.checked; render(); },
+        }),
+        h('span'))));
+    if (seatable) {
+      for (const player of c.seat.candidates) {
+        seatRows.push(h('button', {
+          class: 'row link',
+          onclick: (event) => act(event.currentTarget, 'seat', {
+            slug: player.slug, heads: friend ? 2 : 1,
+          }),
+        }, `➕ ${player.name}`));
+      }
+    }
+  }
+  if (c.seat.guest) {
+    seatRows.push(h('button', {
+      class: 'row link', onclick: (event) => act(event.currentTarget, 'guest'),
+    }, c.seat.guest.on ? `➖ ${c.seat.host} +1 — guest off` : `🎁 ${c.seat.host} +1 — free guest`));
+  }
+
+  return [
+    header(c.court),
+    h('div', { class: 'sub' }, `${c.date} · ${c.time}`),
+    tags.length ? h('div', { class: 'tags' }, tags.map((tag) => h('span', { class: 'tag' }, tag))) : null,
+
+    h('div', { class: 'label' }, `Players · ${c.heads}/${c.capacity}`),
+    roster.length ? h('div', { class: 'section' }, roster)
+      : h('div', { class: 'section' }, h('div', { class: 'row meta' }, 'Nobody is on this court yet.')),
+
+    seatRows.length ? [
+      h('div', { class: 'label' }, 'Seat someone'),
+      h('div', { class: 'section' }, seatRows),
+      h('div', { class: 'note' }, room < 1
+        ? 'The court is full. Open another slot to seat anyone else.'
+        : 'They are billed like anyone who joined themselves.'),
+    ] : null,
+
+    h('div', { class: 'label' }, 'Booking'),
+    h('div', { class: 'section' },
+      c.canRaise ? h('button', {
+        class: 'row link', onclick: (event) => act(event.currentTarget, 'capacity'),
+      }, `👥 Room for ${c.capacity + 1}`) : null,
+      h('button', { class: 'row link', onclick: () => openForm(c) }, '✏️ Change date, court or time'),
+      h('button', { class: 'row danger', onclick: (event) => remove(event.currentTarget) },
+        '🗑 Delete booking')),
+  ];
+}
+
+function form() {
+  const editing = Boolean(state.court);
+  const values = state.values;
+  const players = state.players || [];
+  const set = (key) => (event) => {
+    values[key] = event.target.type === 'checkbox' ? event.target.checked : event.target.value;
+    state.conflict = null;
+  };
+  const field = (label, input) => h('div', { class: 'field' }, h('label', null, label), input);
+  return [
+    header(editing ? `Change ${state.court.court}` : 'Add booking'),
+    editing ? h('div', { class: 'sub' }, `Now ${state.court.date} · ${state.court.time}`) : null,
+    h('div', { class: 'section' },
+      field('Date', h('input', { type: 'date', value: values.date, min: state.today, oninput: set('date') })),
+      field('Start', h('input', { type: 'time', value: values.start, step: 900, min: '07:00', max: '21:00', oninput: set('start') })),
+      field('Finish', h('input', { type: 'time', value: values.end, step: 900, min: '07:15', max: '22:00', oninput: set('end') })),
+      field('Court', h('input', {
+        type: 'text', value: values.court, placeholder: '4 or A', maxLength: 12,
+        autocomplete: 'off', oninput: set('court'),
+      }))),
+    !editing ? [
+      h('div', { class: 'label' }, 'Admin'),
+      h('div', { class: 'section' },
+        field('Booked by', h('select', { onchange: set('booker') },
+          h('option', { value: '', selected: !values.booker }, 'Me'),
+          players.map((player) => h('option', {
+            value: player.slug, selected: values.booker === player.slug,
+          }, player.name)))),
+        h('label', { class: 'field' },
+          h('span', { style: 'flex:1' }, 'Free court — nobody is billed'),
+          h('span', { class: 'switch' },
+            h('input', { type: 'checkbox', checked: Boolean(values.free), onchange: set('free') }),
+            h('span')))),
+    ] : null,
+    h('div', { class: 'note' }, 'Courts run 7am to 10pm. No finish time means one hour.'),
+    state.conflict ? h('div', { class: 'warning' },
+      h('div', null, h('b', null, state.conflict.message)),
+      state.conflict.conflicts.map((line) => h('div', null, line))) : null,
+    h('button', {
+      class: 'primary', onclick: (event) => save(event.currentTarget, Boolean(state.conflict)),
+    }, state.conflict ? '⚠️ Save anyway' : (editing ? '✅ Save changes' : '✅ Add booking')),
+  ];
+}
+
+// ---- Actions
+function blockedBy(result) {
+  if (result.status === 401 || result.status === 403) {
+    trail = [];
+    go('blocked', { message: result.message }, false);
+    return true;
+  }
+  return false;
+}
+
+async function loadList(push = true) {
+  const result = await run(null, () => api('GET', 'courts'));
+  if (!result || blockedBy(result)) return;
+  go('list', { data: result }, push);
+}
+
+async function openCourt(id, push = true) {
+  const result = await run(null, () => api('GET', `court/${id}`));
+  if (!result || blockedBy(result)) return;
+  if (!result.ok) {
+    toast(result.message, 'error');
+    trail = [];
+    return loadList(false);
+  }
+  go('court', { court: result.court, friend: push ? false : state.friend }, push);
+}
+
+async function act(button, action, body = {}) {
+  const c = state.court;
+  const result = await run(button, () => api('POST', `court/${c.id}/${action}`, body));
+  if (!result || blockedBy(result)) return;
+  toast(result.message, result.ok ? 'success' : 'error');
+  if (result.court) {
+    state.court = result.court;
+    if (result.court.capacity - result.court.heads < 2) state.friend = false;
+    render();
+  }
+}
+
+async function remove(button) {
+  const c = state.court;
+  const warning = c.started ? '\n\nThis court is in progress. Deleting it means nobody is charged for it.' : '';
+  if (!(await confirmAction(`Delete ${c.court} on ${c.date}, ${c.time}?${warning}`))) return;
+  const result = await run(button, () => api('POST', `court/${c.id}/delete`));
+  if (!result || blockedBy(result)) return;
+  toast(result.message, result.ok ? 'success' : 'error');
+  if (result.ok) {
+    trail = [];
+    loadList(false);
+  }
+}
+
+async function openForm(court) {
+  let players = [];
+  let today = '';
+  // The list screen already holds who can be named as booker and today's date.
+  const listed = trail.concat(state).find((entry) => entry.screen === 'list');
+  if (listed) ({ players, today } = listed.data);
+  go('form', {
+    court,
+    players,
+    today,
+    conflict: null,
+    values: court
+      ? { ...court.edit }
+      : { date: today, start: '', end: '', court: '', booker: '', free: false },
+  });
+}
+
+async function save(button, force) {
+  const editing = Boolean(state.court);
+  const path = editing ? `court/${state.court.id}/edit` : 'courts';
+  const result = await run(button, () => api('POST', path, { ...state.values, force }));
+  if (!result || blockedBy(result)) return;
+  if (result.conflict) {
+    state.conflict = result;
+    toast(result.message, 'warning');
+    render();
+    return;
+  }
+  toast(result.message, result.ok ? 'success' : 'error');
+  if (!result.ok) return;
+  // Back to the court just saved, with the list underneath it.
+  trail = trail.filter((entry) => entry.screen === 'list');
+  go('court', { court: result.court, friend: false }, false);
+}
+
+// ---- Start. A link can name one court with "_b<id>" after the group.
+async function start() {
+  render();
+  if (!inTelegram && !preview) {
+    go('blocked', { message: 'Open this from the ⚙️ Manage button on the pinned court board.' }, false);
+    return;
+  }
+  const startParam = (inTelegram && tg.initDataUnsafe.start_param) || '';
+  const courtId = (startParam.match(/_b(\d+)$/) || [])[1];
+  await loadList(false);
+  if (courtId && state.screen === 'list') openCourt(Number(courtId));
+}
+
+// ---- Preview data. Only ever used at localhost, outside Telegram.
+let sample;
+function previewApi(method, path, body) {
+  if (!sample) {
+    const players = [
+      { slug: '@nicholaswan', name: '@nicholaswan' }, { slug: '@dodgerblueee', name: '@Dodgerblueee' },
+      { slug: '@alice', name: '@alice' }, { slug: '@jarhead', name: '@jarhead' }, { slug: 'u55', name: 'Mei' },
+    ];
+    let nextRow = 10;
+    const seat = (slug, heads = 1) => {
+      const player = players.find((candidate) => candidate.slug === slug);
+      return { id: nextRow++, slug, name: player.name, heads };
+    };
+    sample = {
+      players, seat, nextId: 4,
+      courts: [
+        { id: 1, court: 'Court 4', date: 'Tue 28 Oct', time: '8–9pm', capacity: 3, free: false, started: false, bookedBy: '@nicholaswan',
+          edit: { date: '2026-10-28', start: '20:00', end: '21:00', court: '4' },
+          roster: [seat('@nicholaswan'), seat('@dodgerblueee')] },
+        { id: 2, court: 'Court 2', date: 'Thu 30 Oct', time: '7–8:30pm', capacity: 4, free: true, started: false, bookedBy: '@jarhead',
+          edit: { date: '2026-10-30', start: '19:00', end: '20:30', court: '2' },
+          roster: [seat('@jarhead', 2), seat('@nicholaswan'), seat('@alice')] },
+        { id: 3, court: 'Court A', date: 'Sat 1 Nov', time: '9–10am', capacity: 3, free: false, started: false, bookedBy: '@nicholaswan',
+          edit: { date: '2026-11-01', start: '09:00', end: '10:00', court: 'A' },
+          roster: [seat('@nicholaswan')] },
+      ],
+    };
+  }
+  const heads = (roster) => roster.reduce((sum, player) => sum + player.heads, 0);
+  const summary = (c) => ({
+    id: c.id, court: c.court, date: c.date, time: c.time, heads: heads(c.roster), capacity: c.capacity,
+    free: c.free, started: c.started,
+    players: c.roster.map(({ id, name, heads: count }) => ({ id, name, heads: count })),
+  });
+  const detail = (c) => {
+    const room = c.capacity - heads(c.roster);
+    const host = c.roster.find((player) => player.slug === '@nicholaswan');
+    const guestOn = Boolean(host) && host.heads > 1;
+    return {
+      ...summary(c), bookedBy: c.bookedBy, canRaise: c.capacity < 12, edit: c.edit,
+      seat: {
+        free: room, host: 'Nicholas',
+        guest: guestOn || room >= (host ? 1 : 2) ? { on: guestOn } : null,
+        candidates: room < 1 ? [] : sample.players
+          .filter((player) => !c.roster.some((seated) => seated.slug === player.slug)),
+      },
+    };
+  };
+  const reply = (data) => new Promise((resolve) => setTimeout(() => resolve({ status: 200, ...data }), 150));
+  if (method === 'GET' && path === 'courts') {
+    return reply({ ok: true, courts: sample.courts.map(summary), today: '2026-10-27', players: sample.players });
+  }
+  const match = path.match(/^court\/(\d+)(?:\/(\w+))?$/);
+  const c = match && sample.courts.find((entry) => entry.id === Number(match[1]));
+  if (method === 'POST' && path === 'courts') {
+    const added = {
+      id: sample.nextId++, court: `Court ${body.court || '?'}`, date: body.date, time: body.start,
+      capacity: 3, free: Boolean(body.free), started: false, bookedBy: 'you', edit: { ...body },
+      roster: [sample.seat('@nicholaswan')],
+    };
+    sample.courts.push(added);
+    return reply({ ok: true, message: '✅ Booking added', court: detail(added) });
+  }
+  if (!c) return reply({ ok: false, message: 'That booking has already gone.' });
+  const action = match[2];
+  const done = (message) => reply({ ok: true, message, court: detail(c) });
+  if (!action) return reply({ ok: true, court: detail(c) });
+  if (action === 'seat') {
+    c.roster.push(sample.seat(body.slug, body.heads));
+    return done(`${c.roster[c.roster.length - 1].name} is on this court. Everyone on it has been told.`);
+  }
+  if (action === 'kick') {
+    const player = c.roster.find((entry) => entry.id === body.player);
+    c.roster = c.roster.filter((entry) => entry !== player);
+    return done(`${player.name} is off this booking.`);
+  }
+  if (action === 'plus') {
+    const player = c.roster.find((entry) => entry.id === body.player);
+    player.heads = player.heads > 1 ? 1 : 2;
+    return done(player.heads > 1 ? `${player.name} now brings a +1 — two shares. Everyone has been told.`
+      : `${player.name}'s +1 is off — one share again. Everyone has been told.`);
+  }
+  if (action === 'guest') {
+    let host = c.roster.find((player) => player.slug === '@nicholaswan');
+    if (!host) { host = sample.seat('@nicholaswan'); host.heads = 0; c.roster.push(host); }
+    host.heads = host.heads > 1 ? 1 : 2;
+    return done(host.heads > 1 ? 'Nicholas +1 is on — the guest is not charged.' : "Nicholas's guest is off.");
+  }
+  if (action === 'capacity') {
+    c.capacity += 1;
+    return done(`This court now holds ${c.capacity} players.`);
+  }
+  if (action === 'edit') {
+    if (!body.force && body.court === '2') {
+      return reply({ ok: false, conflict: true, message: 'This overlaps another booking. Save anyway?',
+        conflicts: ['Court 2 · Thu 30 Oct · 7–8:30pm'], status: 409 });
+    }
+    c.edit = { date: body.date, start: body.start, end: body.end, court: body.court };
+    c.court = `Court ${body.court}`;
+    c.time = body.end ? `${body.start}–${body.end}` : body.start;
+    return done('✅ Booking updated');
+  }
+  if (action === 'delete') {
+    sample.courts = sample.courts.filter((entry) => entry !== c);
+    return reply({ ok: true, message: 'Booking cancelled' });
+  }
+  return reply({ ok: false, message: 'Not found.' });
+}
+
+start();
+</script>
+</body>
+</html>

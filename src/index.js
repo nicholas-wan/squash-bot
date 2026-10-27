@@ -1,14 +1,15 @@
 import { runScheduledMaintenance } from './maintenance-schedule.js';
+import { addSlot, flipOwnerGuest, flipPlusOne, kickPlayer, seatPlayer } from './actions.js';
+import { handleMiniAppApi } from './miniapp-api.js';
 import { rememberLedgerIdentity } from './ledger-identity.js';
 import {
   addPlayerView, authorizeBookingChange, bookingPanelView, cancelBooking, deletePanelView,
-  deliverSightedTabNotice, managerView, notifyRemovedPlayer, notifyRosterOfChange, plusOneView,
+  deliverSightedTabNotice, managerView, notifyRosterOfChange, plusOneView,
   removePlayerView, restoreBoardButtons, runMaintenance, joinPickerView, updateBoard,
 } from './bookings.js';
 import {
-  adminAddPlayer, defaultCapacity, isChatAdmin, isHouseholdPlayer, isOwner, knownPlayers,
-  MAX_CAPACITY, ownerName, raiseCapacity, rememberPlayer, toggleOwnerGuest, togglePlusOne,
-  joinBooking, leaveBooking, removeBookingPlayer, toggleBooking,
+  defaultCapacity, isChatAdmin, isHouseholdPlayer, isOwner, knownPlayers, ownerName,
+  rememberPlayer, joinBooking, leaveBooking, toggleBooking,
 } from './players.js';
 import { looksLikeBooking } from './parser.js';
 import { allowedChats } from './scope.js';
@@ -114,10 +115,10 @@ const boardRoutes = [
   // The head count comes before the slug and is a bare 1 or 2, which is what
   // keeps this apart from the picker's own :h1 / :h2 rows — a slug can start
   // with anything, so the digit has to be matched first and anchored.
-  { pattern: /^sb:addp:(\d+):guest$/, admin: SEAT_ADMIN, handler: flipOwnerGuest },
+  { pattern: /^sb:addp:(\d+):guest$/, admin: SEAT_ADMIN, handler: flipOwnerGuestTapped },
   { pattern: /^sb:addp:(\d+):([12]):(.+)$/, admin: SEAT_ADMIN, handler: seatPickedPlayer },
   { pattern: /^sb:addp:(\d+)(?::h([12]))?$/, admin: SEAT_ADMIN, handler: openSeatPicker },
-  { pattern: /^sb:plus:(\d+):(\d+)$/, admin: PLUS_ADMIN, handler: flipPlusOne },
+  { pattern: /^sb:plus:(\d+):(\d+)$/, admin: PLUS_ADMIN, handler: flipPlusOneTapped },
   { pattern: /^sb:plus:(\d+)$/, admin: PLUS_ADMIN, handler: openPlusOnePicker },
   { pattern: /^sb:kick:(\d+):(\d+)$/, admin: KICK_ADMIN, handler: removePickedPlayer },
   { pattern: /^sb:kick:(\d+)$/, admin: KICK_ADMIN, handler: openRemovePicker },
@@ -320,44 +321,14 @@ async function moveSlot(env, callback, match) {
 async function seatPickedPlayer(env, callback, match) {
   const chatId = callback.message.chat.id;
   const bookingId = Number(match[1]);
-  const heads = Number(match[2]);
-  // Resolved fresh rather than trusted from the button, so a stale panel
-  // cannot seat somebody under an outdated name or id.
-  const candidate = (await knownPlayers(env, chatId))
-    .find((player) => player.slug === match[3]);
-  if (!candidate) {
-    await answerCallback(env, callback.id, 'That player is no longer known.', true);
-    return;
-  }
-  const result = await adminAddPlayer(
-    env, chatId, bookingId, candidate, callback.from.id, heads
+  const result = await seatPlayer(
+    env, chatId, bookingId, match[3], Number(match[2]), callback.from.id
   );
-  let allTold = false;
-  if (result.status === 'added') {
-    // The seated player is the subject of the notice, not the admin tapping.
-    ({ allTold } = await notifyRosterOfChange(env, chatId, result.booking, {
-      id: candidate.user_id || null,
-      username: candidate.slug.startsWith('@') ? candidate.slug.slice(1) : null,
-      first_name: candidate.name,
-    }, 'added', heads));
-    await updateBoard(env, chatId);
+  if (result.changed) {
     const view = await bookingPanelView(env, chatId, bookingId);
     if (view) await showPanel(env, callback, view);
   }
-  const delivery = allTold
-    ? 'Everyone on it has been told.' : 'Some players could not be notified.';
-  const replies = {
-    added: [heads > 1
-      ? `${candidate.name} +1 are on this court — two shares on the tab. `
-        + delivery
-      : `${candidate.name} is on this court. ${delivery}`, false],
-    already: ['They are already on that court.', true],
-    full: [heads > 1
-      ? 'A +1 needs two free slots. Open another one first.'
-      : 'That court is full. Open another slot first.', true],
-    gone: ['That booking has already gone.', true],
-  };
-  await answerCallback(env, callback.id, ...replies[result.status]);
+  await answerCallback(env, callback.id, result.message, result.alert);
 }
 
 // Opening the picker and flipping its friend toggle are the same view drawn
@@ -374,64 +345,29 @@ async function openSeatPicker(env, callback, match) {
     !view);
 }
 
-async function flipPlusOne(env, callback, match) {
+async function flipPlusOneTapped(env, callback, match) {
   const chatId = callback.message.chat.id;
   const bookingId = Number(match[1]);
-  const result = await togglePlusOne(env, chatId, bookingId, Number(match[2]));
-  let allTold = false;
-  if (result.status === 'plus' || result.status === 'minus') {
-    // The member whose share changed is the subject, not the tapping admin.
-    ({ allTold } = await notifyRosterOfChange(env, chatId, result.booking, {
-      id: result.player.user_id || null,
-      username: result.player.slug.startsWith('@') ? result.player.slug.slice(1) : null,
-      first_name: result.player.name,
-    }, result.status));
-    await updateBoard(env, chatId);
+  const result = await flipPlusOne(env, chatId, bookingId, Number(match[2]));
+  if (result.changed) {
     const view = await plusOneView(env, chatId, bookingId);
     if (view) await showPanel(env, callback, view);
   }
-  const delivery = allTold
-    ? 'Everyone has been told.' : 'Some players could not be notified.';
-  const replies = {
-    plus: [`${result.player && result.player.name} now brings a +1 — two shares. `
-      + delivery, false],
-    minus: [`${result.player && result.player.name}'s +1 is off — one share again. `
-      + delivery, false],
-    full: ['No free slot for a +1. Open another slot first.', true],
-    gone: ['That player or booking has already gone.', true],
-  };
-  await answerCallback(env, callback.id, ...replies[result.status]);
+  await answerCallback(env, callback.id, result.message, result.alert);
 }
 
-// The organiser's free guest, flipped from the seat picker: somebody seated
-// on the organiser's +1 is charged to nobody. The picker is redrawn rather
-// than left for the booking panel, since seating the rest usually follows.
-async function flipOwnerGuest(env, callback, match) {
+// The organiser's free guest, flipped from the seat picker. The picker is
+// redrawn rather than left for the booking panel, since seating the rest
+// usually follows.
+async function flipOwnerGuestTapped(env, callback, match) {
   const chatId = callback.message.chat.id;
   const bookingId = Number(match[1]);
-  const result = await toggleOwnerGuest(env, chatId, bookingId, callback.from.id);
-  const host = ownerName(env);
-  let allTold = false;
-  if (result.status === 'plus' || result.status === 'minus') {
-    ({ allTold } = await notifyRosterOfChange(env, chatId, result.booking, {
-      id: result.player.user_id || null,
-      username: result.player.slug.startsWith('@') ? result.player.slug.slice(1) : null,
-      first_name: host,
-    }, result.status));
-    await updateBoard(env, chatId);
+  const result = await flipOwnerGuest(env, chatId, bookingId, callback.from.id);
+  if (result.changed) {
     const view = await addPlayerView(env, chatId, bookingId);
     if (view) await showPanel(env, callback, view);
   }
-  const delivery = allTold
-    ? 'Everyone has been told.' : 'Some players could not be notified.';
-  const replies = {
-    plus: [`${host} +1 is on — the guest is not charged. ${delivery}`, false],
-    minus: [`${host}'s guest is off. ${delivery}`, false],
-    full: ['No free slot for a guest. Open another slot first.', true],
-    already: ['That court has changed — open the picker again.', true],
-    gone: ['That booking has already gone.', true],
-  };
-  await answerCallback(env, callback.id, ...replies[result.status]);
+  await answerCallback(env, callback.id, result.message, result.alert);
 }
 
 async function openPlusOnePicker(env, callback, match) {
@@ -443,18 +379,12 @@ async function openPlusOnePicker(env, callback, match) {
 
 async function removePickedPlayer(env, callback, match) {
   const chatId = callback.message.chat.id;
-  const removed = await removeBookingPlayer(
-    env, chatId, Number(match[1]), Number(match[2])
-  );
-  if (removed) {
-    await updateBoard(env, chatId);
-    await notifyRemovedPlayer(env, chatId, removed.player, removed.booking);
+  const result = await kickPlayer(env, chatId, Number(match[1]), Number(match[2]));
+  if (result.changed) {
     const view = await bookingPanelView(env, chatId, Number(match[1]));
     if (view) await showPanel(env, callback, view);
   }
-  await answerCallback(env, callback.id,
-    removed ? `${removed.player.name} is off this booking.`
-      : 'That player has already gone.', !removed);
+  await answerCallback(env, callback.id, result.message, result.alert);
 }
 
 async function openRemovePicker(env, callback, match) {
@@ -466,16 +396,12 @@ async function openRemovePicker(env, callback, match) {
 
 async function raiseSlotCount(env, callback, match) {
   const chatId = callback.message.chat.id;
-  const raised = await raiseCapacity(env, chatId, Number(match[1]));
-  if (raised) {
-    await updateBoard(env, chatId);
+  const result = await addSlot(env, chatId, Number(match[1]));
+  if (result.changed) {
     const view = await bookingPanelView(env, chatId, Number(match[1]));
     if (view) await showPanel(env, callback, view);
   }
-  await answerCallback(env, callback.id,
-    raised ? `This court now holds ${raised} players.`
-      : `That booking has gone, or it is already at the ${MAX_CAPACITY} player limit.`,
-    !raised);
+  await answerCallback(env, callback.id, result.message, result.alert);
 }
 
 // A private send can come back as an ordinary group message. Everything
@@ -1280,6 +1206,10 @@ export default {
       }
       ctx.waitUntil(handleUpdate(env, update));
       return new Response('ok');
+    }
+
+    if (url.pathname.startsWith('/api/app/')) {
+      return handleMiniAppApi(request, env, url.pathname.slice('/api/app/'.length));
     }
 
     if (url.pathname === '/setup') {

@@ -33,6 +33,16 @@ DEFAULT_CAPACITY = "3"
 # Optional. Overrides the built-in Singapore public holiday list, which is
 # charged at the evening rate all day.
 # PUBLIC_HOLIDAYS = "2027-01-01,2027-02-06"
+# Optional. The Mini App's direct link from @BotFather (/newapp), e.g.
+# https://t.me/<bot>/manage. When set, the pinned board gets a ⚙️ Manage
+# button that opens the app over the chat. Register the app with the URL
+# https://<your-worker>/app/.
+# MINI_APP_URL = "https://t.me/YourBot/manage"
+
+# The Mini App's page, served at /app/. Any path without a file here reaches
+# the worker.
+[assets]
+directory = "./public"
 
 [triggers]
 crons = ["* * * * *"]
