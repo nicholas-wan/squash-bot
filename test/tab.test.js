@@ -123,7 +123,7 @@ describe('money tab', () => {
     expect({ chatId, slug, userId, name, amount, bookingId }).toEqual({
       chatId: -123, slug: 'u9', userId: 9, name: 'Alice', amount: 200, bookingId: 3,
     });
-    expect(reason).toBe('Court 4 · 19 Aug');
+    expect(reason).toBe('Court 4 · 19 Aug · 9pm–10pm · $6.00 ÷ 3');
   });
 
   it('divides by heads and bills a +1 twice in the one row', async () => {
@@ -139,7 +139,7 @@ describe('money tab', () => {
     expect(inserts).toHaveLength(1);
     const [, slug, , , amount, , reason] = inserts[0];
     expect({ slug, amount }).toEqual({ slug: 'u9', amount: 400 });
-    expect(reason).toBe('Court 4 · 19 Aug · for 2');
+    expect(reason).toMatch(/^Court 4 · 19 Aug · 9pm–10pm · \$\d+\.\d{2} ÷ \d · for 2$/);
   });
 
   it('never charges a booking twice', async () => {

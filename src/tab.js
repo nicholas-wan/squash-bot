@@ -1,11 +1,12 @@
 import { syncAnnouncements } from './announcements.js';
-import { courtName } from './format.js';
+import { courtName, shortClock } from './format.js';
 import { courtCostCents, formatMoney, publicHolidays, shareCents } from './pricing.js';
 import { identity, isHouseholdPlayer, ownerName } from './players.js';
 import { boardChats, dataChatId } from './scope.js';
 import { getTimezone, updatePinnedMessage } from './settings.js';
-import { escapeHtml, OK_MARKUP } from './telegram.js';
+import { deleteMessage, escapeHtml, OK_MARKUP, sendMessage } from './telegram.js';
 import { queuePinnedRefresh } from './refresh-queue.js';
+import { miniAppLink } from './miniapp-link.js';
 
 function shortDay(epochMs, tz) {
   return new Intl.DateTimeFormat('en-SG', {
@@ -44,10 +45,14 @@ export async function chargeBooking(env, booking, roster) {
   );
   // Divided by heads rather than rows: a member an admin seated with a friend
   // holds two of the court's slots, so the court splits two ways for them.
-  const share = shareCents(
-    totalCents, roster.reduce((total, player) => total + (player.heads || 1), 0)
-  );
-  const reason = `${courtName(booking)} · ${shortDay(booking.starts_at, tz)}`;
+  const heads = roster.reduce((total, player) => total + (player.heads || 1), 0);
+  const share = shareCents(totalCents, heads);
+  // The time and the sum make a line checkable on its own: "Court 4 · 27 Oct"
+  // twice read as a double charge when it was two courts, and nothing said how
+  // a share was reached.
+  const reason = `${courtName(booking)} · ${shortDay(booking.starts_at, tz)} · `
+    + `${shortClock(booking.starts_at, tz)}–${shortClock(booking.ends_at, tz)} · `
+    + `${formatMoney(totalCents)} ÷ ${heads}`;
 
   let charged = 0;
   if (share > 0) {
@@ -58,7 +63,7 @@ export async function chargeBooking(env, booking, roster) {
       // One row per person however many heads they brought — the unique index
       // allows only one per booking anyway — so the reason carries the count,
       // which is the only place a doubled charge can explain itself.
-      const heads = player.heads || 1;
+      const brought = player.heads || 1;
       const account = await ledgerAccount(env, booking.chat_id, player);
       const inserted = await env.DB.prepare(
         `INSERT OR IGNORE INTO ledger
@@ -66,7 +71,8 @@ export async function chargeBooking(env, booking, roster) {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       ).bind(
         booking.chat_id, account.slug, account.userId, player.name,
-        share * heads, booking.id, heads > 1 ? `${reason} · for ${heads}` : reason, Date.now()
+        share * brought, booking.id, brought > 1 ? `${reason} · for ${brought}` : reason,
+        Date.now()
       ).run();
       charged += inserted.meta.changes ? 1 : 0;
     }
@@ -110,7 +116,12 @@ export function settleable(balances) {
 // a balance an admin could clear. The keyboard is never omitted — editing a
 // message without reply_markup keeps its previous keyboard, so a settle button
 // that should disappear must be overwritten, not left out.
-export function tabMarkup(balances) {
+//
+// With the Mini App registered the pinned tab gets one button into it instead,
+// which opens over the chat wherever the tapper is: the breakdown it replaces
+// could only land at the bottom of the chat. Admins settle from inside it.
+export function tabMarkup(balances, appLink = null) {
+  if (appLink) return { inline_keyboard: [[{ text: '🧾 My tab · 💵 Settle', url: appLink }]] };
   const rows = [[{ text: '🧾 My tab', callback_data: 'tb:mine' }]];
   if (settleable(balances).length) {
     rows.push([{ text: '⚙️ Manage tab', callback_data: 'tb:pay' }]);
@@ -187,7 +198,7 @@ export function breakdownLines(env, rows, tz, { pricing = true } = {}) {
 // Who an admin can open from their own tab: every open balance, plus anyone
 // the ledger touched inside the history window — settling up must not make a
 // player unfindable while their recent story is still worth reading.
-async function adminTabEntries(env, chatId) {
+export async function adminTabEntries(env, chatId) {
   const balances = await tabBalances(env, chatId);
   const known = new Set(balances.map((entry) => entry.slug));
   const { results: recent } = await env.DB.prepare(
@@ -208,12 +219,12 @@ async function adminTabEntries(env, chatId) {
 // payments alike, in the order they happened. The pinned tab is shared and can
 // only name totals; this is sent privately to whoever tapped 🧾, which is the
 // one place the full story fits.
-export async function myTabView(env, chatId, from, isAdmin = false) {
+// Matched by slug or by numeric id: a username change re-keys roster rows but
+// not ledger history, so the id is the only thread tying an old entry to the
+// person asking now — and showing both halves is what makes a total split
+// across two spellings explainable.
+export async function ledgerRowsFor(env, chatId, from) {
   const who = identity(from);
-  // Matched by slug or by numeric id: a username change re-keys roster rows
-  // but not ledger history, so the id is the only thread tying an old entry to
-  // the person tapping now — and showing both halves is what makes a total
-  // split across two spellings explainable.
   const { results } = await env.DB.prepare(
     `SELECT * FROM ledger
      WHERE chat_id = ? AND (
@@ -225,6 +236,39 @@ export async function myTabView(env, chatId, from, isAdmin = false) {
      )
      ORDER BY created_at, id`
   ).bind(dataChatId(env, chatId), who.userId || 0, who.slug).all();
+  return results;
+}
+
+// One account's rows, by the key the pinned tab and payments use.
+export async function accountRows(env, chatId, slug) {
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM ledger WHERE chat_id = ? AND slug = ?
+     ORDER BY created_at, id`
+  ).bind(dataChatId(env, chatId), String(slug)).all();
+  return results;
+}
+
+// The breakdown as data, for the Mini App: the same cut and the same carried
+// total as the chat's, so both always agree, with each line marked when an
+// admin may still take it back.
+export function tabStory(rows, tz, now = Date.now()) {
+  const balance = rows.reduce((sum, row) => sum + row.amount_cents, 0);
+  const { shown, settled, carried } = currentRows(rows, now);
+  return {
+    balance,
+    earlier: settled ? { entries: settled, cents: carried } : null,
+    lines: shown.map((row) => ({
+      id: row.id,
+      label: row.reason || (row.amount_cents < 0 ? 'Payment' : 'Squash'),
+      date: shortDay(row.created_at, tz),
+      cents: row.amount_cents,
+      undoable: undoable(row, now),
+    })),
+  };
+}
+
+export async function myTabView(env, chatId, from, isAdmin = false) {
+  const results = await ledgerRowsFor(env, chatId, from);
 
   const lines = ['🧾 <b>Your squash tab</b>'];
   if (!results.length) {
@@ -261,10 +305,7 @@ export async function myTabView(env, chatId, from, isAdmin = false) {
 // The admin breakdown uses the same canonical account key as the pinned tab,
 // payment controls and monthly notices. Unlinked legacy accounts retain a slug.
 export async function theirTabView(env, chatId, slug) {
-  const { results } = await env.DB.prepare(
-    `SELECT * FROM ledger WHERE chat_id = ? AND slug = ?
-     ORDER BY created_at, id`
-  ).bind(dataChatId(env, chatId), String(slug)).all();
+  const results = await accountRows(env, chatId, slug);
   if (!results.length) return null;
   const name = results[results.length - 1].name || String(slug);
   const lines = [`🧾 <b>${escapeHtml(name)}</b>`];
@@ -304,12 +345,12 @@ export function tabHtml(env, balances) {
 export async function updateTab(env, chatId) {
   const balances = await tabBalances(env, chatId);
   const html = tabHtml(env, balances);
-  const markup = html ? tabMarkup(balances) : null;
   // Shared tabs are independent Telegram calls, just like shared boards. A
   // slow or kicked sibling should not add its full round trip to every /tab.
   const outcomes = await Promise.all(boardChats(env, chatId).map(async (chat) => {
     let outcome;
     try {
+      const markup = html ? tabMarkup(balances, miniAppLink(env, chat, 'tab')) : null;
       const id = await updatePinnedMessage(env, chat, 'tab_message_id', html, markup, 'squash tab');
       outcome = { chat, id };
     } catch (error) {
@@ -414,6 +455,83 @@ export async function settleUser(env, chatId, slug, actor, expectedCents = null)
     console.log(`Tab refresh after a settlement failed: ${error.stack || error}`);
   }
   return entry;
+}
+
+// A payment of any size, for the Mini App's amount box. Cash rarely matches a
+// balance to the cent, and the only way to record $20 against $17.35 used to
+// be a /debt line that read like an adjustment rather than money received.
+// The whole balance is written exactly as settleUser writes it; anything else
+// is a part payment, or an overpayment that leaves them in credit. Guarded the
+// same way: the balance the admin was looking at must still be the balance,
+// so a court charged in between is never paid off unseen.
+const MAX_PAYMENT_CENTS = 100000;
+const PART_PAYMENT = 'Paid · recorded by ';
+
+export async function recordPayment(env, chatId, slug, cents, actor, expectedBalance) {
+  if (!Number.isInteger(cents) || cents <= 0 || cents > MAX_PAYMENT_CENTS) {
+    return { status: 'amount' };
+  }
+  const dataChat = dataChatId(env, chatId);
+  const rows = await accountRows(env, chatId, slug);
+  if (!rows.length) return { status: 'unknown' };
+  const balance = rows.reduce((sum, row) => sum + row.amount_cents, 0);
+  if (balance !== expectedBalance) return { status: 'stale', balance };
+  const latest = rows[rows.length - 1];
+  const who = identity(actor);
+  const result = await env.DB.prepare(
+    `INSERT INTO ledger
+      (chat_id, slug, user_id, name, amount_cents, booking_id, reason, created_at)
+     SELECT ?, ?, ?, ?, ?, NULL, ?, ?
+     WHERE (
+       SELECT COALESCE(SUM(amount_cents), 0) FROM ledger
+       WHERE chat_id = ? AND slug = ?
+     ) = ?`
+  ).bind(
+    dataChat, String(slug), rows.find((row) => row.user_id)?.user_id || null, latest.name,
+    -cents, cents === balance ? `Cleared by ${who.name}` : `${PART_PAYMENT}${who.name}`,
+    Date.now(), dataChat, String(slug), balance
+  ).run();
+  if (!result.meta.changes) {
+    const fresh = await accountRows(env, chatId, slug);
+    return { status: 'stale', balance: fresh.reduce((sum, row) => sum + row.amount_cents, 0) };
+  }
+  try {
+    await updateTab(env, chatId);
+  } catch (error) {
+    console.log(`Tab refresh after a payment failed: ${error.stack || error}`);
+  }
+  return {
+    status: 'paid',
+    name: latest.name,
+    userId: rows.find((row) => row.user_id)?.user_id || null,
+    paid: cents,
+    balance: balance - cents,
+  };
+}
+
+// What a receipt says, in the order the player reads it: what came in, then
+// where that leaves them.
+export function paymentReceiptHtml(paid, balance) {
+  const standing = balance > 0 ? `You now owe <b>${formatMoney(balance)}</b>.`
+    : balance < 0 ? `You are <b>${formatMoney(-balance)}</b> in credit.`
+      : 'Your squash tab is settled.';
+  return `✅ <b>Payment received</b> — ${formatMoney(paid)}. ${standing} Thank you!`;
+}
+
+// A private note to one player with nothing tapped behind it, such as a
+// receipt for a payment an admin recorded in the Mini App. Telegram turns
+// such a message into a public one when it cannot deliver it privately; a
+// public copy would name somebody's balance to the group, so it is deleted
+// and the caller hears it did not land.
+export async function sendPrivateNote(env, chatId, userId, html) {
+  const sent = await sendMessage(env, chatId, html, {
+    receiverUserId: userId, replyMarkup: OK_MARKUP,
+  });
+  if (sent.ok && sent.result && sent.result.ephemeral_message_id) return 'private';
+  if (sent.ok && sent.result && sent.result.message_id) {
+    await deleteMessage(env, chatId, sent.result.message_id);
+  }
+  return 'failed';
 }
 
 // A charge or a credit the courts did not produce: a ball somebody replaced,
@@ -589,6 +707,50 @@ export async function takeDraft(env, chatId, id, actor) {
 // because a week-old line is history the player has already read and acted on.
 export const UNDO_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const ADJUSTMENT_ROW = "booking_id IS NULL AND reason LIKE '% · by %'";
+// A recorded payment can be taken back too, within the same week: a clear
+// tapped against the wrong name could otherwise only be answered with a
+// /debt charge, which read as a new debt rather than a mistake undone.
+const PAYMENT_ROW = "booking_id IS NULL AND amount_cents < 0 AND "
+  + `(reason LIKE 'Cleared by %' OR reason LIKE '${PART_PAYMENT}%')`;
+
+function isPaymentRow(row) {
+  return !row.booking_id && row.amount_cents < 0
+    && /^(Cleared by |Paid · recorded by )/.test(String(row.reason || ''));
+}
+
+function undoable(row, now = Date.now()) {
+  if (row.booking_id || row.created_at <= now - UNDO_WINDOW_MS) return false;
+  return isPaymentRow(row) || String(row.reason || '').includes(' · by ');
+}
+
+// Takes back one /debt entry or one recorded payment, for the Mini App. One
+// statement, as undoAdjustment's, so two admins cannot remove it twice.
+export async function undoEntry(env, chatId, id) {
+  const dataChat = dataChatId(env, chatId);
+  const row = await env.DB.prepare(
+    `DELETE FROM ledger
+     WHERE id = ? AND chat_id = ? AND ((${ADJUSTMENT_ROW}) OR (${PAYMENT_ROW})) AND created_at > ?
+     RETURNING *`
+  ).bind(Number(id), dataChat, Date.now() - UNDO_WINDOW_MS).first();
+  if (!row) return null;
+  const total = await env.DB.prepare(
+    'SELECT COALESCE(SUM(amount_cents), 0) AS balance FROM ledger WHERE chat_id = ? AND slug = ?'
+  ).bind(dataChat, row.slug).first();
+  try {
+    await updateTab(env, chatId);
+  } catch (error) {
+    console.log(`Tab refresh after an undo failed: ${error.stack || error}`);
+  }
+  return {
+    slug: row.slug,
+    name: row.name,
+    userId: row.user_id,
+    cents: row.amount_cents,
+    payment: isPaymentRow(row),
+    note: isPaymentRow(row) ? 'A payment' : adjustmentNote(row),
+    balance: (total && total.balance) || 0,
+  };
+}
 
 // The note an admin wrote, without the stamp adjustBalance added to it.
 export function adjustmentNote(row) {

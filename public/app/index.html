@@ -21,6 +21,7 @@
     --danger: var(--tg-theme-destructive-text-color, #e53935);
     --separator: var(--tg-theme-section-separator-color, rgba(128, 128, 128, 0.22));
     --radius: 12px;
+    --positive: #2e9e5b;
   }
   @media (prefers-color-scheme: dark) {
     :root:not(.tg) {
@@ -86,6 +87,26 @@
   }
   .slot.leave { background: var(--separator); color: var(--text); }
   .meta.link-text { color: var(--link); }
+  .seg {
+    display: flex; gap: 4px; padding: 3px; margin: 0 0 14px; border-radius: 10px;
+    background: var(--section);
+  }
+  .seg button {
+    flex: 1; min-height: 34px; border: 0; border-radius: 8px; background: none;
+    color: var(--hint); font-weight: 600; cursor: pointer;
+  }
+  .seg button.on { background: var(--accent); color: var(--accent-text); }
+  .card {
+    padding: 18px 16px; border-radius: var(--radius); background: var(--section); text-align: center;
+  }
+  .card .big {
+    font-size: 34px; font-weight: 700; letter-spacing: -0.02em; font-variant-numeric: tabular-nums;
+  }
+  .card .what { color: var(--hint); margin-top: 2px; }
+  .card.credit .big { color: var(--positive); }
+  .amount { flex: none; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .amount.credit { color: var(--positive); }
+  .wrap { overflow-wrap: anywhere; }
   .icon-btn {
     flex: none; min-width: 40px; height: 32px; padding: 0 10px; border-radius: 8px; border: 0;
     background: var(--separator); cursor: pointer; font-size: 14px; font-weight: 600;
@@ -245,6 +266,8 @@ function back() {
   state = previous;
   if (state.screen === 'list') return loadList(false);
   if (state.screen === 'court') return openCourt(state.court.id, false);
+  if (state.screen === 'tab') return loadTab(false);
+  if (state.screen === 'person') return openPerson(state.person.slug, false);
   render();
 }
 if (inTelegram) tg.BackButton.onClick(back);
@@ -262,7 +285,7 @@ function header(title) {
 
 // ---- Screens
 function render() {
-  const screens = { loading, blocked, list, court, form };
+  const screens = { loading, blocked, list, court, form, tab, person };
   app.replaceChildren(...[].concat(screens[state.screen]()).flat(Infinity).filter(Boolean));
   window.scrollTo(0, 0);
 }
@@ -325,10 +348,22 @@ function courtRow(court, admin) {
     slotControl(court));
 }
 
+// Courts and the tab are the two roots; the switch under the header moves
+// between them without stacking either on the back trail.
+function sections(current) {
+  const option = (key, label, open) => h('button', {
+    class: current === key ? 'on' : '', 'aria-pressed': current === key ? 'true' : 'false',
+    onclick: () => { if (current !== key) { trail = []; open(false); } },
+  }, label);
+  return h('div', { class: 'seg', role: 'group' },
+    option('list', '🎾 Courts', loadList), option('tab', '🧾 Tab', loadTab));
+}
+
 function list() {
   const { courts, admin } = state.data;
   return [
     header('Courts'),
+    sections('list'),
     courts.length
       ? h('div', { class: 'section' }, courts.map((court) => courtRow(court, admin)))
       : h('div', { class: 'empty' }, h('div', { class: 'big' }, '🎾'), 'Nothing booked yet.'),
@@ -477,6 +512,164 @@ function form() {
   ];
 }
 
+// ---- The tab
+function money(cents) {
+  return `$${(Math.abs(cents) / 100).toFixed(2)}`;
+}
+
+function balanceCard(balance, subject, owner) {
+  const you = subject === 'You';
+  const [what, tone] = balance > 0
+    ? [`${subject} ${you ? 'owe' : 'owes'} ${owner}`, 'owes']
+    : balance < 0 ? [`${subject} ${you ? 'are' : 'is'} in credit`, 'credit']
+      : [`${subject} ${you ? 'are' : 'is'} all settled`, 'settled'];
+  return h('div', { class: `card ${tone}` },
+    h('div', { class: 'big' }, money(balance)),
+    h('div', { class: 'what' }, what));
+}
+
+function amountCell(cents) {
+  return h('span', { class: cents < 0 ? 'amount credit' : 'amount' },
+    `${cents < 0 ? '−' : ''}${money(cents)}`);
+}
+
+// Each line as the chat's breakdown has it, so the two never disagree: what it
+// was, when, and the amount, with anything older carried as one total.
+function history(story, { undo = null } = {}) {
+  const rows = [];
+  if (story.earlier) {
+    const count = `${story.earlier.entries} ${story.earlier.entries === 1 ? 'entry' : 'entries'}`;
+    rows.push(h('div', { class: 'row' },
+      h('div', { class: 'main' },
+        h('div', null, story.earlier.cents ? 'Carried from earlier' : 'Earlier history'),
+        h('div', { class: 'meta' }, story.earlier.cents ? count : `${count} · settled`)),
+      story.earlier.cents ? amountCell(story.earlier.cents) : null));
+  }
+  for (const line of story.lines) {
+    rows.push(h('div', { class: 'row' },
+      h('div', { class: 'main' },
+        h('div', { class: 'wrap' }, line.label),
+        // Courts and /debt charges already name their day.
+        line.label.includes(line.date) ? null : h('div', { class: 'meta' }, line.date)),
+      amountCell(line.cents),
+      undo && line.undoable ? h('button', {
+        class: 'icon-btn', 'aria-label': `Undo ${line.label}`,
+        onclick: (event) => undo(event.currentTarget, line),
+      }, 'Undo') : null));
+  }
+  if (!rows.length) rows.push(h('div', { class: 'row meta' }, 'Nothing here yet.'));
+  return h('div', { class: 'section' }, rows);
+}
+
+function tab() {
+  const { me, people, admin, owner } = state.data;
+  return [
+    header('Tab'),
+    sections('tab'),
+    balanceCard(me.balance, 'You', owner),
+    h('div', { class: 'label' }, 'Your history'),
+    history(me),
+    h('div', { class: 'note' }, 'Courts are $6/hour from 6pm, on weekends and on public holidays, '
+      + '$3/hour otherwise, split across everyone who played.'),
+    admin ? [
+      h('div', { class: 'label' }, 'Everyone'),
+      people.length
+        ? h('div', { class: 'section' }, people.map((entry) => h('button', {
+          class: 'row', onclick: () => openPerson(entry.slug),
+        },
+        h('div', { class: 'main' }, h('div', null, entry.name)),
+        h('span', { class: entry.balance < 0 ? 'amount credit' : 'amount' },
+          entry.balance > 0 ? `owes ${money(entry.balance)}`
+            : entry.balance < 0 ? `${money(entry.balance)} credit` : 'settled'),
+        h('span', { class: 'chev', 'aria-hidden': 'true' }, '›'))))
+        : h('div', { class: 'section' }, h('div', { class: 'row meta' }, 'Nobody owes anything.')),
+    ] : null,
+  ];
+}
+
+function wholeBalance(p) {
+  return p.balance > 0 ? (p.balance / 100).toFixed(2) : '';
+}
+
+function person() {
+  const p = state.person;
+  const amount = state.amount ?? wholeBalance(p);
+  return [
+    header(p.name),
+    balanceCard(p.balance, p.name, state.owner || 'the organiser'),
+    h('div', { class: 'label' }, 'Record a payment'),
+    h('div', { class: 'section' },
+      h('div', { class: 'field' },
+        h('label', { for: 'amount' }, 'Amount ($)'),
+        h('input', {
+          id: 'amount', type: 'text', inputMode: 'decimal', value: amount, placeholder: '0.00',
+          autocomplete: 'off', oninput: (event) => { state.amount = event.target.value; },
+        })),
+      p.balance > 0 && amount !== wholeBalance(p) ? h('button', {
+        class: 'row link', onclick: () => { state.amount = wholeBalance(p); render(); },
+      }, `Use the whole balance · ${money(p.balance)}`) : null),
+    h('div', { class: 'note' }, 'Less than they owe leaves the rest on their tab; more leaves '
+      + 'them in credit. They are sent a receipt.'),
+    h('button', { class: 'primary', onclick: (event) => pay(event.currentTarget) }, '💵 Record payment'),
+    h('div', { class: 'label' }, 'History'),
+    history(p, { undo: undoLine }),
+    h('div', { class: 'note' }, 'Payments and /debt entries can be undone for a week.'),
+  ];
+}
+
+async function loadTab(push = true) {
+  const result = await run(null, () => api('GET', 'tab'));
+  if (!result || blockedBy(result)) return;
+  go('tab', { data: result }, push);
+}
+
+async function openPerson(slug, push = true) {
+  const result = await run(null, () => api('GET', `tab/person/${encodeURIComponent(slug)}`));
+  if (!result || blockedBy(result)) return;
+  if (!result.ok) {
+    toast(result.message, 'error');
+    return;
+  }
+  const listed = trail.concat(state).find((entry) => entry.screen === 'tab');
+  go('person', { person: result.person, owner: listed && listed.data.owner, amount: null }, push);
+}
+
+// Every tab action answers with the person as they now stand.
+function personResult(result) {
+  if (!result.person) return;
+  state.person = result.person;
+  state.amount = null;
+  render();
+}
+
+async function pay(button) {
+  const p = state.person;
+  const raw = String(state.amount ?? wholeBalance(p)).replace(/[$,\s]/g, '');
+  const cents = Math.round(Number(raw) * 100);
+  if (!raw || !Number.isFinite(cents) || cents <= 0) {
+    toast('Enter the amount they paid.', 'error');
+    return;
+  }
+  const after = p.balance - cents;
+  const leaves = after > 0 ? `They will owe ${money(after)}.`
+    : after < 0 ? `They will be ${money(after)} in credit.` : 'Their tab will be settled.';
+  if (!(await confirmAction(`Record ${money(cents)} from ${p.name}? ${leaves}`))) return;
+  const result = await run(button, () => api('POST',
+    `tab/person/${encodeURIComponent(p.slug)}/pay`, { cents, expected: p.balance }));
+  if (!result || blockedBy(result)) return;
+  toast(result.message, result.ok ? 'success' : 'error');
+  personResult(result);
+}
+
+async function undoLine(button, line) {
+  const kind = line.cents < 0 ? 'payment' : 'entry';
+  if (!(await confirmAction(`Undo this ${kind} of ${money(line.cents)}?\n\n${line.label}`))) return;
+  const result = await run(button, () => api('POST', `tab/entry/${line.id}/undo`));
+  if (!result || blockedBy(result)) return;
+  toast(result.message, result.ok ? 'success' : 'error');
+  personResult(result);
+}
+
 // ---- Actions
 function blockedBy(result) {
   if (result.status === 401 || result.status === 403) {
@@ -595,6 +788,11 @@ async function start() {
   }
   const startParam = (inTelegram && tg.initDataUnsafe.start_param) || '';
   const courtId = (startParam.match(/_b(\d+)$/) || [])[1];
+  // The pinned tab's button opens on the tab; everything else on the courts.
+  if (/_tab$/.test(startParam) || new URLSearchParams(location.search).has('tab')) {
+    await loadTab(false);
+    return;
+  }
   await loadList(false);
   // A court link is the announcement's admin button. A member who taps it
   // gets the list, which is where their own Join is.
@@ -665,6 +863,7 @@ function previewApi(method, path, body) {
   if (method === 'GET' && path === 'courts') {
     return reply(listing());
   }
+  if (path.startsWith('tab')) return previewTab(method, path, body, admin, reply);
   const match = path.match(/^court\/(\d+)(?:\/(\w+))?$/);
   const c = match && sample.courts.find((entry) => entry.id === Number(match[1]));
   if (c && (match[2] === 'join' || match[2] === 'leave')) {
@@ -736,6 +935,58 @@ function previewApi(method, path, body) {
     sample.courts = sample.courts.filter((entry) => entry !== c);
     return reply({ ...listing(), message: 'Booking cancelled' });
   }
+  return reply({ ok: false, message: 'Not found.' });
+}
+
+// The tab's sample ledger: Alice owes for two courts, Jarhead paid part of his.
+let ledger;
+function previewTab(method, path, body, admin, reply) {
+  if (!ledger) {
+    let id = 1;
+    const row = (slug, name, cents, label, date, undoable = false) =>
+      ({ id: id++, slug, name, cents, label, date, undoable });
+    ledger = [
+      row('@alice', '@alice', 200, 'Court 4 · 14 Oct · 8pm–9pm · $6.00 ÷ 3', '14 Oct'),
+      row('@alice', '@alice', 433, 'Court 2 · 21 Oct · 7pm–9pm · $12.00 ÷ 3', '21 Oct'),
+      row('@jarhead', '@jarhead', 400, 'Court 2 · 21 Oct · 7pm–9pm · $12.00 ÷ 3 · for 2', '21 Oct'),
+      row('@jarhead', '@jarhead', -300, 'Paid · recorded by @nicholaswan', '23 Oct', true),
+      row('@nicholaswan', '@nicholaswan', 150, 'Ball replaced · by @nicholaswan · 20 Oct', '20 Oct', true),
+    ];
+  }
+  const story = (slug) => {
+    const lines = ledger.filter((entry) => entry.slug === slug);
+    return {
+      balance: lines.reduce((sum, entry) => sum + entry.cents, 0), earlier: null,
+      lines: lines.map(({ id, label, date, cents, undoable }) => ({ id, label, date, cents, undoable })),
+    };
+  };
+  const person = (slug, extra = { ok: true }) => {
+    const lines = ledger.filter((entry) => entry.slug === slug);
+    return reply({ ...extra, person: { slug, name: lines[0] ? lines[0].name : slug, ...story(slug) } });
+  };
+  if (method === 'GET' && path === 'tab') {
+    const people = [...new Set(ledger.map((entry) => entry.slug))]
+      .map((slug) => ({ slug, name: slug, balance: story(slug).balance }))
+      .filter((entry) => entry.slug !== '@nicholaswan');
+    return reply({ ok: true, admin, owner: 'Nicholas', me: story('@nicholaswan'), people: admin ? people : [] });
+  }
+  const pay = path.match(/^tab\/person\/([^/]+)\/pay$/);
+  if (pay) {
+    const slug = decodeURIComponent(pay[1]);
+    const name = slug;
+    const balance = story(slug).balance;
+    ledger.push({ id: ledger.length + 10, slug, name, cents: -body.cents, date: '27 Oct', undoable: true,
+      label: body.cents === balance ? 'Cleared by @nicholaswan' : 'Paid · recorded by @nicholaswan' });
+    return person(slug, { ok: true, message: `$${(body.cents / 100).toFixed(2)} from ${name} recorded. They have a receipt.` });
+  }
+  const undo = path.match(/^tab\/entry\/(\d+)\/undo$/);
+  if (undo) {
+    const entry = ledger.find((line) => line.id === Number(undo[1]));
+    ledger = ledger.filter((line) => line !== entry);
+    return person(entry.slug, { ok: true, message: `Undone on ${entry.name}'s tab. They have been told.` });
+  }
+  const one = path.match(/^tab\/person\/([^/]+)$/);
+  if (one) return person(decodeURIComponent(one[1]));
   return reply({ ok: false, message: 'Not found.' });
 }
 
