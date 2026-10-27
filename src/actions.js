@@ -1,7 +1,7 @@
 import { notifyRemovedPlayer, notifyRosterOfChange, updateBoard } from './bookings.js';
 import {
-  adminAddPlayer, knownPlayers, MAX_CAPACITY, ownerName, raiseCapacity, removeBookingPlayer,
-  toggleOwnerGuest, togglePlusOne,
+  adminAddPlayer, joinBooking, knownPlayers, leaveBooking, MAX_CAPACITY, ownerName,
+  raiseCapacity, removeBookingPlayer, toggleBooking, toggleOwnerGuest, togglePlusOne,
 } from './players.js';
 
 // The roster changes an admin makes from the Manage panels. Each one used to
@@ -129,4 +129,39 @@ export async function addSlot(env, chatId, bookingId) {
     status: 'raised', changed: true, alert: false,
     message: `This court now holds ${raised} players.`,
   };
+}
+
+// A member taking or giving up their own slot. The chat button answers its tap
+// between the move and the notices, so the two halves are separate: the move,
+// then whatever the caller does first, then settleSlotMove.
+const SLOT_REFUSALS = {
+  already: 'You are already on that court.',
+  'identity-conflict': 'That username is already tied to another player on this court. '
+    + 'Ask an admin to update the roster.',
+  absent: 'You were not on that court.',
+  full: 'That court is full. A group admin can open another slot.',
+  started: 'That court has already started, so the roster is locked.',
+  gone: 'That booking has already gone.',
+};
+
+export async function moveOwnSlot(env, chatId, bookingId, from, action) {
+  const move = { tap: toggleBooking, join: joinBooking, leave: leaveBooking }[action];
+  const result = await move(env, chatId, bookingId, from);
+  const moved = result.status === 'joined' || result.status === 'left';
+  return {
+    ...result,
+    changed: moved,
+    alert: !moved,
+    message: moved
+      ? (result.status === 'left' ? 'You are out. Your slot is free again.' : 'You are in.')
+      : SLOT_REFUSALS[result.status],
+  };
+}
+
+// Telling the court comes before the board: updateBoard throws when the pinned
+// message cannot be edited or re-pinned, and that must not swallow the one
+// notice the people on the court are waiting on.
+export async function settleSlotMove(env, chatId, result, from, options = {}) {
+  await notifyRosterOfChange(env, chatId, result.booking, from, result.status, 1, options);
+  await updateBoard(env, chatId);
 }

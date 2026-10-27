@@ -1,6 +1,7 @@
 import { compactTimeRange, courtName, formatCountdown, playerTags, shortDate } from './format.js';
 import { allowedChats, dataChatId } from './scope.js';
 import { DEFAULT_CAPACITY, rosterFor } from './players.js';
+import { miniAppLink } from './miniapp-link.js';
 import { getTimezone } from './settings.js';
 import { deleteMessage, editMessage, escapeHtml, sendMessage } from './telegram.js';
 
@@ -136,16 +137,20 @@ export async function syncAnnouncements(env, chatId, now = Date.now()) {
       // Who is already on it, so "should I join" can be answered from the
       // message itself. The booker stays off: the roster is the news.
       + `👥 ${playerTags(roster)}`;
-    // The keyboard is shared, so the admin row is drawn for everyone; the
-    // routes behind it refuse a member with a toast. Both open the same
-    // private pickers Manage reaches, one tap from the court in question
-    // rather than four taps in.
+    // The keyboard is shared, so the admin row is drawn for everyone; what is
+    // behind it refuses a member. With the Mini App registered it is one
+    // button that opens this court's screen over the chat, where seating and
+    // removing sit side by side. Without it, both open the same private
+    // pickers Manage reaches, one tap from the court rather than four taps in.
+    const app = miniAppLink(env, chatId, booking.id);
     const replyMarkup = { inline_keyboard: [
       [{ text: '🙋 Join', callback_data: `sb:join:${booking.id}` }],
-      [
-        { text: '➕ Admin: add', callback_data: `sb:addp:${booking.id}` },
-        { text: '➖ Admin: remove', callback_data: `sb:kick:${booking.id}` },
-      ],
+      app
+        ? [{ text: '⚙️ Admin: add / remove', url: app }]
+        : [
+          { text: '➕ Admin: add', callback_data: `sb:addp:${booking.id}` },
+          { text: '➖ Admin: remove', callback_data: `sb:kick:${booking.id}` },
+        ],
     ] };
     // What is stored is the whole rendering, keyboard included, so a change
     // to the buttons alone still reaches a message whose text is unchanged.

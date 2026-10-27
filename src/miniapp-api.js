@@ -1,4 +1,6 @@
-import { addSlot, flipOwnerGuest, flipPlusOne, kickPlayer, seatPlayer } from './actions.js';
+import {
+  addSlot, flipOwnerGuest, flipPlusOne, kickPlayer, moveOwnSlot, seatPlayer, settleSlotMove,
+} from './actions.js';
 import {
   addBooking, authorizeBookingChange, BookingConflictError, BOOKING_STARTED, cancelBooking,
   courtDetail, courtList, getTimezone, updateBooking,
@@ -6,14 +8,17 @@ import {
 import { courtName, compactTimeRange, shortDate } from './format.js';
 import { verifyInitData } from './miniapp-auth.js';
 import { BookingParseError, bookingFromDraft, extractCourt } from './parser.js';
-import { isChatAdmin, knownPlayers, RosterCapacityError } from './players.js';
+import { rememberLedgerIdentity } from './ledger-identity.js';
+import { isChatAdmin, knownPlayers, rememberPlayer, RosterCapacityError } from './players.js';
 import { allowedChats } from './scope.js';
 
 // The Mini App's API. The page is only a drawing of these answers: who is
 // asking comes from Telegram's signature, which group from the launch link's
-// startapp value, and every call — reads included, since the rosters are what
-// the shared board deliberately leaves out — asks Telegram whether that
-// person is an admin there. Refusals the chat panels show as alerts come back
+// startapp value, and every call asks Telegram whether that person is an
+// admin there. Members get the court list and their own Join and Leave, as
+// the private 🙋 Join list gives them; everything else — reads included, since
+// the rosters are what the shared board deliberately leaves out — is for
+// admins. Refusals the chat panels show as alerts come back
 // as { ok: false, message } with a 200, so the page has one way to show them;
 // HTTP errors are kept for requests that should never have been made.
 
@@ -79,17 +84,35 @@ async function readBody(request) {
 
 // After a change the court is drawn again from the database, so the page
 // never has to guess what its own tap did.
-async function actionReply(env, chatId, bookingId, result) {
+async function actionReply(env, chatId, bookingId, result, user) {
   return json({
     ok: result.changed, message: result.message,
-    court: await courtDetail(env, chatId, bookingId),
+    court: await courtDetail(env, chatId, bookingId, user),
   });
 }
 
+// A member's own slot. The reply is the whole list again, since that is the
+// screen it was tapped on. The roster hears it as from the chat button; the
+// member's own copy is skipped, because the app has just said it on screen.
+async function slotReply(env, chatId, bookingId, user, admin, action) {
+  const result = await moveOwnSlot(env, chatId, bookingId, user, action);
+  if (result.changed) await settleSlotMove(env, chatId, result, user, { tellActor: false });
+  return json({
+    ok: result.changed, message: result.message,
+    ...(await courtList(env, chatId, { viewer: user, admin })),
+  });
+}
+
+// A route marked member is open to anyone in the group, as the private 🙋 Join
+// list is; every other one is refused to a member before its handler runs.
 const routes = [
-  ['GET', /^courts$/, async ({ env, chatId }) => json({ ok: true, ...(await courtList(env, chatId)) })],
-  ['GET', /^court\/(\d+)$/, async ({ env, chatId, match }) => {
-    const court = await courtDetail(env, chatId, Number(match[1]));
+  ['GET', /^courts$/, async ({ env, chatId, user, admin }) => json({
+    ok: true, ...(await courtList(env, chatId, { viewer: user, admin })),
+  }), { member: true }],
+  ['POST', /^court\/(\d+)\/(join|leave)$/, async ({ env, chatId, match, user, admin }) =>
+    slotReply(env, chatId, Number(match[1]), user, admin, match[2]), { member: true }],
+  ['GET', /^court\/(\d+)$/, async ({ env, chatId, match, user }) => {
+    const court = await courtDetail(env, chatId, Number(match[1]), user);
     return court
       ? json({ ok: true, court })
       : json({ ok: false, message: 'That booking has already gone.' });
@@ -99,21 +122,22 @@ const routes = [
     const result = await seatPlayer(
       env, chatId, Number(match[1]), String(body.slug || ''), heads, user.id
     );
-    return actionReply(env, chatId, Number(match[1]), result);
+    return actionReply(env, chatId, Number(match[1]), result, user);
   }],
-  ['POST', /^court\/(\d+)\/plus$/, async ({ env, chatId, match, body }) => actionReply(
+  ['POST', /^court\/(\d+)\/plus$/, async ({ env, chatId, match, body, user }) => actionReply(
     env, chatId, Number(match[1]),
-    await flipPlusOne(env, chatId, Number(match[1]), Number(body.player))
+    await flipPlusOne(env, chatId, Number(match[1]), Number(body.player)), user
   )],
   ['POST', /^court\/(\d+)\/guest$/, async ({ env, chatId, match, user }) => actionReply(
-    env, chatId, Number(match[1]), await flipOwnerGuest(env, chatId, Number(match[1]), user.id)
-  )],
-  ['POST', /^court\/(\d+)\/kick$/, async ({ env, chatId, match, body }) => actionReply(
     env, chatId, Number(match[1]),
-    await kickPlayer(env, chatId, Number(match[1]), Number(body.player))
+    await flipOwnerGuest(env, chatId, Number(match[1]), user.id), user
   )],
-  ['POST', /^court\/(\d+)\/capacity$/, async ({ env, chatId, match }) => actionReply(
-    env, chatId, Number(match[1]), await addSlot(env, chatId, Number(match[1]))
+  ['POST', /^court\/(\d+)\/kick$/, async ({ env, chatId, match, body, user }) => actionReply(
+    env, chatId, Number(match[1]),
+    await kickPlayer(env, chatId, Number(match[1]), Number(body.player)), user
+  )],
+  ['POST', /^court\/(\d+)\/capacity$/, async ({ env, chatId, match, user }) => actionReply(
+    env, chatId, Number(match[1]), await addSlot(env, chatId, Number(match[1])), user
   )],
   ['POST', /^court\/(\d+)\/edit$/, async ({ env, chatId, match, body, user, now }) => {
     const bookingId = Number(match[1]);
@@ -137,7 +161,8 @@ const routes = [
     };
     if (saved !== true) return json({ ok: false, message: refusals[String(saved)] });
     return json({
-      ok: true, message: '✅ Booking updated', court: await courtDetail(env, chatId, bookingId),
+      ok: true, message: '✅ Booking updated',
+      court: await courtDetail(env, chatId, bookingId, user),
     });
   }],
   ['POST', /^court\/(\d+)\/delete$/, async ({ env, chatId, match, user }) => {
@@ -170,7 +195,8 @@ const routes = [
       throw error;
     }
     return json({
-      ok: true, message: '✅ Booking added', court: await courtDetail(env, chatId, bookingId),
+      ok: true, message: '✅ Booking added',
+      court: await courtDetail(env, chatId, bookingId, user),
     });
   }],
 ];
@@ -182,15 +208,21 @@ export async function handleMiniAppApi(request, env, path, now = Date.now()) {
   if (!session) return json({ ok: false, message: 'Open this from the pinned court board.' }, 401);
   const chatId = chatFromStartParam(env, session.startParam);
   if (!chatId) return json({ ok: false, message: 'This link is not for a SquashBot group.' }, 403);
-  if (!(await isChatAdmin(env, chatId, session.user))) {
-    return json({ ok: false, admin: false, message: MANAGE_ADMIN }, 403);
-  }
-  for (const [method, pattern, handler] of routes) {
+  const { user } = session;
+  for (const [method, pattern, handler, { member = false } = {}] of routes) {
     const match = path.match(pattern);
     if (!match || request.method !== method) continue;
-    const body = method === 'POST' ? await readBody(request) : {};
+    const admin = await isChatAdmin(env, chatId, user);
+    if (!member && !admin) return json({ ok: false, admin: false, message: MANAGE_ADMIN }, 403);
     try {
-      return await handler({ env, chatId, match, body, user: session.user, now });
+      if (method === 'POST') {
+        // What a tap in the chat does before anything else: tie this account
+        // to the handle it was seeded under, so a write keys them as one person.
+        await rememberPlayer(env, user);
+        await rememberLedgerIdentity(env, chatId, user);
+      }
+      const body = method === 'POST' ? await readBody(request) : {};
+      return await handler({ env, chatId, match, body, user, admin, now });
     } catch (error) {
       if (error instanceof BookingParseError) return json({ ok: false, message: error.message });
       console.log(`Mini App ${method} ${path} failed: ${error.stack || error}`);
