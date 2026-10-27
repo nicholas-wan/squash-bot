@@ -215,7 +215,7 @@ describe('money tab', () => {
     }; } }; } };
     const markup = await settleMarkup({ ...env, DB: db }, -123);
     expect(markup.inline_keyboard[0][0]).toEqual({
-      text: '✅ @thadduu · $14.00', callback_data: 'tb:pay:@thadduu',
+      text: '💵 @thadduu · $14.00', callback_data: 'tb:pay:@thadduu',
     });
   });
 
@@ -460,6 +460,39 @@ describe('money tab', () => {
     expect(alice).toBeTruthy();
     expect(alice.text).toContain('@alice');
     expect(alice.text).toContain('$0.00');
+  });
+
+  it('carries anything cut off as one line, so the lines add up to the balance', () => {
+    const now = Date.now();
+    const day = 86400000;
+    // Paid off ten days ago; the two-week window reaches back past the zero to
+    // the payment and the charge before it, but not the one before that.
+    const rows = [
+      { amount_cents: 500, reason: 'Court 4 · old', created_at: now - 20 * day },
+      { amount_cents: 300, reason: 'Court 4 · recent', created_at: now - 12 * day },
+      { amount_cents: -800, reason: 'Cleared by Nick', created_at: now - 10 * day },
+      { amount_cents: 400, reason: 'Court 4 · this week', created_at: now - 2 * day },
+    ];
+    const lines = breakdownLines(env, rows, 'Asia/Singapore', { pricing: false });
+    expect(lines.join('\n')).toContain('Owed to Nicholas: <b>$4.00</b>');
+    expect(lines).toContain('• Carried from 1 entry before these — $5.00');
+    // $5 carried + $3 − $8 + $4 = $4: the story matches the balance.
+    expect(lines.join('\n')).toContain('Court 4 · recent — $3.00');
+  });
+
+  it('folds the oldest lines once a balance has run for months without hitting zero', () => {
+    // Round-dollar cash leaves a balance a few cents off zero for good; the
+    // breakdown must still fit one Telegram message.
+    const rows = [];
+    for (let week = 0; week < 100; week += 1) {
+      rows.push({ amount_cents: 433, reason: `Court 4 · week ${week}`, created_at: 0 });
+      if (week % 4 === 3) rows.push({ amount_cents: -1700, reason: 'Cleared by Nick', created_at: 0 });
+    }
+    const lines = breakdownLines(env, rows, 'Asia/Singapore');
+    expect(lines.filter((line) => line.startsWith('• Court') || line.startsWith('• Cleared')))
+      .toHaveLength(25);
+    expect(lines.some((line) => line.startsWith('• Carried from'))).toBe(true);
+    expect(lines.join('\n').length).toBeLessThan(2500);
   });
 
   it('keeps a breakdown with nothing settled complete', () => {

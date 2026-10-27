@@ -126,7 +126,14 @@ export function tabMarkup(balances) {
 // what, so the last two weeks stay visible even once they are settled. Two
 // weeks of one group's squash is bounded; a lifetime of it is not.
 const HISTORY_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
+// A balance only returns to exactly zero when somebody pays to the cent; cash
+// paid in round dollars never does, and the story since the last zero grew
+// without end. Past this many lines the oldest are folded into one.
+const MAX_SHOWN_ROWS = 25;
 
+// Whatever is cut off is carried as one line, so the lines shown always add
+// up to the balance above them — reaching back two weeks past a zero used to
+// show a payment without the charges it paid.
 function currentRows(rows, now = Date.now()) {
   let sum = 0;
   let lastZero = -1;
@@ -136,7 +143,9 @@ function currentRows(rows, now = Date.now()) {
   });
   let start = lastZero + 1;
   while (start > 0 && rows[start - 1].created_at > now - HISTORY_WINDOW_MS) start -= 1;
-  return { shown: rows.slice(start), settled: start };
+  start = Math.max(start, rows.length - MAX_SHOWN_ROWS);
+  const carried = rows.slice(0, start).reduce((total, row) => total + row.amount_cents, 0);
+  return { shown: rows.slice(start), settled: start, carried };
 }
 
 // The balance line and the story behind it, shared by every breakdown view.
@@ -151,10 +160,14 @@ export function breakdownLines(env, rows, tz, { pricing = true } = {}) {
     lines.push(balance < 0 ? `In credit: <b>${formatMoney(-balance)}</b>` : 'All settled.');
   }
   lines.push('');
-  const { shown, settled } = currentRows(rows);
-  if (settled) {
+  const { shown, settled, carried } = currentRows(rows);
+  const entries = `${settled} ${settled === 1 ? 'entry' : 'entries'}`;
+  if (settled && !carried) {
     lines.push(`Earlier history — ${settled} settled ${settled === 1 ? 'entry' : 'entries'} not shown.`);
     if (shown.length) lines.push('');
+  } else if (settled) {
+    lines.push(`• Carried from ${entries} before these — `
+      + `${carried < 0 ? '−' : ''}${formatMoney(Math.abs(carried))}`);
   }
   for (const row of shown) {
     // Charges carry their date in the reason; a payment's reason only names
@@ -331,7 +344,8 @@ export async function updateTab(env, chatId) {
 export async function settleMarkup(env, chatId) {
   const balances = await tabBalances(env, chatId);
   const rows = settleable(balances).map((entry) => [{
-    text: `✅ ${entry.name} · ${formatMoney(entry.balance)}`,
+    // 💵 rather than ✅: a tick next to a name read as "already paid".
+    text: `💵 ${entry.name} · ${formatMoney(entry.balance)}`,
     callback_data: `tb:pay:${settleKey(entry.slug)}`,
   }]);
   rows.push([{ text: '← Done', callback_data: 'tb:back' }]);

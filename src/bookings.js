@@ -139,7 +139,7 @@ export async function addBooking(
   const preReminderAt = parsed.startsAt - 2 * 60 * 60 * 1000;
   // A court booked inside its own reminder windows is not news to anyone, so
   // both flags start spent rather than firing on the next cron tick.
-  const preReminderSent = preReminderAt <= now ? 1 : 0;
+  const preReminderSent = parsed.skipPreReminder || preReminderAt <= now ? 1 : 0;
   const reminderSent = parsed.reminderAt <= now ? 1 : 0;
   const capacity = defaultCapacity(env);
   const result = await env.DB.prepare(
@@ -215,11 +215,21 @@ export async function addBooking(
 }
 
 export async function updateBooking(
-  env, chatId, id, parsed, from, sourceText = null, { allowConflict = false } = {}
+  env, chatId, id, parsed, from, sourceText = null, { allowConflict = false, expected = null } = {}
 ) {
   const before = await env.DB.prepare('SELECT * FROM bookings WHERE id = ? AND chat_id = ?')
     .bind(id, dataChatId(env, chatId)).first();
   if (!before) return false;
+  // A form saves the whole booking, not just the field it was opened for, so
+  // one left open while somebody else moved the court would quietly move it
+  // back. It carries what the court held when it opened; anything different
+  // now means it is out of date.
+  if (expected && (Number(expected.startsAt) !== before.starts_at
+    || Number(expected.endsAt) !== before.ends_at
+    || String(expected.court) !== String(before.court))) return 'changed';
+  // Saved as it already was: nothing to write, and nothing to tell the court.
+  if (String(parsed.court) === String(before.court) && parsed.startsAt === before.starts_at
+    && parsed.endsAt === before.ends_at) return true;
   const now = Date.now();
   // A stale form must not move a court after it has finished. In particular,
   // an admin can open an edit during play and leave it on screen past the end;
@@ -247,7 +257,8 @@ export async function updateBooking(
   ).bind(
     parsed.court, parsed.startsAt, parsed.endsAt, parsed.reminderAt,
     parsed.reminderAt <= now ? 1 : 0, preReminderAt,
-    preReminderAt <= now ? 1 : 0, id, dataChatId(env, chatId), now, allowConflict ? 1 : 0,
+    parsed.skipPreReminder || preReminderAt <= now ? 1 : 0, id, dataChatId(env, chatId), now,
+    allowConflict ? 1 : 0,
     dataChatId(env, chatId), parsed.court, parsed.endsAt, parsed.startsAt, id
   );
   const resetReminders = env.DB.prepare(
@@ -258,7 +269,7 @@ export async function updateBooking(
          AND starts_at = ? AND ends_at = ? AND reminder_at = ?
      )`
   ).bind(
-    parsed.reminderAt <= now ? 1 : 0, preReminderAt <= now ? 1 : 0,
+    parsed.reminderAt <= now ? 1 : 0, parsed.skipPreReminder || preReminderAt <= now ? 1 : 0,
     id, id, dataChatId(env, chatId), String(parsed.court),
     parsed.startsAt, parsed.endsAt, parsed.reminderAt
   );
@@ -320,6 +331,9 @@ const BOOKING_GONE = 'That booking has already gone.';
 // a court nobody could get into is theirs to sort out.
 export const BOOKING_STARTED =
   'That court has already started, so only a group admin can change it.';
+
+export const BOOKING_CHANGED =
+  'Somebody changed this booking while you had it open. Open it again to see the latest.';
 
 // Booking ids are small sequential numbers, so without this any member could
 // walk the whole group's history away. One rule for /cancel and for every button
@@ -701,7 +715,13 @@ export async function managerView(env, chatId, now = Date.now()) {
 // Mini App: it draws its own screens, so it needs facts rather than keyboards.
 // Labels are formatted here, in the group's timezone, so the page never has to
 // know what that timezone is.
-function courtSummary(booking, roster, tz, now, viewer = null) {
+const pad = (value) => String(value).padStart(2, '0');
+const isoDate = ({ y, mo, d }) => `${y}-${pad(mo)}-${pad(d)}`;
+const isoClock = ({ h, mi }) => `${pad(h)}:${pad(mi)}`;
+
+function courtSummary(env, booking, roster, tz, now, viewer = null) {
+  const start = localParts(booking.starts_at, tz);
+  const end = localParts(booking.ends_at, tz);
   return {
     id: booking.id,
     court: courtName(booking),
@@ -712,15 +732,22 @@ function courtSummary(booking, roster, tz, now, viewer = null) {
     free: Boolean(booking.free),
     started: booking.starts_at <= now,
     mine: Boolean(viewer) && roster.some((player) => matchesPlayer(player, viewer)),
+    // Whoever booked a court may change or cancel it, as /cancel and the chat
+    // buttons let them; authorizeBookingChange still decides on the server.
+    booker: Boolean(viewer && booking.created_by_user_id)
+      && Number(booking.created_by_user_id) === Number(viewer.id),
     players: roster.map((player) => ({
       id: player.id, name: player.name, heads: playerHeads(player),
+      unbilled: isHouseholdPlayer(env, player),
     })),
+    // The edit form's starting values, and what a save checks the court
+    // still holds, so a form left open cannot undo somebody else's change.
+    edit: {
+      date: isoDate(start), start: isoClock(start), end: isoClock(end), court: String(booking.court),
+    },
+    stamp: { startsAt: booking.starts_at, endsAt: booking.ends_at, court: String(booking.court) },
   };
 }
-
-const pad = (value) => String(value).padStart(2, '0');
-const isoDate = ({ y, mo, d }) => `${y}-${pad(mo)}-${pad(d)}`;
-const isoClock = ({ h, mi }) => `${pad(h)}:${pad(mi)}`;
 
 // Members get what the 🙋 Join list gives them: courts still to come, and the
 // names only on the courts they are on. An admin sees every court, in play
@@ -733,7 +760,7 @@ export async function courtList(env, chatId, { viewer = null, admin = false } = 
   const bookings = admin ? active : active.filter((booking) => booking.starts_at > now);
   const rosters = await rostersFor(env, chatId, bookings.map((booking) => booking.id));
   const courts = bookings.map((booking) =>
-    courtSummary(booking, rosters.get(booking.id) || [], tz, now, viewer));
+    courtSummary(env, booking, rosters.get(booking.id) || [], tz, now, viewer));
   if (!admin) for (const court of courts) if (!court.mine) court.players = [];
   return {
     admin,
@@ -752,10 +779,8 @@ export async function courtDetail(env, chatId, bookingId, viewer = null, now = D
   if (!booking) return null;
   const [roster, tz] = await Promise.all([rosterFor(env, bookingId), getTimezone(env, chatId)]);
   const { free, guest, candidates } = await seatOptions(env, chatId, booking, roster);
-  const start = localParts(booking.starts_at, tz);
-  const end = localParts(booking.ends_at, tz);
   return {
-    ...courtSummary(booking, roster, tz, now, viewer),
+    ...courtSummary(env, booking, roster, tz, now, viewer),
     bookedBy: booking.created_by_name || null,
     canRaise: (booking.capacity || DEFAULT_CAPACITY) < MAX_CAPACITY,
     seat: {
@@ -763,9 +788,6 @@ export async function courtDetail(env, chatId, bookingId, viewer = null, now = D
       host: ownerName(env),
       guest,
       candidates: candidates.map((player) => ({ slug: player.slug, name: player.name })),
-    },
-    edit: {
-      date: isoDate(start), start: isoClock(start), end: isoClock(end), court: String(booking.court),
     },
   };
 }
@@ -933,7 +955,8 @@ export async function plusOneView(env, chatId, bookingId) {
   const rows = roster.map((player) => [{
     text: playerHeads(player) > 1
       ? `➖ ${player.name} +1 — back to one share`
-      : `➕ ${player.name} — bring a friend, pays double`,
+      : `➕ ${player.name} — bring a friend, `
+        + `${isHouseholdPlayer(env, player) ? 'plays free' : 'pays double'}`,
     callback_data: `sb:plus:${bookingId}:${player.id}`,
   }]);
   rows.push([{ text: '← Back', callback_data: `sb:pick:${bookingId}` }, CLOSE_BUTTON]);
@@ -965,21 +988,34 @@ export async function removePlayerView(env, chatId, bookingId) {
 // they already have their toast. Used for the changes that have no join-shaped
 // wording: a cancelled court and a moved one. Dedup is by id, like
 // notifyRosterOfChange, and the cleanup rows land in one batch.
+//
+// A private message nobody tapped for is the kind Telegram drops for somebody
+// who is offline, and for these two that is how a person turns up at 9pm for
+// a court that moved to 8. Whoever the private copy did not reach — and anyone
+// seated by handle alone, who has no account to write to — is tagged in one
+// silent group message instead, which stays until the end of that day.
 async function notifyRosterDirectly(env, chatId, roster, html, deleteAfter, excludeUserId = null) {
   const told = new Set();
   const cleanups = [];
-  await Promise.all(roster.map((player) => {
-    if (!player.user_id || player.user_id === excludeUserId || told.has(player.user_id)) {
-      return null;
+  const missed = [];
+  await Promise.all(roster.map(async (player) => {
+    if (player.user_id && (player.user_id === excludeUserId || told.has(player.user_id))) return;
+    if (!player.user_id) {
+      missed.push(player);
+      return;
     }
     told.add(player.user_id);
-    return sendPrivately(env, chatId, html, player.user_id, deleteAfter,
+    const outcome = await sendPrivately(env, chatId, html, player.user_id, deleteAfter,
       { replyMarkup: OK_MARKUP, cleanups });
+    if (outcome !== 'private') missed.push(player);
   }));
   if (cleanups.length) {
     if (typeof env.DB.batch === 'function') await env.DB.batch(cleanups);
     else for (const statement of cleanups) await statement.run();
   }
+  if (!missed.length) return;
+  const sent = await sendMessage(env, chatId, `${html}\n${playerTags(missed)}`, { silent: true });
+  if (sent.ok && sent.result) await scheduleCleanup(env, chatId, sent.result, null, deleteAfter);
 }
 
 // The person taken off is told privately. Deliberately narrower than the
@@ -1135,8 +1171,11 @@ export async function restoreBoardButtons(env, chatId, messageId, now = Date.now
   return editReplyMarkup(env, chatId, messageId, boardButtons(env, chatId, bookings));
 }
 
+// A headline can depend on the court: the day's reminder for a morning court
+// goes out the evening before, and says so.
 function reminderHtml(booking, roster, headline, tz) {
-  return `🎾 <b>${escapeHtml(headline)}</b>\n` +
+  const text = typeof headline === 'function' ? headline(booking, tz) : headline;
+  return `🎾 <b>${escapeHtml(text)}</b>\n` +
     `${escapeHtml(courtName(booking))} · ${formatDate(booking.starts_at, tz)} · ` +
     `${compactTimeRange(booking.starts_at, booking.ends_at, tz)}` +
     (roster.length ? `\n👥 ${playerTags(roster)}` : '');
@@ -1292,13 +1331,17 @@ async function purgeFinishedMessages(env, now) {
 async function sendClaimedReminders(env, now, column, headline) {
   const scope = chatScope(env, 'b.chat_id');
   // Rosters are seeded with their flags unspent, so the booking-level flag is
-  // what suppresses a reminder for a court booked inside its own window.
+  // what suppresses a reminder for a court booked inside its own window. A
+  // player who joined after the reminder was due has their join confirmation
+  // and is skipped: otherwise somebody joining a 9pm court at 8:30 got "in 2
+  // hours" and "today" on top of it, both overdue, in the same minute.
   const { results } = await env.DB.prepare(
     `SELECT p.id AS player_row_id, p.user_id AS player_user_id, p.chat_id AS player_chat_id,
             b.*
      FROM booking_players AS p
      JOIN bookings AS b ON b.id = p.booking_id
      WHERE p.${column}_sent = 0 AND b.${column}_sent = 0
+       AND p.created_at <= b.${column}_at
        AND b.${column}_at <= ? AND b.starts_at > ?${scope.sql}
      ORDER BY b.${column}_at, p.id LIMIT 200`
   ).bind(now, now, ...scope.args).all();
@@ -1425,7 +1468,8 @@ async function sendReminders(env, now, column, headline) {
 }
 
 function sendDueReminders(env, now) {
-  return sendReminders(env, now, 'reminder', 'Squash today!');
+  return sendReminders(env, now, 'reminder', (booking, tz) =>
+    (isSameLocalDay(now, booking.starts_at, tz) ? 'Squash today!' : 'Squash tomorrow!'));
 }
 
 function sendPreReminders(env, now) {
@@ -1471,7 +1515,12 @@ async function removeExpiredBookings(env, now) {
       failures += 1;
       console.log(`Board refresh for chat ${chatId} failed: ${error.stack || error}`);
     }
-    if (!charged) continue;
+    // Not only when this pass wrote a charge: a pass that wrote one and then
+    // failed before counting it leaves the retry with nothing new to write,
+    // and the pinned tab used to stay without those charges. Any court that
+    // could have billed somebody redraws it; the edit is a no-op when nothing
+    // changed.
+    if (!charged && !expired.some((row) => row.chat_id === chatId && !row.free)) continue;
     try {
       await updateTab(env, chatId);
     } catch (error) {

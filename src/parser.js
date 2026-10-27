@@ -432,13 +432,23 @@ export function bookingFromDraft(draft, nowMs = Date.now(), tz = 'Asia/Singapore
   } else if (startMinutes + 60 > CLOSE_HOUR * 60) {
     endsAt = zonedEpoch(y, mo, d, CLOSE_HOUR, 0, tz);
   }
-  const midnight = zonedEpoch(y, mo, d, 0, 0, tz);
-  // The morning-of reminder. Mid-morning rather than 8am, so it lands when
-  // people are awake and looking at their phone; a court earlier than 11am
-  // is reminded an hour before it instead, and never before its own midnight.
-  const tenAm = zonedEpoch(y, mo, d, 10, 0, tz);
-  const reminderAt = Math.max(midnight, Math.min(tenAm, startsAt - 60 * 60 * 1000));
-  return { court: String(draft.court), startsAt, endsAt, reminderAt };
+  // The day's reminder. Mid-morning rather than 8am, so it lands when people
+  // are awake and looking at their phone. A court before 11am cannot be
+  // reminded mid-morning, and an hour before it was 6am for a 7am court —
+  // asleep, and too late to plan around — so it is reminded at 8pm the
+  // evening before instead, and the reminder says tomorrow.
+  const HOUR = 60 * 60 * 1000;
+  const reminderAt = startMinutes < 11 * 60
+    ? zonedEpoch(y, mo, d, 20, 0, tz) - 24 * HOUR
+    : zonedEpoch(y, mo, d, 10, 0, tz);
+  // The two-hour reminder only earns its place when it says something the day's
+  // reminder did not: one that lands within two hours of it, or before 7am,
+  // is dropped. An 11am to 1pm court gets the 10am one alone; a 7am court the
+  // evening one alone.
+  const preReminderAt = startsAt - 2 * HOUR;
+  const skipPreReminder = preReminderAt - reminderAt < 2 * HOUR
+    || startMinutes - 120 < OPEN_HOUR * 60;
+  return { court: String(draft.court), startsAt, endsAt, reminderAt, skipPreReminder };
 }
 
 export function parseField(field, text, nowMs = Date.now(), tz = 'Asia/Singapore') {

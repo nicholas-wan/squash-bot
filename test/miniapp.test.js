@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import worker from '../src/index.js';
+import worker, { handleUpdate } from '../src/index.js';
 import { restoreBoardButtons } from '../src/bookings.js';
 import { miniAppLink } from '../src/miniapp-link.js';
 import { signInitData, verifyInitData } from '../src/miniapp-auth.js';
@@ -49,8 +49,8 @@ function futureDate(days = 3) {
   return parts;
 }
 
-function bookingDb(booking, { ran = [], conflict = null } = {}) {
-  const db = { prepare(sql) { return { bind() { return {
+function bookingDb(booking, { ran = [], conflict = null, bound = [] } = {}) {
+  const db = { prepare(sql) { return { bind(...args) { bound.push({ sql: sql.trim(), args }); return {
     async first() {
       if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
       if (sql.includes('SELECT * FROM bookings WHERE id')) return booking;
@@ -272,5 +272,112 @@ describe('The pinned board’s button', () => {
       const edit = requests.find((r) => r.url.endsWith('/editMessageReplyMarkup'));
       expect(edit.body.reply_markup.inline_keyboard).toEqual([[button]]);
     }
+  });
+});
+
+describe('Booking changes from the Mini App', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    clearAdminCache();
+  });
+
+  const member = (id) => initData({ user: JSON.stringify({ id, first_name: 'M' }) });
+  const form = () => ({ date: futureDate(), start: '20:00', end: '21:00', court: '4' });
+
+  it('lets a member add a booking, but not name another booker or make it free', async () => {
+    stubTelegram([], { member: 'member' });
+    const bound = [];
+    const response = await worker.fetch(
+      apiRequest('courts', await member(8), { ...form(), booker: '@bo', free: true }),
+      env(bookingDb(futureBooking(), { bound }))
+    );
+    const body = await response.json();
+    expect(body.ok).toBe(true);
+    // A member goes back to the list rather than to an admin's court screen.
+    expect(body.courts).toBeDefined();
+    expect(body.court).toBeUndefined();
+    const insert = bound.find((call) => call.sql.startsWith('INSERT INTO bookings'));
+    // created_by_user_id is the member, and free (the last column) is off.
+    expect(insert.args).toContain(8);
+    expect(insert.args).not.toContain(42);
+    expect(insert.args[13]).toBe(0);
+  });
+
+  it('lets whoever booked a court change it, and nobody else short of an admin', async () => {
+    stubTelegram([], { member: 'member' });
+    const booking = { ...futureBooking(), created_by_user_id: 8 };
+    const stranger = await worker.fetch(
+      apiRequest('court/3/edit', await member(7), form()), env(bookingDb(booking))
+    );
+    expect((await stranger.json()).message).toContain('or a group admin can edit');
+    const booker = await worker.fetch(
+      apiRequest('court/3/edit', await member(8), { ...form(), start: '19:00', end: '20:00' }),
+      env(bookingDb(booking))
+    );
+    expect((await booker.json()).ok).toBe(true);
+  });
+
+  it('refuses a save from a form opened before somebody else changed the court', async () => {
+    stubTelegram([]);
+    const booking = futureBooking();
+    const ran = [];
+    const response = await worker.fetch(
+      apiRequest('court/3/edit', await initData(), {
+        ...form(), start: '19:00', end: '20:00',
+        expected: { startsAt: booking.starts_at, endsAt: booking.ends_at, court: '2' },
+      }),
+      env(bookingDb(booking, { ran }))
+    );
+    const body = await response.json();
+    expect(body.ok).toBe(false);
+    expect(body.message).toContain('changed this booking while you had it open');
+    expect(ran.some((sql) => sql.startsWith('UPDATE bookings'))).toBe(false);
+  });
+
+  it('tags in the group whoever a cancellation could not reach privately', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      const body = JSON.parse(init.body);
+      requests.push({ url: String(url), body });
+      // Nick (7) is offline: his private copy is refused.
+      const refused = String(url).endsWith('/sendMessage') && body.receiver_user_id === 7;
+      return new Response(JSON.stringify(refused
+        ? { ok: false, description: 'Bad Request: message could not be delivered' }
+        : { ok: true, result: { message_id: 1, ephemeral_message_id: 12 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const response = await worker.fetch(
+      apiRequest('court/3/delete', await initData(), {}), env(bookingDb(futureBooking()))
+    );
+    expect((await response.json()).ok).toBe(true);
+    const group = requests.find((r) => r.url.endsWith('/sendMessage') && !r.body.receiver_user_id);
+    expect(group.body.text).toContain('Cancelled');
+    expect(group.body.text).toContain('tg://user?id=7');
+    expect(group.body.disable_notification).toBe(true);
+  });
+});
+
+describe('Settling the tab', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    clearAdminCache();
+  });
+
+  it('opens the settle list privately instead of taking over the pinned tab', async () => {
+    const requests = [];
+    stubTelegram(requests);
+    await handleUpdate(env(bookingDb(futureBooking())), {
+      callback_query: {
+        id: 'callback-1', data: 'tb:pay',
+        from: { id: 9, username: 'admin' },
+        message: { message_id: 60, chat: { id: CHAT } },
+      },
+    });
+    // The pinned tab's keyboard is everyone's; it is left alone.
+    expect(requests.some((r) => r.url.endsWith('/editMessageReplyMarkup'))).toBe(false);
+    const panel = requests.find((r) => r.url.endsWith('/sendMessage'));
+    expect(panel.body.receiver_user_id).toBe(9);
+    expect(panel.body.text).toContain('Settle the tab');
   });
 });

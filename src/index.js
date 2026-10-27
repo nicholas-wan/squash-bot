@@ -538,16 +538,28 @@ async function openTheirTab(env, callback, match) {
     view ? '' : 'Nothing on that tab any more.', !view);
 }
 
+// Settling used to swap the pinned tab's own keyboard for the settle list. That
+// keyboard is everyone's, so while an admin was in it nobody could open 🧾 My
+// tab — and if they walked away it stayed that way. It is a private panel now,
+// like Manage bookings. Done closes it; on a pinned tab still showing the old
+// list from before this change, Done puts the tab's buttons back.
+const SETTLE_HEADER = '💵 <b>Settle the tab</b>\n\nTap whoever has paid you. Only you can see this.';
+
+async function settlePanel(env, chatId) {
+  return { html: SETTLE_HEADER, replyMarkup: await settleMarkup(env, chatId) };
+}
+
 async function closeSettlePicker(env, callback) {
-  await updateTab(env, callback.message.chat.id);
+  if (callback.message.ephemeral_message_id) await dismissMessage(env, callback);
+  else await updateTab(env, callback.message.chat.id);
   await answerCallback(env, callback.id);
 }
 
 async function openSettlePicker(env, callback) {
   const chatId = callback.message.chat.id;
-  await editReplyMarkup(env, chatId, callback.message.message_id,
-    await settleMarkup(env, chatId));
-  await answerCallback(env, callback.id, 'Choose whose debt to clear');
+  await showPanel(env, callback, await settlePanel(env, chatId));
+  await answerCallback(env, callback.id,
+    callback.message.ephemeral_message_id ? '' : '💵 The settle list is below ⬇️');
 }
 
 async function settleTapped(env, callback, match) {
@@ -558,9 +570,7 @@ async function settleTapped(env, callback, match) {
   // and confirms that instead.
   if (settled && settled.stale) {
     const confirmation = await confirmSettleMarkup(env, chatId, match[2]);
-    if (confirmation) {
-      await editReplyMarkup(env, chatId, callback.message.message_id, confirmation.markup);
-    }
+    if (confirmation) await showSettleStep(env, callback, confirmation.markup);
     await answerCallback(env, callback.id,
       `${settled.name}'s balance is now ${formatMoney(settled.balance)}. `
       + 'Check the amount and confirm again.', true);
@@ -578,20 +588,39 @@ async function settleTapped(env, callback, match) {
       { replyMarkup: OK_MARKUP });
     if (receipt.status !== 'private') told = ' · they could not be told privately';
   }
+  // Back to the list, for whoever paid next.
+  if (callback.message.ephemeral_message_id) {
+    await showPanel(env, callback, await settlePanel(env, chatId));
+  }
   await answerCallback(env, callback.id,
     settled ? `${settled.name} cleared · ${formatMoney(settled.balance)}${told}`
       : 'That balance is already clear.', !settled);
+}
+
+// A step inside the settle panel. A tap from a pinned tab left showing the old
+// in-place list still edits that keyboard, so it can be finished or backed
+// out of; every new one is private.
+async function showSettleStep(env, callback, markup) {
+  if (callback.message.ephemeral_message_id) {
+    await showPanel(env, callback, { html: SETTLE_HEADER, replyMarkup: markup });
+  } else {
+    await editReplyMarkup(env, callback.message.chat.id, callback.message.message_id, markup);
+  }
 }
 
 async function confirmSettle(env, callback, match) {
   const chatId = callback.message.chat.id;
   const confirmation = await confirmSettleMarkup(env, chatId, match[1]);
   if (!confirmation) {
-    await updateTab(env, chatId);
+    if (callback.message.ephemeral_message_id) {
+      await showPanel(env, callback, await settlePanel(env, chatId));
+    } else {
+      await updateTab(env, chatId);
+    }
     await answerCallback(env, callback.id, 'That balance is already clear.', true);
     return;
   }
-  await editReplyMarkup(env, chatId, callback.message.message_id, confirmation.markup);
+  await showSettleStep(env, callback, confirmation.markup);
   await answerCallback(env, callback.id);
 }
 

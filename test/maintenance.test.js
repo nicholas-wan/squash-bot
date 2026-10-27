@@ -200,3 +200,46 @@ it('never charges the organiser\'s guest, only the members beside them', async (
     .map((row) => ({ ...row }));
   expect(charges).toEqual([{ slug: 'u5', amount_cents: 100 }]);
 });
+
+it('does not remind somebody who joined after the reminder was due', async () => {
+  // A court in an hour: its two-hour reminder was due an hour ago.
+  book(1, now + HOUR);
+  seat(1, 5);
+  db.prepare(`INSERT INTO booking_players (booking_id, chat_id, user_id, slug, name, created_at)
+    VALUES (1, -123, 6, 'u6', 'Late', ?)`).run(now - 10 * 60000);
+  reply = (method, body) => (method === 'sendMessage' && body.receiver_user_id
+    ? { ok: true, result: { ephemeral_message_id: 7 } } : null);
+  await runMaintenance(env, now);
+  const reminded = requests
+    .filter((request) => request.method === 'sendMessage' && String(request.text).includes('in 2 hours'))
+    .map((request) => request.receiver_user_id);
+  // The player seated yesterday is reminded; the one who joined ten minutes
+  // ago already has their join confirmation, and gets nothing overdue.
+  expect(reminded).toEqual([5]);
+});
+
+it('says tomorrow when a morning court is reminded the evening before', async () => {
+  // 8pm on the 10th, for a 7am court on the 11th.
+  const evening = now + 12 * HOUR;
+  vi.setSystemTime(evening);
+  book(1, evening + 11 * HOUR);
+  db.prepare('UPDATE bookings SET reminder_at = ?, reminder_sent = 0, pre_reminder_sent = 1')
+    .run(evening);
+  seat(1, 5);
+  await runMaintenance(env, evening);
+  const reminder = requests.find((request) => request.method === 'sendMessage'
+    && request.receiver_user_id === 5);
+  expect(reminder.text).toContain('Squash tomorrow!');
+});
+
+it('brings the pinned tab up to date when a retried charge has nothing new to write', async () => {
+  // The first pass wrote the charge and then failed before it counted it; on
+  // the retry the charge is already there, and the tab still has to show it.
+  book(1, now - 2 * HOUR);
+  seat(1, 5);
+  db.prepare(`INSERT INTO ledger (chat_id, slug, user_id, name, amount_cents, booking_id, reason, created_at)
+    VALUES (-123, 'u5', 5, 'Player', 600, 1, 'Court 4', ?)`).run(now - HOUR);
+  await runMaintenance(env, now);
+  expect(requests.some((request) => request.method === 'sendMessage'
+    && String(request.text).includes('Squash tab'))).toBe(true);
+});
