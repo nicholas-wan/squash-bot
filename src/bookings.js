@@ -15,6 +15,7 @@ import {
 import { breakdownLines, chargeBooking, tabBalances, updateTab } from './tab.js';
 import { formatDate, formatTime, localParts, zonedEpoch } from './time.js';
 import { queuePinnedRefresh } from './refresh-queue.js';
+import { miniAppLink } from './miniapp-link.js';
 import { maintainAnnouncements, syncAnnouncements } from './announcements.js';
 import {
   deleteEphemeralMessage, deleteMessage, editReplyMarkup, escapeHtml,
@@ -463,32 +464,13 @@ function slotsLabel(roster, capacity) {
 // per person, which a keyboard on a shared pinned message never can.
 function boardButtons(env, chatId, bookings) {
   if (!bookings.length) return { inline_keyboard: [] };
-  const row = [{ text: '🙋 Join', callback_data: 'sb:join' }];
-  const manage = manageLink(env, chatId);
-  if (manage) row.push({ text: '⚙️ Manage', url: manage });
-  return { inline_keyboard: [row] };
-}
-
-// Manage opens the Mini App over the chat, wherever the tapper is scrolled to:
-// a private panel can only ever arrive at the bottom of the chat, which from
-// the pinned board is the far end of it. A group cannot carry a web_app
-// button, but a direct link to the app can, and startapp tells the app which
-// group it was opened from — the launch data Telegram signs does not.
-// Members see the button too, since the keyboard is shared; the app refuses
-// them with the same words the chat panels use. Unset until the app is
-// registered with BotFather, and then the board is exactly as it was.
-export function manageLink(env, chatId) {
-  if (!env.MINI_APP_URL) return null;
-  let link;
-  try {
-    link = new URL(env.MINI_APP_URL);
-  } catch {
-    console.log(`MINI_APP_URL is not a URL: ${env.MINI_APP_URL}`);
-    return null;
-  }
-  link.searchParams.set('startapp', `g${chatId}`);
-  link.searchParams.set('mode', 'compact');
-  return link.toString();
+  // With the Mini App registered, its button replaces the private list: the
+  // list can only arrive at the bottom of the chat, which from the pinned
+  // board is the far end of it, while the app opens over the chat wherever
+  // the tapper is. Admins manage from inside it.
+  const app = miniAppLink(env, chatId);
+  if (app) return { inline_keyboard: [[{ text: '🙋 Join · ⚙️ Manage', url: app }]] };
+  return { inline_keyboard: [[{ text: '🙋 Join', callback_data: 'sb:join' }]] };
 }
 
 // A court's name on a button: as short as it can stay unambiguous, since a
@@ -719,7 +701,7 @@ export async function managerView(env, chatId, now = Date.now()) {
 // Mini App: it draws its own screens, so it needs facts rather than keyboards.
 // Labels are formatted here, in the group's timezone, so the page never has to
 // know what that timezone is.
-function courtSummary(booking, roster, tz, now) {
+function courtSummary(booking, roster, tz, now, viewer = null) {
   return {
     id: booking.id,
     court: courtName(booking),
@@ -729,6 +711,7 @@ function courtSummary(booking, roster, tz, now) {
     capacity: booking.capacity || DEFAULT_CAPACITY,
     free: Boolean(booking.free),
     started: booking.starts_at <= now,
+    mine: Boolean(viewer) && roster.some((player) => matchesPlayer(player, viewer)),
     players: roster.map((player) => ({
       id: player.id, name: player.name, heads: playerHeads(player),
     })),
@@ -739,14 +722,22 @@ const pad = (value) => String(value).padStart(2, '0');
 const isoDate = ({ y, mo, d }) => `${y}-${pad(mo)}-${pad(d)}`;
 const isoClock = ({ h, mi }) => `${pad(h)}:${pad(mi)}`;
 
-export async function courtList(env, chatId, now = Date.now()) {
-  const [bookings, tz, known] = await Promise.all([
-    activeBookings(env, chatId, now), getTimezone(env, chatId), knownPlayers(env, chatId),
+// Members get what the 🙋 Join list gives them: courts still to come, and the
+// names only on the courts they are on. An admin sees every court, in play
+// too, with every roster, and who can be named as a booker.
+export async function courtList(env, chatId, { viewer = null, admin = false } = {}, now = Date.now()) {
+  const [active, tz, known] = await Promise.all([
+    activeBookings(env, chatId, now), getTimezone(env, chatId),
+    admin ? knownPlayers(env, chatId) : [],
   ]);
+  const bookings = admin ? active : active.filter((booking) => booking.starts_at > now);
   const rosters = await rostersFor(env, chatId, bookings.map((booking) => booking.id));
+  const courts = bookings.map((booking) =>
+    courtSummary(booking, rosters.get(booking.id) || [], tz, now, viewer));
+  if (!admin) for (const court of courts) if (!court.mine) court.players = [];
   return {
-    courts: bookings.map((booking) =>
-      courtSummary(booking, rosters.get(booking.id) || [], tz, now)),
+    admin,
+    courts,
     // For the add form: the earliest date it can offer, and who can be
     // recorded as the booker.
     today: isoDate(localParts(now, tz)),
@@ -756,7 +747,7 @@ export async function courtList(env, chatId, now = Date.now()) {
   };
 }
 
-export async function courtDetail(env, chatId, bookingId, now = Date.now()) {
+export async function courtDetail(env, chatId, bookingId, viewer = null, now = Date.now()) {
   const booking = await openBooking(env, chatId, bookingId);
   if (!booking) return null;
   const [roster, tz] = await Promise.all([rosterFor(env, bookingId), getTimezone(env, chatId)]);
@@ -764,7 +755,7 @@ export async function courtDetail(env, chatId, bookingId, now = Date.now()) {
   const start = localParts(booking.starts_at, tz);
   const end = localParts(booking.ends_at, tz);
   return {
-    ...courtSummary(booking, roster, tz, now),
+    ...courtSummary(booking, roster, tz, now, viewer),
     bookedBy: booking.created_by_name || null,
     canRaise: (booking.capacity || DEFAULT_CAPACITY) < MAX_CAPACITY,
     seat: {
@@ -1022,7 +1013,8 @@ export async function notifyRemovedPlayer(env, chatId, player, booking) {
 // the roster because that would rest on the seated player resolving to the same
 // slug their row was written under, which is exactly what rememberPlayer moves.
 export async function notifyRosterOfChange(
-  env, chatId, booking, from, action, heads = 1, { callbackQueryId = null } = {}
+  env, chatId, booking, from, action, heads = 1,
+  { callbackQueryId = null, tellActor = true } = {}
 ) {
   // Loud, not lenient: an unrecognised action falling through to one of the
   // messages would announce something that did not happen. 'added' is an
@@ -1074,8 +1066,10 @@ export async function notifyRosterOfChange(
   // being merged, and two copies of this would be a bug.
   const told = new Set();
   const sends = [];
-  if (actor.userId) {
-    told.add(actor.userId);
+  // The Mini App says it on screen instead: a private message sent with no
+  // tap behind it is the kind Telegram can turn into a public one.
+  if (actor.userId) told.add(actor.userId);
+  if (actor.userId && tellActor) {
     sends.push({
       isActor: true, userId: actor.userId, html: toActor, callbackQueryId,
     });

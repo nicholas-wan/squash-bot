@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index.js';
-import { manageLink, restoreBoardButtons } from '../src/bookings.js';
+import { restoreBoardButtons } from '../src/bookings.js';
+import { miniAppLink } from '../src/miniapp-link.js';
 import { signInitData, verifyInitData } from '../src/miniapp-auth.js';
 import { clearAdminCache } from '../src/players.js';
 
@@ -126,21 +127,58 @@ describe('Mini App API', () => {
     expect(response.status).toBe(403);
   });
 
-  it('refuses a member with the same words as the chat panels', async () => {
-    const requests = [];
-    stubTelegram(requests, { member: 'member' });
+  it('shows a member the courts, with names only where they play', async () => {
+    stubTelegram([], { member: 'member' });
+    const listed = async (userId) => (await (await worker.fetch(
+      apiRequest('courts', await initData({ user: JSON.stringify({ id: userId, first_name: 'X' }) })),
+      env(bookingDb(futureBooking()))
+    )).json());
+    // Nick (7) is on the court and sees who with; Sam (8) is not and does not.
+    const nick = await listed(7);
+    expect(nick.admin).toBe(false);
+    expect(nick.courts[0]).toMatchObject({ mine: true, heads: 1, capacity: 3 });
+    expect(nick.courts[0].players.map((player) => player.name)).toEqual(['Nick']);
+    expect(nick.players).toEqual([]);
+    const sam = await listed(8);
+    expect(sam.courts[0]).toMatchObject({ mine: false, players: [] });
+  });
+
+  it('refuses a member anything past their own slot, with the chat panel’s words', async () => {
+    stubTelegram([], { member: 'member' });
     const auth = await initData({ user: JSON.stringify({ id: 7, first_name: 'Nick' }) });
-    const response = await worker.fetch(apiRequest('courts', auth), env(bookingDb(futureBooking())));
-    expect(response.status).toBe(403);
-    expect((await response.json()).message).toBe('Only group admins can manage bookings.');
-    // A write is refused before it touches anything.
     const ran = [];
-    const write = await worker.fetch(
-      apiRequest('court/3/seat', auth, { slug: '@bo', heads: 1 }),
+    for (const [path, body] of [['court/3', null], ['court/3/seat', { slug: '@bo', heads: 1 }]]) {
+      const response = await worker.fetch(
+        apiRequest(path, auth, body), env(bookingDb(futureBooking(), { ran }))
+      );
+      expect(response.status).toBe(403);
+      expect((await response.json()).message).toBe('Only group admins can manage bookings.');
+    }
+    // Refused before it touches anything.
+    expect(ran).toHaveLength(0);
+  });
+
+  it('lets a member join, tells the court, and redraws the board', async () => {
+    const requests = [];
+    const ran = [];
+    stubTelegram(requests, { member: 'member' });
+    const response = await worker.fetch(
+      apiRequest('court/3/join',
+        await initData({ user: JSON.stringify({ id: 8, username: 'sam', first_name: 'Sam' }) }), {}),
       env(bookingDb(futureBooking(), { ran }))
     );
-    expect(write.status).toBe(403);
-    expect(ran).toHaveLength(0);
+    const body = await response.json();
+    expect(body.ok).toBe(true);
+    expect(body.message).toBe('You are in.');
+    expect(body.courts).toHaveLength(1);
+    expect(ran.some((sql) => sql.startsWith('INSERT OR IGNORE INTO booking_players'))).toBe(true);
+    const sent = requests.filter((r) => r.url.endsWith('/sendMessage'));
+    // Nick, already on it, hears; Sam has the app's own toast instead of a
+    // private message nothing was tapped to receive.
+    expect(sent.find((r) => r.body.receiver_user_id === 7).body.text).toContain('joined');
+    expect(sent.some((r) => r.body.receiver_user_id === 8)).toBe(false);
+    expect(requests.some((r) => r.url.endsWith('/editMessageText') && r.body.message_id === 55))
+      .toBe(true);
   });
 
   it('lists the courts for an admin', async () => {
@@ -208,24 +246,31 @@ describe('Mini App API', () => {
   });
 });
 
-describe('Manage button on the pinned board', () => {
+describe('The pinned board’s button', () => {
   afterEach(() => vi.unstubAllGlobals());
 
-  it('links to the Mini App for this group, compact, only once one is registered', async () => {
-    expect(manageLink({}, CHAT)).toBeNull();
-    const link = new URL(manageLink({ MINI_APP_URL: 'https://t.me/squash_book_bot/manage' }, CHAT));
+  it('links to the Mini App for this group, compact, and to one court when asked', () => {
+    expect(miniAppLink({}, CHAT)).toBeNull();
+    const app = { MINI_APP_URL: 'https://t.me/squash_book_bot/manage' };
+    const link = new URL(miniAppLink(app, CHAT));
     expect(link.searchParams.get('startapp')).toBe(`g${CHAT}`);
     expect(link.searchParams.get('mode')).toBe('compact');
+    expect(new URL(miniAppLink(app, CHAT, 3)).searchParams.get('startapp')).toBe(`g${CHAT}_b3`);
+  });
 
-    for (const [extra, labels] of [
-      [{}, ['🙋 Join']],
-      [{ MINI_APP_URL: 'https://t.me/squash_book_bot/manage' }, ['🙋 Join', '⚙️ Manage']],
+  it('opens the Mini App once one is registered, and the private list until then', async () => {
+    for (const [extra, button] of [
+      [{}, { text: '🙋 Join', callback_data: 'sb:join' }],
+      [{ MINI_APP_URL: 'https://t.me/squash_book_bot/manage' }, {
+        text: '🙋 Join · ⚙️ Manage',
+        url: `https://t.me/squash_book_bot/manage?startapp=g${CHAT}&mode=compact`,
+      }],
     ]) {
       const requests = [];
       stubTelegram(requests);
       await restoreBoardButtons(env(bookingDb(futureBooking()), extra), CHAT, 55);
       const edit = requests.find((r) => r.url.endsWith('/editMessageReplyMarkup'));
-      expect(edit.body.reply_markup.inline_keyboard.flat().map((b) => b.text)).toEqual(labels);
+      expect(edit.body.reply_markup.inline_keyboard).toEqual([[button]]);
     }
   });
 });

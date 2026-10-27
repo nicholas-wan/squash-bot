@@ -1,15 +1,17 @@
 import { runScheduledMaintenance } from './maintenance-schedule.js';
-import { addSlot, flipOwnerGuest, flipPlusOne, kickPlayer, seatPlayer } from './actions.js';
+import {
+  addSlot, flipOwnerGuest, flipPlusOne, kickPlayer, moveOwnSlot, seatPlayer, settleSlotMove,
+} from './actions.js';
 import { handleMiniAppApi } from './miniapp-api.js';
 import { rememberLedgerIdentity } from './ledger-identity.js';
 import {
   addPlayerView, authorizeBookingChange, bookingPanelView, cancelBooking, deletePanelView,
-  deliverSightedTabNotice, managerView, notifyRosterOfChange, plusOneView,
+  deliverSightedTabNotice, managerView, plusOneView,
   removePlayerView, restoreBoardButtons, runMaintenance, joinPickerView, updateBoard,
 } from './bookings.js';
 import {
   defaultCapacity, isChatAdmin, isHouseholdPlayer, isOwner, knownPlayers, ownerName,
-  rememberPlayer, joinBooking, leaveBooking, toggleBooking,
+  rememberPlayer,
 } from './players.js';
 import { looksLikeBooking } from './parser.js';
 import { allowedChats } from './scope.js';
@@ -276,46 +278,20 @@ async function fullCourtToast(env, callback) {
 
 async function moveSlot(env, callback, match) {
   const chatId = callback.message.chat.id;
-  const action = match[1];
-  const bookingId = Number(match[2]);
-  let result;
-  if (action === 'tap') result = await toggleBooking(env, chatId, bookingId, callback.from);
-  else if (action === 'join') result = await joinBooking(env, chatId, bookingId, callback.from);
-  else result = await leaveBooking(env, chatId, bookingId, callback.from);
-  const replies = {
-    already: ['You are already on that court.', true],
-    'identity-conflict': [
-      'That username is already tied to another player on this court. Ask an admin to update the roster.',
-      true,
-    ],
-    absent: ['You were not on that court.', true],
-    full: ['That court is full. A group admin can open another slot.', true],
-    started: ['That court has already started, so the roster is locked.', true],
-    gone: ['That booking has already gone.', true],
-  };
-  if (result.status === 'joined' || result.status === 'left') {
-    // The slot changed hands the moment the insert or delete ran, so the
-    // toast goes out first: it is the one piece of feedback that expires,
-    // and it used to wait behind the notification burst, the board edit,
-    // and the picker refresh — long enough for Telegram to discard it,
-    // which read as a tap that did nothing. The roster's private notices
-    // carry the fuller story; the toast only confirms the slot moved.
-    await answerCallback(env, callback.id, result.status === 'left'
-      ? 'You are out. Your slot is free again.' : 'You are in.');
-    // Telling the court still comes before the board: updateBoard throws
-    // when the pinned message cannot be edited or re-pinned, and the catch
-    // around this handler would then swallow the notification along with it
-    // — the people on the court would never hear, for a reason that has
-    // nothing to do with them.
-    await notifyRosterOfChange(
-      env, chatId, result.booking, callback.from, result.status, 1,
-      { callbackQueryId: callback.id }
-    );
-    await updateBoard(env, chatId);
-    await refreshJoinPicker(env, callback);
+  const result = await moveOwnSlot(env, chatId, Number(match[2]), callback.from, match[1]);
+  if (!result.changed) {
+    await answerCallback(env, callback.id, result.message, true);
     return;
   }
-  await answerCallback(env, callback.id, ...replies[result.status]);
+  // The slot changed hands the moment the insert or delete ran, so the
+  // toast goes out first: it is the one piece of feedback that expires,
+  // and it used to wait behind the notification burst, the board edit,
+  // and the picker refresh — long enough for Telegram to discard it,
+  // which read as a tap that did nothing. The roster's private notices
+  // carry the fuller story; the toast only confirms the slot moved.
+  await answerCallback(env, callback.id, result.message);
+  await settleSlotMove(env, chatId, result, callback.from, { callbackQueryId: callback.id });
+  await refreshJoinPicker(env, callback);
 }
 
 async function seatPickedPlayer(env, callback, match) {

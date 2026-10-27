@@ -73,6 +73,18 @@
   .tags { display: flex; flex-wrap: wrap; gap: 6px; margin: -4px 0 4px; }
   .tag { font-size: 13px; padding: 3px 9px; border-radius: 999px; background: var(--section); color: var(--hint); }
 
+  .row.court { padding-right: 12px; }
+  .main.open {
+    display: flex; align-items: center; gap: 8px; border: 0; background: none; padding: 0;
+    text-align: left; cursor: pointer;
+  }
+  .main.open .text { flex: 1; min-width: 0; }
+  .main.open .chev { color: var(--hint); font-size: 22px; line-height: 1; }
+  .slot {
+    flex: none; min-width: 72px; height: 34px; padding: 0 14px; border: 0; border-radius: 999px;
+    background: var(--accent); color: var(--accent-text); font-weight: 600; cursor: pointer;
+  }
+  .slot.leave { background: var(--separator); color: var(--text); }
   .icon-btn {
     flex: none; min-width: 40px; height: 32px; padding: 0 10px; border-radius: 8px; border: 0;
     background: var(--separator); cursor: pointer; font-size: 14px; font-weight: 600;
@@ -120,9 +132,10 @@
     position: fixed; left: 16px; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom));
     padding: 12px 14px; border-radius: var(--radius); font-size: 14px;
     background: rgba(30, 30, 34, 0.94); color: #fff; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
-    transform: translateY(140%); transition: transform 0.2s ease-out; z-index: 10;
+    transform: translateY(calc(100% + 40px)); visibility: hidden; z-index: 10;
+    transition: transform 0.2s ease-out, visibility 0s linear 0.2s;
   }
-  .toast.show { transform: none; }
+  .toast.show { transform: none; visibility: visible; transition: transform 0.2s ease-out; }
   .busy { opacity: 0.6; pointer-events: none; }
 </style>
 </head>
@@ -266,30 +279,58 @@ function blocked() {
   ];
 }
 
-function slotsPill(court) {
-  const room = court.capacity - court.heads;
-  return h('span', { class: room > 0 ? 'pill' : 'pill full' },
-    room > 0 ? `${room} left · ${court.heads}/${court.capacity}` : 'Full');
+function playerNames(players) {
+  return players.map((player) => (player.heads > 1 ? `${player.name} +1` : player.name)).join(', ');
 }
 
-function playerNames(players) {
-  return players.map((player) => (player.heads > 1 ? `${player.name} +1` : player.name)).join(', ')
-    || 'Nobody yet';
+// What the right of a court row offers the person looking at it: their own
+// slot first, since that is what most people open this for.
+function slotControl(court) {
+  const room = court.capacity - court.heads;
+  if (court.started) return h('span', { class: 'pill full' }, 'Playing');
+  if (court.mine) {
+    return h('button', {
+      class: 'slot leave', onclick: (event) => moveSlot(event.currentTarget, court, 'leave'),
+    }, 'Leave');
+  }
+  if (room > 0) {
+    return h('button', {
+      class: 'slot', onclick: (event) => moveSlot(event.currentTarget, court, 'join'),
+    }, 'Join');
+  }
+  return h('span', { class: 'pill full' }, 'Full');
+}
+
+function courtRow(court, admin) {
+  const room = court.capacity - court.heads;
+  const names = playerNames(court.players);
+  const text = [
+    h('div', { class: 'title' }, `${court.court} · ${court.date}`),
+    h('div', { class: 'meta' },
+      `${court.time} · ${room > 0 ? `${room} left` : 'full'} · ${court.heads}/${court.capacity}`),
+    names ? h('div', { class: 'meta' }, `👥 ${names}`) : null,
+  ];
+  // An admin opens the court to manage it; a member's row is only its slot.
+  return h('div', { class: 'row court' },
+    admin
+      ? h('button', { class: 'main open', onclick: () => openCourt(court.id) },
+        h('div', { class: 'text' }, text),
+        h('span', { class: 'chev', 'aria-hidden': 'true' }, '›'))
+      : h('div', { class: 'main' }, text),
+    slotControl(court));
 }
 
 function list() {
-  const { courts } = state.data;
+  const { courts, admin } = state.data;
   return [
-    header('Manage courts'),
+    header('Courts'),
     courts.length
-      ? h('div', { class: 'section' }, courts.map((court) =>
-        h('button', { class: 'row', onclick: () => openCourt(court.id) },
-          h('div', { class: 'main' },
-            h('div', { class: 'title' }, `${court.court} · ${court.date}`),
-            h('div', { class: 'meta' }, `${court.time} · ${playerNames(court.players)}`)),
-          slotsPill(court))))
+      ? h('div', { class: 'section' }, courts.map((court) => courtRow(court, admin)))
       : h('div', { class: 'empty' }, h('div', { class: 'big' }, '🎾'), 'Nothing booked yet.'),
-    h('button', { class: 'primary', onclick: () => openForm(null) }, '➕ Add booking'),
+    h('div', { class: 'note' }, admin
+      ? 'Tap a court to seat or remove players, or to change it.'
+      : 'You can see who is playing on the courts you are on.'),
+    admin ? h('button', { class: 'primary', onclick: () => openForm(null) }, '➕ Add booking') : null,
   ];
 }
 
@@ -465,6 +506,18 @@ async function act(button, action, body = {}) {
   }
 }
 
+// Join or Leave from the list. The reply is the list again, so the row shows
+// the slot exactly as the server now holds it.
+async function moveSlot(button, court, action) {
+  const result = await run(button, () => api('POST', `court/${court.id}/${action}`));
+  if (!result || blockedBy(result)) return;
+  toast(result.message, result.ok ? 'success' : 'error');
+  if (result.courts) {
+    state.data = result;
+    render();
+  }
+}
+
 async function remove(button) {
   const c = state.court;
   const warning = c.started ? '\n\nThis court is in progress. Deleting it means nobody is charged for it.' : '';
@@ -517,13 +570,15 @@ async function save(button, force) {
 async function start() {
   render();
   if (!inTelegram && !preview) {
-    go('blocked', { message: 'Open this from the ⚙️ Manage button on the pinned court board.' }, false);
+    go('blocked', { message: 'Open this from the 🙋 Join button on the pinned court board.' }, false);
     return;
   }
   const startParam = (inTelegram && tg.initDataUnsafe.start_param) || '';
   const courtId = (startParam.match(/_b(\d+)$/) || [])[1];
   await loadList(false);
-  if (courtId && state.screen === 'list') openCourt(Number(courtId));
+  // A court link is the announcement's admin button. A member who taps it
+  // gets the list, which is where their own Join is.
+  if (courtId && state.screen === 'list' && state.data.admin) openCourt(Number(courtId));
 }
 
 // ---- Preview data. Only ever used at localhost, outside Telegram.
@@ -547,18 +602,29 @@ function previewApi(method, path, body) {
           roster: [seat('@nicholaswan'), seat('@dodgerblueee')] },
         { id: 2, court: 'Court 2', date: 'Thu 30 Oct', time: '7–8:30pm', capacity: 4, free: true, started: false, bookedBy: '@jarhead',
           edit: { date: '2026-10-30', start: '19:00', end: '20:30', court: '2' },
-          roster: [seat('@jarhead', 2), seat('@nicholaswan'), seat('@alice')] },
+          roster: [seat('@jarhead', 2), seat('@alice')] },
         { id: 3, court: 'Court A', date: 'Sat 1 Nov', time: '9–10am', capacity: 3, free: false, started: false, bookedBy: '@nicholaswan',
           edit: { date: '2026-11-01', start: '09:00', end: '10:00', court: 'A' },
           roster: [seat('@nicholaswan')] },
       ],
     };
   }
+  // "?member" previews what a member sees; the viewer is always @nicholaswan.
+  const admin = !new URLSearchParams(location.search).has('member');
+  const me = '@nicholaswan';
   const heads = (roster) => roster.reduce((sum, player) => sum + player.heads, 0);
-  const summary = (c) => ({
-    id: c.id, court: c.court, date: c.date, time: c.time, heads: heads(c.roster), capacity: c.capacity,
-    free: c.free, started: c.started,
-    players: c.roster.map(({ id, name, heads: count }) => ({ id, name, heads: count })),
+  const summary = (c) => {
+    const mine = c.roster.some((player) => player.slug === me);
+    return {
+      id: c.id, court: c.court, date: c.date, time: c.time, heads: heads(c.roster), capacity: c.capacity,
+      free: c.free, started: c.started, mine,
+      players: admin || mine
+        ? c.roster.map(({ id, name, heads: count }) => ({ id, name, heads: count })) : [],
+    };
+  };
+  const listing = () => ({
+    ok: true, admin, courts: sample.courts.map(summary), today: '2026-10-27',
+    players: admin ? sample.players : [],
   });
   const detail = (c) => {
     const room = c.capacity - heads(c.roster);
@@ -576,10 +642,22 @@ function previewApi(method, path, body) {
   };
   const reply = (data) => new Promise((resolve) => setTimeout(() => resolve({ status: 200, ...data }), 150));
   if (method === 'GET' && path === 'courts') {
-    return reply({ ok: true, courts: sample.courts.map(summary), today: '2026-10-27', players: sample.players });
+    return reply(listing());
   }
   const match = path.match(/^court\/(\d+)(?:\/(\w+))?$/);
   const c = match && sample.courts.find((entry) => entry.id === Number(match[1]));
+  if (c && (match[2] === 'join' || match[2] === 'leave')) {
+    const mine = c.roster.find((player) => player.slug === me);
+    if (match[2] === 'join' && !mine && heads(c.roster) < c.capacity) {
+      c.roster.push(sample.seat(me));
+      return reply({ ...listing(), message: 'You are in.' });
+    }
+    if (match[2] === 'leave' && mine) {
+      c.roster = c.roster.filter((player) => player !== mine);
+      return reply({ ...listing(), message: 'You are out. Your slot is free again.' });
+    }
+    return reply({ ...listing(), ok: false, message: 'That court is full. A group admin can open another slot.' });
+  }
   if (method === 'POST' && path === 'courts') {
     const added = {
       id: sample.nextId++, court: `Court ${body.court || '?'}`, date: body.date, time: body.start,

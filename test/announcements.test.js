@@ -83,6 +83,19 @@ it('redraws the message when only its keyboard has changed', async () => {
   expect(requests.length).toBe(before);
 });
 
+it('sends admins straight to the court in the Mini App once one is registered', async () => {
+  seat(1);
+  env.MINI_APP_URL = 'https://t.me/squash_book_bot/manage';
+  await syncAnnouncements(env, -123, now);
+  const [join, admin] = requests[0].reply_markup.inline_keyboard;
+  // Join stays a one-tap callback: it needs no screen at all.
+  expect(join).toEqual([{ text: '🙋 Join', callback_data: 'sb:join:1' }]);
+  expect(admin).toHaveLength(1);
+  const link = new URL(admin[0].url);
+  expect(link.searchParams.get('startapp')).toBe('g-123_b1');
+  expect(link.searchParams.get('mode')).toBe('compact');
+});
+
 it('posts one silent message for the next open court, edits its slot count, and moves on when it fills', async () => {
   seat(1);
   expect(await syncAnnouncements(env, -123, now)).toBe(0);
