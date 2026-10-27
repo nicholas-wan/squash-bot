@@ -262,7 +262,7 @@ describe('The pinned board’s button', () => {
     for (const [extra, button] of [
       [{}, { text: '🙋 Join', callback_data: 'sb:join' }],
       [{ MINI_APP_URL: 'https://t.me/squash_book_bot/manage' }, {
-        text: '🙋 Join · ⚙️ Manage',
+        text: '🎾 Courts',
         url: `https://t.me/squash_book_bot/manage?startapp=g${CHAT}&mode=compact`,
       }],
     ]) {

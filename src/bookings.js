@@ -4,7 +4,7 @@ import {
   ownerName, ownerRow, rosterFor, rostersFor, seedRoster,
 } from './players.js';
 import {
-  compactTimeRange, courtName, formatCountdown, playerHeads, playerTags, rosterHeads, shortClock,
+  compactTimeRange, courtName, playerHeads, playerTags, rosterHeads, shortClock,
   shortCourtName, shortDate,
 } from './format.js';
 export { formatCountdown } from './format.js';
@@ -456,7 +456,7 @@ function bookedByLine(owner, booking) {
     const name = String(booking.created_by_name).toLowerCase();
     if (name === owner.slug || name === owner.name.toLowerCase()) return null;
   }
-  return `📝 Booked by ${escapeHtml(booking.created_by_name)}`;
+  return `↳ <i>booked by ${escapeHtml(booking.created_by_name)}</i>`;
 }
 
 // The board stays about who is playing. Money lives on the tab.
@@ -481,9 +481,11 @@ function boardButtons(env, chatId, bookings) {
   // With the Mini App registered, its button replaces the private list: the
   // list can only arrive at the bottom of the chat, which from the pinned
   // board is the far end of it, while the app opens over the chat wherever
-  // the tapper is. Admins manage from inside it.
+  // the tapper is. Admins manage from inside it, and the label says nothing
+  // about managing: every member sees this one button, and one that read
+  // "Manage" looked like a right they had been given.
   const app = miniAppLink(env, chatId);
-  if (app) return { inline_keyboard: [[{ text: '🙋 Join · ⚙️ Manage', url: app }]] };
+  if (app) return { inline_keyboard: [[{ text: '🎾 Courts', url: app }]] };
   return { inline_keyboard: [[{ text: '🙋 Join', callback_data: 'sb:join' }]] };
 }
 
@@ -583,44 +585,39 @@ async function renderBoard(env, chatId, now) {
   if (!bookings.length) return { html: null, bookings };
   const rosters = await rostersFor(env, chatId, bookings.map((booking) => booking.id));
 
-  // Two short lines and a gap per booking. A phone wraps anything much past
-  // thirty characters, and a wrapped “Court 4” or “1 slot” is what made the
-  // board read as a wall. An open court's roster is dropped because
-  // DEFAULT_PLAYERS puts the same handles on every row; who is playing lives
-  // behind 🙋 Join, which can answer it per person as the shared board never
-  // could. Two exceptions. A full court: nobody can join it, so the one
-  // question left about it is who took it, and that is answered underneath.
-  // And the nearest court — every court sharing the earliest start — because
-  // that is the one people are deciding about tonight, and "who is on it" is
-  // the question they open the board to ask. Every court is listed, full ones
-  // included: the board is the answer to "what is booked", and a court missing
-  // from it reads as a court nobody took. The slot count carries the difference.
-  // A court booked by somebody other than the organiser says who underneath,
-  // so the group can see whose court it is without opening a panel.
-  const lines = ['🎾 <b>Upcoming squash courts</b>'];
-  // A court already in play is listed, but it is no longer the one anyone is
-  // deciding about: its roster is locked. The nearest court is the earliest
-  // that has not started, and only when none is ahead does the court in play
-  // stand in.
-  const nearest = (bookings.find((booking) => booking.starts_at > now) || bookings[0]).starts_at;
+  // A schedule: one line per court, and nothing to act on. It sat beside the
+  // "next available court" message looking like a copy of it — same emoji,
+  // same countdown, same court line, same roster — so it says only what is
+  // booked and leaves "join this one" to that message, which names who is on
+  // it. Every court is listed, full ones included: the board is the answer to
+  // "what is booked", and a court missing from it reads as a court nobody
+  // took. A full one is struck through so the open slots pop at a glance. A
+  // court booked by somebody other than the organiser says whose it is.
+  const lines = ['📌 <b>Court schedule</b>', ''];
   const owner = ownerIdentity(env);
   for (const booking of bookings) {
     const roster = rosters.get(booking.id) || [];
-    const slots = slotsLabel(roster, booking.capacity || DEFAULT_CAPACITY);
-    const line = `${compactTimeRange(booking.starts_at, booking.ends_at, tz)} · ` +
-      `<b>${escapeHtml(courtName(booking))}</b> · ${slots}`;
-    lines.push('');
-    lines.push(formatCountdown(booking.starts_at, tz, now));
-    // A full court stays listed — dropping it would read as a court nobody
-    // took — but struck through, so the open slots pop at a glance.
-    lines.push(slots === 'full' ? `<s>${line}</s>` : line);
-    if ((slots === 'full' || booking.starts_at === nearest) && roster.length) {
-      lines.push(`👥 ${playerTags(roster)}`);
-    }
+    const free = Math.max(0, (booking.capacity || DEFAULT_CAPACITY) - rosterHeads(roster));
+    // Its roster is locked once it starts, so a court in play has no slots
+    // left to offer, whatever the count says.
+    const state = booking.starts_at <= now ? 'playing now'
+      : free ? `${free} slot${free === 1 ? '' : 's'}` : 'full';
+    const line = `${scheduleDay(booking.starts_at, tz, now)} · `
+      + `${compactTimeRange(booking.starts_at, booking.ends_at, tz)} · `
+      + `<b>${escapeHtml(shortCourtName(booking))}</b> · ${state}`;
+    lines.push(state === 'full' ? `<s>${line}</s>` : line);
     const bookedBy = bookedByLine(owner, booking);
     if (bookedBy) lines.push(bookedBy);
   }
   return { html: lines.join('\n'), bookings };
+}
+
+// "Today" and "Tomorrow" where they apply, the date otherwise. The board is
+// redrawn every morning, so a relative day never goes stale.
+function scheduleDay(epochMs, tz, now) {
+  if (isSameLocalDay(epochMs, now, tz)) return 'Today';
+  if (isSameLocalDay(epochMs, now + 24 * 60 * 60 * 1000, tz)) return 'Tomorrow';
+  return shortDate(epochMs, tz);
 }
 
 export async function boardHtml(env, chatId, now = Date.now()) {
