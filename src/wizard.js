@@ -1,5 +1,5 @@
 import {
-  addBooking, BOOKING_STARTED, BookingConflictError, getTimezone, updateBooking,
+  addBooking, BOOKING_CHANGED, BOOKING_STARTED, BookingConflictError, getTimezone, updateBooking,
 } from './bookings.js';
 import { courtName } from './format.js';
 import { parseBookingCompanions } from './booking-companions.js';
@@ -352,6 +352,9 @@ export async function beginEditBooking(env, callback, bookingId, field) {
     court: booking.court,
     start: { h: start.h, mi: start.mi },
     end: { h: end.h, mi: end.mi },
+    // What the court held when the form opened; the save is refused if it has
+    // changed since, rather than putting the other fields back as they were.
+    expected: { startsAt: booking.starts_at, endsAt: booking.ends_at, court: String(booking.court) },
     dateChoices: [], courtChoices: [], timeChoices: [], issues: [], conflicts: [],
   };
   if (field === 'date') payload.date = null;
@@ -552,7 +555,8 @@ export async function handleBookingCallback(env, callback) {
       if (payload.operation === 'edit') {
         saved = await updateBooking(
           env, chatId, payload.bookingId, booking, callback.from,
-          payload.editSourceText || 'Edited with SquashBot', { allowConflict: action === 'o' }
+          payload.editSourceText || 'Edited with SquashBot',
+          { allowConflict: action === 'o', expected: payload.expected || null }
         );
       } else {
         saved = await addBooking(
@@ -595,6 +599,16 @@ export async function handleBookingCallback(env, callback) {
     if (saved === 'played') {
       await answerCallback(env, callback.id,
         'That court has already finished, so it can no longer be edited.', true);
+      return true;
+    }
+    // The draft is already gone, so the stale form goes with it.
+    if (saved === 'changed') {
+      if (row.wizard_ephemeral) {
+        await deleteEphemeralMessage(env, chatId, row.user_id, row.wizard_message_id);
+      } else {
+        await deleteMessage(env, chatId, row.wizard_message_id);
+      }
+      await answerCallback(env, callback.id, BOOKING_CHANGED, true);
       return true;
     }
     if (!saved) {

@@ -53,9 +53,21 @@ describe('parseBooking', () => {
     expect(() => parseBooking('12 Aug Court 2 7pm', NOW, TZ)).toThrow(/already passed/);
   });
 
-  it('never schedules the same-day reminder on the previous day', () => {
-    const booking = parseBooking('13 Aug Court 2 7am', NOW, TZ);
-    expect(local(booking.reminderAt)).toMatchObject({ d: 13, h: 6, mi: 0 });
+  it('reminds a morning court the evening before, and drops a two-hour reminder that adds nothing', () => {
+    const cases = [
+      // court, day's reminder, two-hour reminder kept
+      ['7am', { d: 12, h: 20 }, false], // 5am is too early to be read
+      ['9am', { d: 12, h: 20 }, true], // 7am: early, but the day's own
+      ['11am', { d: 13, h: 10 }, false], // 9am would come before 10am's
+      ['1pm', { d: 13, h: 10 }, false], // 11am is only an hour after it
+      ['2pm', { d: 13, h: 10 }, true],
+      ['9pm', { d: 13, h: 10 }, true],
+    ];
+    for (const [time, reminder, kept] of cases) {
+      const booking = parseBooking(`13 Aug Court 2 ${time}`, NOW, TZ);
+      expect(local(booking.reminderAt)).toMatchObject({ ...reminder, mi: 0 });
+      expect(booking.skipPreReminder).toBe(!kept);
+    }
   });
 
   it('keeps bookings inside the 7am to 10pm opening hours', () => {

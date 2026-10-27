@@ -1,7 +1,7 @@
 import { notifyRemovedPlayer, notifyRosterOfChange, updateBoard } from './bookings.js';
 import {
-  adminAddPlayer, joinBooking, knownPlayers, leaveBooking, MAX_CAPACITY, ownerName,
-  raiseCapacity, removeBookingPlayer, toggleBooking, toggleOwnerGuest, togglePlusOne,
+  adminAddPlayer, isHouseholdPlayer, joinBooking, knownPlayers, leaveBooking, MAX_CAPACITY,
+  ownerName, raiseCapacity, removeBookingPlayer, toggleBooking, toggleOwnerGuest, togglePlusOne,
 } from './players.js';
 
 // The roster changes an admin makes from the Manage panels. Each one used to
@@ -17,6 +17,12 @@ function subject(player, name = player.name) {
     username: player.slug.startsWith('@') ? player.slug.slice(1) : null,
     first_name: name,
   };
+}
+
+// The organiser and household are never billed, so their +1 costs nobody
+// anything, and talk of two shares would be wrong for them.
+function plusOneCost(env, player) {
+  return isHouseholdPlayer(env, player) ? 'the +1 plays free' : 'two shares on the tab';
 }
 
 function told(allTold, everyone = 'Everyone has been told.') {
@@ -50,7 +56,7 @@ export async function seatPlayer(env, chatId, bookingId, slug, heads, actorId) {
   return {
     status: 'added', changed: true, alert: false,
     message: heads > 1
-      ? `${candidate.name} +1 are on this court — two shares on the tab. ${delivery}`
+      ? `${candidate.name} +1 are on this court — ${plusOneCost(env, candidate)}. ${delivery}`
       : `${candidate.name} is on this court. ${delivery}`,
   };
 }
@@ -73,7 +79,7 @@ export async function flipPlusOne(env, chatId, bookingId, playerRowId) {
   return {
     status: result.status, changed: true, alert: false,
     message: result.status === 'plus'
-      ? `${name} now brings a +1 — two shares. ${told(allTold)}`
+      ? `${name} now brings a +1 — ${plusOneCost(env, result.player)}. ${told(allTold)}`
       : `${name}'s +1 is off — one share again. ${told(allTold)}`,
   };
 }

@@ -2,7 +2,8 @@ import {
   addSlot, flipOwnerGuest, flipPlusOne, kickPlayer, moveOwnSlot, seatPlayer, settleSlotMove,
 } from './actions.js';
 import {
-  addBooking, authorizeBookingChange, BookingConflictError, BOOKING_STARTED, cancelBooking,
+  addBooking, authorizeBookingChange, BookingConflictError, BOOKING_CHANGED, BOOKING_STARTED,
+  cancelBooking,
   courtDetail, courtList, getTimezone, updateBooking,
 } from './bookings.js';
 import { courtName, compactTimeRange, shortDate } from './format.js';
@@ -91,6 +92,14 @@ async function actionReply(env, chatId, bookingId, result, user) {
   });
 }
 
+// After a booking is added or changed an admin lands on its court screen; a
+// member, who has no court screen, lands back on the list.
+async function savedReply(env, chatId, bookingId, user, admin, message) {
+  return json(admin
+    ? { ok: true, message, court: await courtDetail(env, chatId, bookingId, user) }
+    : { ok: true, message, ...(await courtList(env, chatId, { viewer: user, admin })) });
+}
+
 // A member's own slot. The reply is the whole list again, since that is the
 // screen it was tapped on. The roster hears it as from the chat button; the
 // member's own copy is skipped, because the app has just said it on screen.
@@ -139,7 +148,11 @@ const routes = [
   ['POST', /^court\/(\d+)\/capacity$/, async ({ env, chatId, match, user }) => actionReply(
     env, chatId, Number(match[1]), await addSlot(env, chatId, Number(match[1])), user
   )],
-  ['POST', /^court\/(\d+)\/edit$/, async ({ env, chatId, match, body, user, now }) => {
+  // Changing, cancelling and adding are open to members on the same terms as
+  // the chat: anyone may book, and whoever booked a court — or an admin — may
+  // change or cancel it until it starts. authorizeBookingChange is that rule,
+  // and cancelBooking applies it itself.
+  ['POST', /^court\/(\d+)\/edit$/, async ({ env, chatId, match, body, user, admin, now }) => {
     const bookingId = Number(match[1]);
     const permitted = await authorizeBookingChange(env, chatId, bookingId, user, 'edit');
     if (!permitted.allowed) return json({ ok: false, message: permitted.message });
@@ -148,7 +161,7 @@ const routes = [
     try {
       saved = await updateBooking(
         env, chatId, bookingId, parsed, user, 'Edited in the Mini App',
-        { allowConflict: Boolean(body.force) }
+        { allowConflict: Boolean(body.force), expected: body.expected || null }
       );
     } catch (error) {
       if (error instanceof BookingConflictError) return conflictReply(env, chatId, error);
@@ -157,28 +170,31 @@ const routes = [
     const refusals = {
       started: BOOKING_STARTED,
       played: 'That court has already finished, so it can no longer be edited.',
+      changed: BOOKING_CHANGED,
       false: 'That booking no longer exists.',
     };
     if (saved !== true) return json({ ok: false, message: refusals[String(saved)] });
-    return json({
-      ok: true, message: '✅ Booking updated',
-      court: await courtDetail(env, chatId, bookingId, user),
-    });
-  }],
-  ['POST', /^court\/(\d+)\/delete$/, async ({ env, chatId, match, user }) => {
+    return savedReply(env, chatId, bookingId, user, admin, '✅ Booking updated');
+  }, { member: true }],
+  ['POST', /^court\/(\d+)\/delete$/, async ({ env, chatId, match, user, admin }) => {
     const result = await cancelBooking(
       env, chatId, Number(match[1]), user, 'Deleted in the Mini App'
     );
-    return result.status === 'cancelled'
-      ? json({ ok: true, message: 'Booking cancelled' })
-      : json({ ok: false, message: result.message });
-  }],
-  ['POST', /^courts$/, async ({ env, chatId, body, user, now }) => {
+    if (result.status !== 'cancelled') return json({ ok: false, message: result.message });
+    return json({
+      ok: true, message: 'Booking cancelled',
+      ...(await courtList(env, chatId, { viewer: user, admin })),
+    });
+  }, { member: true }],
+  ['POST', /^courts$/, async ({ env, chatId, body, user, admin, now }) => {
     const parsed = bookingFromForm(body, now, await getTimezone(env, chatId));
-    // Resolved fresh, as the wizard's booker picker does, so the page cannot
-    // record somebody under a name or id the bot does not hold.
+    // Naming somebody else as the booker, and marking a court free, change who
+    // is billed: admin-only, as in the chat wizard. A member's form never
+    // shows them, and a hand-made request carrying them is not believed.
+    // The booker is resolved fresh, as the wizard's picker does, so the page
+    // cannot record somebody under a name or id the bot does not hold.
     let bookedFor = null;
-    if (body.booker) {
+    if (admin && body.booker) {
       const player = (await knownPlayers(env, chatId))
         .find((candidate) => candidate.slug === body.booker);
       if (!player) return json({ ok: false, message: 'That player is no longer known.' });
@@ -187,18 +203,16 @@ const routes = [
     let bookingId;
     try {
       bookingId = await addBooking(env, chatId, parsed, user, 'Added in the Mini App', {
-        allowConflict: Boolean(body.force), bookedFor, free: Boolean(body.free), receipt: false,
+        allowConflict: Boolean(body.force), bookedFor, free: admin && Boolean(body.free),
+        receipt: false,
       });
     } catch (error) {
       if (error instanceof BookingConflictError) return conflictReply(env, chatId, error);
       if (error instanceof RosterCapacityError) return json({ ok: false, message: error.message });
       throw error;
     }
-    return json({
-      ok: true, message: '✅ Booking added',
-      court: await courtDetail(env, chatId, bookingId, user),
-    });
-  }],
+    return savedReply(env, chatId, bookingId, user, admin, '✅ Booking added');
+  }, { member: true }],
 ];
 
 export async function handleMiniAppApi(request, env, path, now = Date.now()) {

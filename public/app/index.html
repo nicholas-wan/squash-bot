@@ -85,6 +85,7 @@
     background: var(--accent); color: var(--accent-text); font-weight: 600; cursor: pointer;
   }
   .slot.leave { background: var(--separator); color: var(--text); }
+  .meta.link-text { color: var(--link); }
   .icon-btn {
     flex: none; min-width: 40px; height: 32px; padding: 0 10px; border-radius: 8px; border: 0;
     background: var(--separator); cursor: pointer; font-size: 14px; font-weight: 600;
@@ -310,11 +311,15 @@ function courtRow(court, admin) {
       `${court.time} · ${room > 0 ? `${room} left` : 'full'} · ${court.heads}/${court.capacity}`),
     names ? h('div', { class: 'meta' }, `👥 ${names}`) : null,
   ];
-  // An admin opens the court to manage it; a member's row is only its slot.
+  // An admin opens the court to manage it; whoever booked it opens it to change
+  // or cancel it; anyone else's row is only its slot.
+  const open = admin ? () => openCourt(court.id)
+    : court.booker && !court.started ? () => openForm(court) : null;
   return h('div', { class: 'row court' },
-    admin
-      ? h('button', { class: 'main open', onclick: () => openCourt(court.id) },
-        h('div', { class: 'text' }, text),
+    open
+      ? h('button', { class: 'main open', onclick: open },
+        h('div', { class: 'text' }, text,
+          !admin ? h('div', { class: 'meta link-text' }, 'Your booking · change or cancel') : null),
         h('span', { class: 'chev', 'aria-hidden': 'true' }, '›'))
       : h('div', { class: 'main' }, text),
     slotControl(court));
@@ -330,7 +335,7 @@ function list() {
     h('div', { class: 'note' }, admin
       ? 'Tap a court to seat or remove players, or to change it.'
       : 'You can see who is playing on the courts you are on.'),
-    admin ? h('button', { class: 'primary', onclick: () => openForm(null) }, '➕ Add booking') : null,
+    h('button', { class: 'primary', onclick: () => openForm(null) }, '➕ Add booking'),
   ];
 }
 
@@ -349,7 +354,8 @@ function court() {
     h('div', { class: 'row' },
       h('div', { class: 'main' },
         h('div', null, player.name),
-        player.heads > 1 ? h('div', { class: 'meta' }, 'Bringing a friend · two shares') : null),
+        player.heads > 1 ? h('div', { class: 'meta' },
+          player.unbilled ? 'Bringing a friend · plays free' : 'Bringing a friend · two shares') : null),
       h('button', {
         class: player.heads > 1 ? 'icon-btn on' : 'icon-btn',
         'aria-label': player.heads > 1 ? `Take ${player.name}'s +1 off` : `Give ${player.name} a +1`,
@@ -443,7 +449,7 @@ function form() {
         type: 'text', value: values.court, placeholder: '4 or A', maxLength: 12,
         autocomplete: 'off', oninput: set('court'),
       }))),
-    !editing ? [
+    !editing && state.admin ? [
       h('div', { class: 'label' }, 'Admin'),
       h('div', { class: 'section' },
         field('Booked by', h('select', { onchange: set('booker') },
@@ -464,6 +470,10 @@ function form() {
     h('button', {
       class: 'primary', onclick: (event) => save(event.currentTarget, Boolean(state.conflict)),
     }, state.conflict ? '⚠️ Save anyway' : (editing ? '✅ Save changes' : '✅ Add booking')),
+    // An admin deletes from the court screen; a booker has only this one.
+    editing && !state.admin ? h('div', { class: 'section', style: 'margin-top:12px' },
+      h('button', { class: 'row danger', onclick: (event) => remove(event.currentTarget) },
+        '🗑 Cancel this booking')) : null,
   ];
 }
 
@@ -527,20 +537,23 @@ async function remove(button) {
   toast(result.message, result.ok ? 'success' : 'error');
   if (result.ok) {
     trail = [];
-    loadList(false);
+    go('list', { data: result }, false);
   }
 }
 
 async function openForm(court) {
   let players = [];
   let today = '';
-  // The list screen already holds who can be named as booker and today's date.
+  let admin = false;
+  // The list screen already holds who can be named as booker, today's date,
+  // and whether this person is an admin.
   const listed = trail.concat(state).find((entry) => entry.screen === 'list');
-  if (listed) ({ players, today } = listed.data);
+  if (listed) ({ players, today, admin } = listed.data);
   go('form', {
     court,
     players,
     today,
+    admin,
     conflict: null,
     values: court
       ? { ...court.edit }
@@ -551,7 +564,9 @@ async function openForm(court) {
 async function save(button, force) {
   const editing = Boolean(state.court);
   const path = editing ? `court/${state.court.id}/edit` : 'courts';
-  const result = await run(button, () => api('POST', path, { ...state.values, force }));
+  const result = await run(button, () => api('POST', path, {
+    ...state.values, force, expected: editing ? state.court.stamp : undefined,
+  }));
   if (!result || blockedBy(result)) return;
   if (result.conflict) {
     state.conflict = result;
@@ -561,9 +576,14 @@ async function save(button, force) {
   }
   toast(result.message, result.ok ? 'success' : 'error');
   if (!result.ok) return;
-  // Back to the court just saved, with the list underneath it.
+  // An admin goes to the court just saved, with the list underneath it; a
+  // member goes back to the list, which the reply carries.
   trail = trail.filter((entry) => entry.screen === 'list');
-  go('court', { court: result.court, friend: false }, false);
+  if (result.court) go('court', { court: result.court, friend: false }, false);
+  else {
+    trail = [];
+    go('list', { data: result }, false);
+  }
 }
 
 // ---- Start. A link can name one court with "_b<id>" after the group.
@@ -617,7 +637,8 @@ function previewApi(method, path, body) {
     const mine = c.roster.some((player) => player.slug === me);
     return {
       id: c.id, court: c.court, date: c.date, time: c.time, heads: heads(c.roster), capacity: c.capacity,
-      free: c.free, started: c.started, mine,
+      free: c.free, started: c.started, mine, booker: c.bookedBy === me, edit: c.edit,
+      stamp: { startsAt: 0, endsAt: 0, court: c.edit.court },
       players: admin || mine
         ? c.roster.map(({ id, name, heads: count }) => ({ id, name, heads: count })) : [],
     };
@@ -661,11 +682,12 @@ function previewApi(method, path, body) {
   if (method === 'POST' && path === 'courts') {
     const added = {
       id: sample.nextId++, court: `Court ${body.court || '?'}`, date: body.date, time: body.start,
-      capacity: 3, free: Boolean(body.free), started: false, bookedBy: 'you', edit: { ...body },
+      capacity: 3, free: Boolean(body.free), started: false, bookedBy: me, edit: { ...body },
       roster: [sample.seat('@nicholaswan')],
     };
     sample.courts.push(added);
-    return reply({ ok: true, message: '✅ Booking added', court: detail(added) });
+    return reply(admin ? { ok: true, message: '✅ Booking added', court: detail(added) }
+      : { ...listing(), message: '✅ Booking added' });
   }
   if (!c) return reply({ ok: false, message: 'That booking has already gone.' });
   const action = match[2];
@@ -702,13 +724,17 @@ function previewApi(method, path, body) {
         conflicts: ['Court 2 · Thu 30 Oct · 7–8:30pm'], status: 409 });
     }
     c.edit = { date: body.date, start: body.start, end: body.end, court: body.court };
+    if (!admin) {
+      c.court = `Court ${body.court}`;
+      return reply({ ...listing(), message: '✅ Booking updated' });
+    }
     c.court = `Court ${body.court}`;
     c.time = body.end ? `${body.start}–${body.end}` : body.start;
     return done('✅ Booking updated');
   }
   if (action === 'delete') {
     sample.courts = sample.courts.filter((entry) => entry !== c);
-    return reply({ ok: true, message: 'Booking cancelled' });
+    return reply({ ...listing(), message: 'Booking cancelled' });
   }
   return reply({ ok: false, message: 'Not found.' });
 }
