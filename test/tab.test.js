@@ -192,9 +192,8 @@ describe('money tab', () => {
       { slug: 'u11', user_id: 11, name: '@bob', balance: 400 },
     ];
     const html = tabHtml(env, balances);
-    expect(html).toContain('Owed to Nicholas');
-    expect(html).toContain('• @alice — <b>$8.00</b>');
-    expect(html).toContain('• @bob — <b>$4.00</b>');
+    expect(html).toBe('💰 <b>Squash tab</b> · owed to Nicholas\n\n'
+      + '@alice · <b>$8.00</b>\n@bob · <b>$4.00</b>');
     expect(html).not.toContain('Total');
     const keyboard = tabMarkup(balances).inline_keyboard;
     expect(keyboard[0][0].callback_data).toBe('tb:mine');
@@ -394,8 +393,8 @@ describe('money tab', () => {
 
   it('shows an overpayment as credit', () => {
     const html = tabHtml(env, [{ slug: 'u9', user_id: 9, name: '@alice', balance: -150 }]);
-    expect(html).toContain('In credit');
-    expect(html).toContain('• @alice — $1.50');
+    expect(html).toContain('Nobody owes anything.');
+    expect(html).toContain('@alice · $1.50 in credit');
   });
 
   it('replays only the story since the balance last hit zero', () => {

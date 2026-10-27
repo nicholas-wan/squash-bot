@@ -326,16 +326,17 @@ export function tabHtml(env, balances) {
   const credit = balances.filter((entry) => entry.balance < 0);
   if (!owing.length && !credit.length) return null;
 
-  const lines = ['💰 <b>Squash tab</b>', '', `Owed to ${escapeHtml(ownerName(env))}`];
-  if (!owing.length) lines.push('• Nobody — all settled');
+  // Laid out like the court schedule pinned beside it: a heading, then one
+  // short line per person, the amount owed in bold where the schedule bolds
+  // the court. Credit sits after the debts on lines that say so, rather than
+  // under a heading of its own.
+  const lines = [`💰 <b>Squash tab</b> · owed to ${escapeHtml(ownerName(env))}`, ''];
+  if (!owing.length) lines.push('Nobody owes anything.');
   for (const entry of owing) {
-    lines.push(`• ${escapeHtml(entry.name)} — <b>${formatMoney(entry.balance)}</b>`);
+    lines.push(`${escapeHtml(entry.name)} · <b>${formatMoney(entry.balance)}</b>`);
   }
-  if (credit.length) {
-    lines.push('', 'In credit');
-    for (const entry of credit) {
-      lines.push(`• ${escapeHtml(entry.name)} — ${formatMoney(-entry.balance)}`);
-    }
+  for (const entry of credit) {
+    lines.push(`${escapeHtml(entry.name)} · ${formatMoney(-entry.balance)} in credit`);
   }
   return lines.join('\n');
 }
