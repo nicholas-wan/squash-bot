@@ -1,4 +1,4 @@
-import { compactTimeRange, courtName, formatCountdown, playerTags, shortDate } from './format.js';
+import { compactTimeRange, courtName, formatCountdown, playerTags } from './format.js';
 import { allowedChats, dataChatId } from './scope.js';
 import { DEFAULT_CAPACITY, rosterFor } from './players.js';
 import { miniAppLink } from './miniapp-link.js';
@@ -23,39 +23,18 @@ async function deleteAnnouncement(env, chatId, messageId) {
   throw new Error(removed.description || 'Announcement deletion failed');
 }
 
-// What a kept message says once there is no open court to show: the fate of
-// the court it announced, in one line, with no button. A line that only
-// points at the board says nothing anyone needs; the closing state of the
-// court at least records what happened to it. A cancelled or played court
-// has left the bookings table, so its details come from the audit trail.
-async function closedRendering(env, chatId, bookingId, now) {
-  const tz = await getTimezone(env, chatId);
-  let booking = await env.DB.prepare('SELECT * FROM bookings WHERE id = ?').bind(bookingId).first();
-  let status;
-  if (booking) {
-    const roster = await rosterFor(env, bookingId);
-    const seated = roster.reduce((sum, player) => sum + (player.heads || 1), 0);
-    status = booking.starts_at <= now ? 'played'
-      : seated >= (booking.capacity || DEFAULT_CAPACITY) ? 'full' : null;
-    if (status === 'full') status += `\n👥 ${playerTags(roster)}`;
-  } else {
-    const audit = await env.DB.prepare(`SELECT source_text, before_json FROM booking_audit
-      WHERE booking_id = ? AND action = 'deleted' ORDER BY id DESC LIMIT 1`).bind(bookingId).first();
-    if (!audit?.before_json) return null;
-    const snapshot = JSON.parse(audit.before_json);
-    booking = { court: snapshot.court, starts_at: snapshot.startsAt, ends_at: snapshot.endsAt };
-    status = /expired/i.test(audit.source_text || '') ? 'played' : 'cancelled';
-  }
-  if (!status) return null;
-  return `🎾 <b>${escapeHtml(courtName(booking))}</b> · ${shortDate(booking.starts_at, tz)} · `
-    + `${compactTimeRange(booking.starts_at, booking.ends_at, tz)} · ${status}`;
-}
+// What a kept message says once there is no open court to show. It used to
+// name the court it had announced, marked played, full or cancelled, which
+// read as the court still on offer. Now it says plainly that nothing is open,
+// and is rewritten in place for the next court that opens.
+export const NO_COURTS_HTML = '🎾 <b>No courts available</b>';
 
+// False when the message is already gone, so the caller can stop tracking it.
 async function closeAnnouncement(env, chatId, messageId, text) {
   const closed = await editMessage(env, chatId, messageId, text, { inline_keyboard: [] });
-  if (!closed.ok && !/message is not modified/i.test(closed.description || '')) {
-    throw new Error(closed.description || 'Announcement retirement failed');
-  }
+  if (closed.ok || /message is not modified/i.test(closed.description || '')) return true;
+  if (/message to edit not found/i.test(closed.description || '')) return false;
+  throw new Error(closed.description || 'Announcement retirement failed');
 }
 
 async function nextOpenBooking(env, chatId, now) {
@@ -73,20 +52,23 @@ async function nextOpenBooking(env, chatId, now) {
 }
 
 export async function syncAnnouncements(env, chatId, now = Date.now()) {
-  await env.DB.prepare('INSERT OR IGNORE INTO availability_notices (chat_id) VALUES (?)')
-    .bind(chatId).run();
   // Serialize webhook/cron sends for this chat. Expiry recovers a dead worker.
+  // One round trip creates the row if need be, claims the lease, and reads the
+  // row back; no row comes back while another worker holds the lease.
   const lease = Date.now() + 60000;
-  const claimed = await env.DB.prepare(`UPDATE availability_notices SET lease_until = ?
-    WHERE chat_id = ? AND lease_until <= ?`).bind(lease, chatId, Date.now()).run();
-  if (!claimed.meta.changes) return 0;
+  const current = await env.DB.prepare(`INSERT INTO availability_notices (chat_id, lease_until)
+    VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET lease_until = excluded.lease_until
+    WHERE availability_notices.lease_until <= ? RETURNING *`)
+    .bind(chatId, lease, Date.now()).first();
+  if (!current) return 0;
   try {
-    const current = await env.DB.prepare('SELECT * FROM availability_notices WHERE chat_id = ?')
-      .bind(chatId).first() || { booking_id: null, message_id: null, html: null };
-    const [next, pinned] = await Promise.all([
+    // The timezone is only needed when there is a court to announce, but it is
+    // usually cached, and fetching it alongside costs no extra wall clock.
+    const [next, pinned, tz] = await Promise.all([
       nextOpenBooking(env, chatId, now),
       env.DB.prepare('SELECT board_message_id, tab_message_id FROM settings WHERE chat_id = ?')
         .bind(chatId).first(),
+      getTimezone(env, chatId),
     ]);
     // Message ids only grow within a chat, so a pinned board or tab with a
     // higher id was posted after this message and sits below it. The bot's
@@ -107,28 +89,26 @@ export async function syncAnnouncements(env, chatId, now = Date.now()) {
         current.message_id = null;
         current.html = null;
         current.booking_id = null;
-      } else if (!next) {
-        // Nothing to point at and no way to remove the message: close it as a
-        // record of its court, once. The stored rendering is the closed text
-        // and booking_id is cleared, so later sweeps leave it alone until a
-        // court opens and the message is rewritten for that one.
-        const closed = await closedRendering(env, chatId, current.booking_id, now)
-          || current.html.split('\n{')[0];
-        await closeAnnouncement(env, chatId, current.message_id, closed);
-        await env.DB.prepare(`UPDATE availability_notices SET booking_id = NULL, html = ?
-          WHERE chat_id = ?`).bind(closed, chatId).run();
-        return 0;
       }
     }
     if (!next) {
-      if (current.booking_id !== null && !current.message_id) {
+      // Nothing to point at and no way to remove the message: say so, once.
+      // booking_id is cleared, so later sweeps leave it alone until a court
+      // opens and the message is rewritten for that one. A message closed
+      // before this text existed still names its old court, and is caught
+      // here too because its stored rendering differs.
+      if (current.message_id && current.html !== NO_COURTS_HTML) {
+        const kept = await closeAnnouncement(env, chatId, current.message_id, NO_COURTS_HTML);
+        await env.DB.prepare(`UPDATE availability_notices SET booking_id = NULL, html = ?,
+          message_id = ? WHERE chat_id = ?`)
+          .bind(kept ? NO_COURTS_HTML : null, kept ? current.message_id : null, chatId).run();
+      } else if (current.booking_id !== null) {
         await env.DB.prepare('UPDATE availability_notices SET booking_id = NULL WHERE chat_id = ?')
           .bind(chatId).run();
       }
       return 0;
     }
     const { booking, free, roster } = next;
-    const tz = await getTimezone(env, chatId);
     // An invitation, not a listing: the pinned board is the schedule, and this
     // used to repeat one of its lines under a near-identical heading. It leads
     // with the one thing it is for — a slot you can take — then when, then who
@@ -201,14 +181,15 @@ export async function syncAnnouncements(env, chatId, now = Date.now()) {
   }
 }
 
+// Each chat has its own lease and its own message, so they sync side by side:
+// the sweep takes as long as the slowest chat rather than the sum of them all.
 export async function maintainAnnouncements(env, now) {
-  let failures = 0;
-  for (const chatId of allowedChats(env)) {
-    try { failures += await syncAnnouncements(env, chatId, now); }
+  const results = await Promise.all(allowedChats(env).map(async (chatId) => {
+    try { return await syncAnnouncements(env, chatId, now); }
     catch (error) {
-      failures += 1;
       console.log(`Announcements for ${chatId} failed: ${error.message || error}`);
+      return 1;
     }
-  }
-  return failures;
+  }));
+  return results.reduce((sum, failures) => sum + failures, 0);
 }

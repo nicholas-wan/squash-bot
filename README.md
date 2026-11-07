@@ -42,15 +42,15 @@ The "SquashBot pinned …" notice Telegram adds for each of the bot's own pins
 is deleted as it arrives; pins made by people are left alone. A message Telegram refuses to delete — one older than
 48 hours in a group where the bot lacks the Delete Messages right — is kept and
 rewritten in place for the next court instead, or, when no court is open,
-closed as a one-line record of what became of its court (full, played, or
-cancelled) with no button. The chat therefore never collects a trail of
+rewritten to say "No courts available", with no button, rather than naming
+the court it last announced. The chat therefore never collects a trail of
 retired announcements, and the bot never posts a line that only points at the
 board. A batch of new bookings therefore produces one message
 for the nearest of them, not one each, and a court further out is never
 announced until it is next. Maintenance posts the message if a refresh failed
 and moves it on at the start time. Telegram only permits deletion within 48
-hours of sending: if it refuses an older message, the bot marks it closed and
-removes its Join button instead.
+hours of sending: if it refuses an older message, the bot rewrites it to say no
+courts are available and removes its Join button instead.
 
 ```text
 in 5 days · Mon 17 Aug

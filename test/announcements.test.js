@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, expect, it, onTestFinished, vi } from 'vitest';
-import { syncAnnouncements } from '../src/announcements.js';
+import { NO_COURTS_HTML, syncAnnouncements } from '../src/announcements.js';
 import { addBooking, runMaintenance, updateBoard } from '../src/bookings.js';
 
 let db, env, requests, failure, failWrite;
@@ -217,37 +217,56 @@ it('retries transient edit/delete failures without sending duplicate messages', 
 const undeletable = method => method === 'deleteMessage'
   ? { ok: false, description: "Bad Request: message can't be deleted" } : null;
 
-it('closes an undeletable message as a record of its court, once, with no pointer text', async () => {
+it('says no courts are available on an undeletable message, once, instead of naming the last court', async () => {
   await syncAnnouncements(env, -123, now);
   seat(1, 3);
   failure = undeletable;
   expect(await syncAnnouncements(env, -123, now)).toBe(0);
-  expect(requests.at(-1)).toMatchObject({ method: 'editMessageText', message_id: 101, reply_markup: { inline_keyboard: [] } });
-  expect(requests.at(-1).text).toBe('🎾 <b>Court 4</b> · Sun 13 Sept · 8am · full\n👥 <a href="tg://user?id=1">Player +1</a>');
-  expect(notice()).toMatchObject({ message_id: 101, booking_id: null });
+  expect(requests.at(-1)).toMatchObject({
+    method: 'editMessageText', message_id: 101, text: NO_COURTS_HTML, reply_markup: { inline_keyboard: [] },
+  });
+  expect(notice()).toMatchObject({ message_id: 101, booking_id: null, html: NO_COURTS_HTML });
   // The next sweep finds nothing to change and calls Telegram for nothing.
   const count = requests.length;
   expect(await syncAnnouncements(env, -123, now)).toBe(0);
   expect(requests).toHaveLength(count);
 });
 
-it('records a cancelled court from its audit trail, and a played one as played', async () => {
+it('says no courts are available whether the last court was cancelled or played', async () => {
   await syncAnnouncements(env, -123, now);
   failure = undeletable;
-  db.prepare(`INSERT INTO booking_audit (booking_id, chat_id, action, source_text, before_json, created_at)
-    VALUES (1, -123, 'deleted', 'cancel', ?, ?)`)
-    .run(JSON.stringify({ court: '4', startsAt: now + 3 * DAY, endsAt: now + 3 * DAY + 3600000 }), now);
   db.prepare('DELETE FROM bookings WHERE id = 1').run();
   await syncAnnouncements(env, -123, now);
-  expect(requests.at(-1).text).toBe('🎾 <b>Court 4</b> · Sun 13 Sept · 8am · cancelled');
-  // A court that started, still on the table, reads as played.
+  expect(requests.at(-1).text).toBe(NO_COURTS_HTML);
+  // A court that started reads the same: nothing is open.
   book(2, now - 60000, '1');
   seat(5, 1, 2);
   await syncAnnouncements(env, -123, now - DAY);
   expect(joinTarget(requests.at(-1))).toBe('sb:join:2');
   await syncAnnouncements(env, -123, now);
-  expect(requests.at(-1).text).toBe('🎾 <b>Court 1</b> · Thu 10 Sept · 7:59am · played');
-  expect(requests.every(r => !/pinned board/.test(r.text || ''))).toBe(true);
+  expect(requests.at(-1).text).toBe(NO_COURTS_HTML);
+  expect(requests.every(r => !/pinned board|played|cancelled/.test(r.text || ''))).toBe(true);
+});
+
+it('rewrites a message closed with the old last-court text', async () => {
+  await syncAnnouncements(env, -123, now);
+  db.prepare(`UPDATE availability_notices SET booking_id = NULL,
+    html = '🎾 <b>Court 4</b> · Sun 13 Sept · 8am · played'`).run();
+  db.prepare('DELETE FROM bookings WHERE id = 1').run();
+  requests = [];
+  expect(await syncAnnouncements(env, -123, now)).toBe(0);
+  expect(requests).toEqual([expect.objectContaining({
+    method: 'editMessageText', message_id: 101, text: NO_COURTS_HTML,
+  })]);
+});
+
+it('stops tracking a closed message that has gone from the chat', async () => {
+  await syncAnnouncements(env, -123, now);
+  failure = method => method === 'deleteMessage' ? undeletable(method)
+    : method === 'editMessageText' ? { ok: false, description: 'Bad Request: message to edit not found' } : null;
+  db.prepare('DELETE FROM bookings WHERE id = 1').run();
+  expect(await syncAnnouncements(env, -123, now)).toBe(0);
+  expect(notice()).toMatchObject({ message_id: null, booking_id: null, html: null });
 });
 
 it('rewrites an undeletable message in place for the next court instead of leaving a stub', async () => {
@@ -262,7 +281,7 @@ it('rewrites an undeletable message in place for the next court instead of leavi
   // Both courts fill, then one reopens: the closed message is reused too.
   seat(1, 3, 1); seat(2, 3, 2);
   await syncAnnouncements(env, -123, now);
-  expect(requests.at(-1).text).toContain('· full');
+  expect(requests.at(-1).text).toBe(NO_COURTS_HTML);
   db.prepare('DELETE FROM booking_players WHERE booking_id = 2').run();
   await syncAnnouncements(env, -123, now);
   expect(requests.at(-1)).toMatchObject({ method: 'editMessageText', message_id: 101 });
