@@ -35,10 +35,12 @@ function told(allTold, everyone = 'Everyone has been told.') {
 // happened, and trying again undid a +1. updateBoard has queued its own retry
 // by then, so the failure is only logged. With `defer` (the Mini App's
 // waitUntil, or a list the chat handler drains after answering) the caller
-// replies first and the board, and any notice behind it, follows.
-// Work an action hands back to run once the tap is answered: the board, and
-// for a member's own move the roster's notices. Chat updates already run
-// inside waitUntil, so draining this at the end keeps the worker alive for it.
+// does not wait for the board, or any notice behind it: that work starts at
+// once and runs alongside the reply, and is only collected afterwards.
+// Work an action hands back so the tap can be answered without waiting on
+// it: the board, and for a member's own move the roster's notices. Chat
+// updates already run inside waitUntil, so draining this at the end keeps the
+// worker alive for it.
 export function afterAnswer() {
   const jobs = [];
   return { defer: (work) => { jobs.push(work); }, drain: () => Promise.all(jobs) };

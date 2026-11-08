@@ -400,6 +400,15 @@ response (Bot API, "Making requests when getting updates") instead of a
 separate round trip, and each tap logs its colo and duration — one line in
 `npx wrangler tail` — so "is it slow" is always answerable with a number.
 
+Every update's first database trip is one batch: the update id, the sender's
+identity writes, any tab notice waiting for them and, on a fresh isolate, the
+timezone. A tap answers as soon as its own change is saved; the pinned board,
+the tab, roster notices and receipts follow it. Redraws of one message run one
+at a time, and a burst of requests shares the one that is waiting. A private
+message cut off by the fifteen-second bound may have arrived, so it is never
+sent again or repeated in the group. `node bench/latency.mjs` prints the round
+trips behind each common flow, and `test/speed.test.js` pins them.
+
 The root URL is a health check: 200 while a fully successful every-minute
 maintenance tick is fresh. A failed reminder, board, notice, cleanup, charging,
 or database stage withholds the success heartbeat; the URL turns 500 once the
@@ -434,6 +443,7 @@ npm run db:migrate:015
 npm run db:migrate:016
 npm run db:migrate:017
 npm run db:migrate:018
+npm run db:migrate:019
 npm run db:verify
 ```
 
@@ -444,7 +454,8 @@ table/index/trigger migrations. 018 replaces the alias-claim trigger, which
 `schema.sql` cannot do on a live database because its triggers are
 `IF NOT EXISTS`: the old one left a handle's charge behind when the same court
 was also billed to the verified id. It also adds the tab-notice index and
-moves any such leftover onto the id. 015
+moves any such leftover onto the id. 019 only adds indexes (and swaps the
+ledger's for a wider one), so it is safe to run at any time. 015
 adds the table that records every Telegram update id once, so an update
 Telegram redelivers is answered and dropped rather than handled twice — the
 guard that keeps a redelivered `/debt` from writing a second row. 014 replaces
