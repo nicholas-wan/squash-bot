@@ -22,7 +22,11 @@ puts the same words after `/book` (see [Privacy](#privacy) for why):
 court four tomorrow at 9pm
 Friday 8pm-9:30pm, Court 2
 tmr c4 2100
+fri c2 7:30-8:30pm
 ```
+
+A clock may skip its colon with am or pm (`830pm`), and the minutes in a range
+such as `7:30-8:30pm` are never read as a day and month.
 
 Anything missing or ambiguous is asked with buttons rather than guessed, and
 nothing is saved until it is confirmed. No end time means one hour. Courts run
@@ -83,7 +87,9 @@ is the question they open the board to ask. For any other open court, who is
 playing is named on the court's own panel behind ⚙️ Manage, which is private.
 A court booked by somebody other than the organiser carries `📝 Booked by`
 and their name underneath; the organiser books most courts, and naming them
-on every row would bury the one row that is news.
+on every row would bury the one row that is news. A court that has started
+reads `playing now` instead of its slots, since its roster is locked: the
+sweep the scheduler runs at each start redraws the board for it.
 
 The board carries a single **🙋 Join** button. A keyboard belongs to the message,
 so anything drawn on the pinned board reads the same to everyone — which is why
@@ -236,14 +242,22 @@ quietly. That delete is why free text is only read as a booking from group
 admins: the intent gate is loose on purpose, and applied to everyone it cleared
 ordinary chat out of the group for looking like a court. Anybody else's
 booking-shaped message is ignored where it stands — no form, nothing removed —
-so members book with `/book`, which is never public at any point. The booker
-gets a private receipt with an **OK** button either way. The separate availability
+so members book with `/book`, which is never public at any point. Whether a
+message reads as a booking is decided once, on the text with its @handles and
+`+1` taken out, so the delete and the form never disagree: an admin's "+1 for
+squash" stays where it is. A booking form Telegram would only deliver as a
+group message is deleted, and the booker is asked to try again. The booker
+gets a private receipt with **OK** and **🗑 Cancel booking** either way — the
+receipt is the one message every booker has, so it is where they cancel from;
+cancelling asks to confirm first. The separate availability
 announcement shows the court, time, free slots and who is on it already, so
 "should I join" is answerable from the message; it does not name the booker.
 
 Each player is reminded two hours before their court and again at 10am on the
 day. Reminders and receipts clear themselves at the end of the day they are
-about. Telegram does not guarantee ephemeral delivery when the recipient is
+about. Panels — the court list, Manage, a 🧾 tab breakdown — are working
+surfaces rather than records, so each clears itself a day after it opens.
+Telegram does not guarantee ephemeral delivery when the recipient is
 offline; if it refuses, the private copy is deleted and the whole roster is
 reminded once in the group rather than one public post per player. Refusal is
 the detectable case only: Telegram can also accept an ephemeral send — id
@@ -316,8 +330,8 @@ player is told it was removed. It reaches only rows `/debt` wrote, and only for
 7 days: court charges and settlements are money that really moved, and the rest
 of the ledger stays append-only.
 
-Booking ids are small sequential numbers, so editing or removing one — by command
-or from **⚙️ Manage** — is limited to whoever booked the court and to group
+Booking ids are small sequential numbers, so editing or removing one — by command,
+from the receipt, or from **⚙️ Manage** — is limited to whoever booked the court and to group
 admins. Once the court starts, only a group admin can change or cancel it: the
 tab is charged when the booking expires, so a cancellation during the hour of
 play — or a move to tomorrow and a cancellation there — would erase everyone's

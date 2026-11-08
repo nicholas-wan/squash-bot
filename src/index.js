@@ -6,7 +6,8 @@ import {
 import { handleMiniAppApi } from './miniapp-api.js';
 import { rememberLedgerIdentity } from './ledger-identity.js';
 import {
-  addPlayerView, authorizeBookingChange, bookingPanelView, cancelBooking, deletePanelView,
+  addPlayerView, authorizeBookingChange, boardButtonName, bookingPanelView, cancelBooking,
+  deletePanelView, receiptView,
   deliverSightedTabNotice, managerView, plusOneView,
   removePlayerView, restoreBoardButtons, runMaintenance, joinPickerView, updateBoard,
 } from './bookings.js';
@@ -14,7 +15,6 @@ import {
   defaultCapacity, forgetRole, isChatAdmin, isHouseholdPlayer, isOwner, knownPlayers, ownerName,
   rememberPlayer,
 } from './players.js';
-import { looksLikeBooking } from './parser.js';
 import { allowedChats } from './scope.js';
 import { formatMoney } from './pricing.js';
 import {
@@ -28,7 +28,7 @@ import {
   sendMessage, setBotProfilePhoto, telegram,
 } from './telegram.js';
 import {
-  beginBooking, beginEditBooking, handleBookingCallback, handleBookingReply,
+  beginBooking, beginEditBooking, bookingIntent, handleBookingCallback, handleBookingReply,
   pruneBookingDrafts,
 } from './wizard.js';
 
@@ -45,7 +45,7 @@ function chatAllowed(env, chat) {
   return false;
 }
 
-function helpHtml(env) {
+function helpHtml(env, chatId) {
   return '🎾 <b>SquashBot</b>\n\n' +
     'Send a booking in natural language:\n' +
     '<code>13 Aug Court 4 9pm</code>\n' +
@@ -54,8 +54,8 @@ function helpHtml(env) {
     'Courts run <b>7am to 10pm</b>, so 9pm is the last slot.\n' +
     'No end time means one hour. If anything is missing or ambiguous, ' +
     'SquashBot asks with buttons and saves only after confirmation.\n\n' +
-    `Every court holds <b>${defaultCapacity(env)} players</b> by default — tap a ` +
-    '🙋 button on the pinned board to join or leave. Group admins can open extra ' +
+    `Every court holds <b>${defaultCapacity(env)} players</b> by default — tap ` +
+    `${boardButtonName(env, chatId)} on the pinned board to join or leave. Group admins can open extra ` +
     'slots from <b>Manage bookings</b>.\n' +
     'Courts cost <b>$6/hour</b> from 6pm, on weekends, and on Singapore public ' +
     'holidays, and <b>$3/hour</b> before 6pm on other days. Your share appears on ' +
@@ -93,8 +93,9 @@ async function helpBoardMarkup(env, chatId) {
 // are gated, and which deliberately are not, reads straight down this table.
 // sb:manage and sb:pick only *render*, but what they render includes rosters a
 // non-admin member is deliberately not shown, so they carry the gate too;
-// sb:edit, sb:delete, and sb:cancel guard themselves through
+// sb:edit, sb:delete, sb:cancel, and sb:keep guard themselves through
 // authorizeBookingChange, whose booker-or-admin rule this table cannot express.
+// sb:back is open to everyone but only ever edits the pinned board itself.
 // sb:ok and sb:close are open to everyone because the message they clear is
 // normally the tapper's own receipt — dismissMessage checks the pinned board
 // and tab ids itself, since a hand-sent sb:ok naming one would otherwise
@@ -109,8 +110,9 @@ const boardRoutes = [
   { pattern: /^sb:back$/, handler: restoreBoard },
   { pattern: /^sb:pick:(\d+)$/, admin: MANAGE_ADMIN, handler: openBookingPanel },
   { pattern: /^sb:edit:(\d+):([dct])$/, handler: openEditForm },
-  { pattern: /^sb:delete:(\d+)$/, handler: openDeleteConfirmation },
+  { pattern: /^sb:delete:(\d+)(?::(r))?$/, handler: openDeleteConfirmation },
   { pattern: /^sb:cancel:(\d+)$/, handler: cancelFromPanel },
+  { pattern: /^sb:keep:(\d+)$/, handler: keepFromReceipt },
   { pattern: /^sb:join$/, handler: openJoinPicker },
   { pattern: /^sb:(?:close|ok)$/, handler: dismissTapped },
   { pattern: /^sb:full:(\d+)$/, handler: fullCourtToast },
@@ -168,10 +170,25 @@ async function openManager(env, callback) {
 }
 
 async function restoreBoard(env, callback) {
-  await restoreBoardButtons(
-    env, callback.message.chat.id, callback.message.message_id
-  );
+  const chatId = callback.message.chat.id;
+  if (await isPinnedBoard(env, chatId, callback.message)) {
+    await restoreBoardButtons(env, chatId, callback.message.message_id);
+  }
   await answerCallback(env, callback.id);
+}
+
+// Restoring the board's buttons writes them onto whichever message the tap
+// came from, and Telegram never checks callback data against the keyboard it
+// drew: a hand-sent sb:back aimed at the pinned tab swapped 🧾 My tab for the
+// board's button, and aimed at the availability message it stuck, since that
+// message is only redrawn when its own rendering changes. Only the pinned
+// board itself is ever given the board's buttons.
+async function isPinnedBoard(env, chatId, message) {
+  if (!message || message.ephemeral_message_id || !message.message_id) return false;
+  const setting = await env.DB.prepare(
+    'SELECT board_message_id FROM settings WHERE chat_id = ?'
+  ).bind(chatId).first();
+  return Boolean(setting && Number(setting.board_message_id) === Number(message.message_id));
 }
 
 async function openBookingPanel(env, callback, match) {
@@ -200,8 +217,9 @@ async function openEditForm(env, callback, match) {
     found ? `Change ${field} form opened` : 'That booking has already gone.', !found);
   // Restoring the board's buttons only means anything when the tap came off
   // the pinned board itself. From a private panel the message id is the
-  // ephemeral one's 0, and the edit was a doomed request on every tap.
-  if (found && !callback.message.ephemeral_message_id && messageId) {
+  // ephemeral one's 0, and the edit was a doomed request on every tap; from
+  // any other message it would put the board's buttons on it.
+  if (found && await isPinnedBoard(env, chatId, callback.message)) {
     await restoreBoardButtons(env, chatId, messageId);
   }
 }
@@ -215,10 +233,28 @@ async function openDeleteConfirmation(env, callback, match) {
     await answerCallback(env, callback.id, permitted.message, true);
     return;
   }
-  const view = await deletePanelView(env, chatId, Number(match[1]));
+  const view = await deletePanelView(env, chatId, Number(match[1]), Date.now(),
+    { fromReceipt: match[2] === 'r' });
   if (view) await showPanel(env, callback, view);
   await answerCallback(env, callback.id, view ? '' : 'That booking has already gone.', !view);
   if (!view) await updateBoard(env, chatId);
+}
+
+// Keep booking, on a cancel opened from the booker's receipt: the receipt
+// comes back. It names the roster, so it is only redrawn for somebody who
+// could have cancelled the court — a court already started included, since
+// putting a receipt back changes nothing.
+async function keepFromReceipt(env, callback, match) {
+  const chatId = callback.message.chat.id;
+  const bookingId = Number(match[1]);
+  const permitted = await authorizeBookingChange(env, chatId, bookingId, callback.from, 'change');
+  if (!permitted.allowed && permitted.status !== 'started') {
+    await answerCallback(env, callback.id, permitted.message, true);
+    return;
+  }
+  const view = await receiptView(env, chatId, bookingId);
+  if (view) await showPanel(env, callback, view);
+  await answerCallback(env, callback.id, view ? '' : 'That booking has already gone.', !view);
 }
 
 async function cancelFromPanel(env, callback, match) {
@@ -232,6 +268,15 @@ async function cancelFromPanel(env, callback, match) {
     await answerCallback(env, callback.id,
       removed ? 'Booking cancelled' : result.message, !removed);
   } finally {
+    // The confirmation would otherwise stay up offering to delete a court
+    // that is already gone. The toast has said it worked; this only tidies.
+    if (removed && callback.message.ephemeral_message_id) {
+      later.defer(() => showPanel(env, callback, {
+        html: '🗑 <b>Booking cancelled.</b>', replyMarkup: OK_MARKUP,
+      }).catch((error) => {
+        console.log(`Cancelled panel redraw failed: ${error.stack || error}`);
+      }));
+    }
     await later.drain();
   }
 }
@@ -408,11 +453,36 @@ async function deliverPrivately(env, chatId, userId, html, options = {}) {
   return { status: 'failed', sent };
 }
 
-function sendPrivatePanel(env, callback, view) {
-  return deliverPrivately(env, callback.message.chat.id, callback.from.id, view.html, {
+async function sendPrivatePanel(env, callback, view) {
+  const delivery = await deliverPrivately(env, callback.message.chat.id, callback.from.id, view.html, {
     callbackQueryId: callback.id,
     replyMarkup: view.replyMarkup,
   });
+  await expirePanel(env, callback.message.chat.id, callback.from.id, delivery);
+  return delivery;
+}
+
+// A panel is a working surface, not a record: a court list, Manage, a
+// breakdown of somebody's tab. Each tap on 🙋 Join or 🧾 My tab opened a new
+// one and none of them ever went, so a person's chat collected stale lists
+// and balances. Each is handed to the message sweep a day after it opens.
+// Receipts are not, so whoever was told something can keep it.
+const PANEL_LIFETIME_MS = 24 * 60 * 60 * 1000;
+
+async function expirePanel(env, chatId, userId, delivery) {
+  const messageId = delivery.status === 'private' && delivery.sent.result.ephemeral_message_id;
+  if (!messageId) return;
+  const now = Date.now();
+  try {
+    await env.DB.prepare(
+      `INSERT INTO sent_messages
+        (chat_id, receiver_user_id, message_id, is_ephemeral, delete_after, created_at)
+       VALUES (?, ?, ?, 1, ?, ?)`
+    ).bind(chatId, userId, messageId, now + PANEL_LIFETIME_MS, now).run();
+  } catch (error) {
+    // The panel is already in front of them; only its tidying is lost.
+    console.log(`Panel cleanup record failed: ${error.stack || error}`);
+  }
 }
 
 function editSucceeded(result) {
@@ -818,12 +888,49 @@ async function clearSentMessage(env, msg, kind = 'booking message') {
 // queued for them goes out once their own tap or message has been dealt with,
 // so their answer never waits behind it, and a failure here is logged rather
 // than allowed to fail the update it rode in on.
-export async function handleUpdate(env, update) {
+export async function handleUpdate(env, update, { identities = null } = {}) {
   try {
-    await dispatchUpdate(env, update);
+    await dispatchUpdate(env, update, identities);
   } finally {
     await noticeSighting(env, update);
   }
+}
+
+// Whose identity an update records: the tapper, or the sender of a text
+// message — exactly the updates dispatchUpdate remembers somebody for.
+function updateSender(update) {
+  const callback = update && update.callback_query;
+  if (callback) return callback.message ? { chat: callback.message.chat, from: callback.from } : null;
+  const msg = update && update.message;
+  if (!msg || !msg.text || !msg.chat || msg.pinned_message
+    || msg.left_chat_member || msg.new_chat_members) return null;
+  return { chat: msg.chat, from: msg.from };
+}
+
+// Separate tables, so the two identity writes run together.
+function rememberSender(env, chat, from) {
+  return Promise.all([rememberPlayer(env, from), rememberLedgerIdentity(env, chat.id, from)]);
+}
+
+// Every update paid two database writes one after the other before its
+// handler ran: the redelivery record, then the sender's identity. Both are
+// safe to repeat, so the webhook starts the identity writes alongside the
+// record rather than behind it, saving a round trip on every tap. The promise
+// settles to the error rather than rejecting, so a failure surfaces where the
+// handler waits for it instead of as an unhandled rejection in between.
+export function startIdentityWrites(env, update) {
+  const sender = updateSender(update);
+  if (!sender || !allowedChats(env).includes(Number(sender.chat.id))) return null;
+  return rememberSender(env, sender.chat, sender.from).then(() => null, (error) => error);
+}
+
+async function settleIdentities(env, chat, from, identities) {
+  if (!identities) {
+    await rememberSender(env, chat, from);
+    return;
+  }
+  const failure = await identities;
+  if (failure) throw failure;
 }
 
 async function noticeSighting(env, update) {
@@ -843,16 +950,12 @@ async function noticeSighting(env, update) {
   }
 }
 
-async function dispatchUpdate(env, update) {
+async function dispatchUpdate(env, update, identities = null) {
   const callback = update.callback_query;
   if (callback && callback.message) {
     if (!chatAllowed(env, callback.message.chat)) return;
     try {
-      // Separate tables, so the two identity writes run together.
-      await Promise.all([
-        rememberPlayer(env, callback.from),
-        rememberLedgerIdentity(env, callback.message.chat.id, callback.from),
-      ]);
+      await settleIdentities(env, callback.message.chat, callback.from, identities);
       if (await handleBoardCallback(env, callback)) return;
       if (await handleTabCallback(env, callback)) return;
       await handleBookingCallback(env, callback);
@@ -863,7 +966,7 @@ async function dispatchUpdate(env, update) {
       // itself committed before the failure. Answering twice is harmless;
       // Telegram ignores the second answer.
       await answerCallback(env, callback.id,
-        '⚠️ Something went wrong. Please try again.', true);
+        (error && error.userMessage) || '⚠️ Something went wrong. Please try again.', true);
     }
     return;
   }
@@ -902,16 +1005,14 @@ async function dispatchUpdate(env, update) {
   let clearedText = null;
 
   try {
-    await Promise.all([
-      rememberPlayer(env, msg.from), rememberLedgerIdentity(env, msg.chat.id, msg.from),
-    ]);
+    await settleIdentities(env, msg.chat, msg.from, identities);
     if (await handleBookingReply(env, msg)) return;
     if (!text.startsWith('/')) {
       // The booking form repeats the text back, and the pinned board is the
       // record, so the original message is cleared out of the group. The intent
       // is read up front and the delete runs in a finally, because a form that
       // fails to open would otherwise leave the booking sitting in the chat.
-      const isBooking = looksLikeBooking(text);
+      const isBooking = bookingIntent(text, msg);
       // The gate is deliberately loose — "I booked 2 tickets" reads as a
       // booking — and it is the delete that makes that expensive: ordinary
       // chat from a member was being cleared out of the group for looking
@@ -921,10 +1022,14 @@ async function dispatchUpdate(env, update) {
       // round trip, which is why it hangs off isBooking rather than running
       // on every message in the chat. /book stays open to everyone.
       if (isBooking && !(await isChatAdmin(env, msg.chat.id, msg.from))) return;
+      // The message only goes once the form is on its way, or it failed on
+      // the way and the text is handed back below. A form that declined to
+      // open must not take the message with it.
+      let opened = true;
       try {
-        await beginBooking(env, msg, text);
+        opened = await beginBooking(env, msg, text);
       } finally {
-        if (isBooking && msg.message_id) {
+        if (isBooking && opened !== false && msg.message_id) {
           clearedText = text;
           await clearSentMessage(env, msg);
         }
@@ -983,7 +1088,7 @@ async function dispatchUpdate(env, update) {
       const [replyMarkup] = await Promise.all([
         helpBoardMarkup(env, msg.chat.id), clearCommand,
       ]);
-      await sendMessage(env, msg.chat.id, helpHtml(env), {
+      await sendMessage(env, msg.chat.id, helpHtml(env, msg.chat.id), {
         receiverUserId: msg.from.id,
         replyToEphemeral: msg.ephemeral_message_id || null,
         replyMarkup,
@@ -1033,8 +1138,9 @@ async function dispatchUpdate(env, update) {
       const view = await myTabView(
         env, msg.chat.id, msg.from, isChatAdmin(env, msg.chat.id, msg.from)
       );
-      await privateReply(env, msg,
+      const delivery = await privateReply(env, msg,
         `💰 Nothing outstanding on the group tab.\n\n${view.html}`, view.replyMarkup);
+      await expirePanel(env, msg.chat.id, msg.from.id, delivery);
       return;
     }
     // Money the courts did not produce: a ball somebody replaced, cash handed
@@ -1145,7 +1251,7 @@ async function dispatchUpdate(env, update) {
     // anything the person can actually act on before it throws.
     console.log(`Update failed: ${error.stack || error}`);
     await sendMessage(env, msg.chat.id,
-      '⚠️ Something went wrong. Please try again.'
+      ((error && error.userMessage) || '⚠️ Something went wrong. Please try again.')
       // Their message was deleted before this failed, so it only exists here.
       + (clearedText ? `\n\n<code>${escapeHtml(clearedText)}</code>` : ''), {
         receiverUserId: msg.from.id,
@@ -1224,7 +1330,10 @@ export default {
       } catch {
         return new Response('bad request', { status: 400 });
       }
+      const identities = startIdentityWrites(env, update);
       if (!(await firstSighting(env, update))) {
+        // Harmless to have repeated; only kept alive until it finishes.
+        if (identities) ctx.waitUntil(identities);
         console.log(`Update ${update.update_id} redelivered by Telegram; already handled`);
         return new Response('ok');
       }
@@ -1237,7 +1346,7 @@ export default {
         // dropped, the answer falls back to HTTPS, and Telegram is not left
         // holding the webhook long enough to redeliver the whole update.
         const reply = armWebhookAnswer(callback.id);
-        ctx.waitUntil(handleUpdate(env, update).finally(() => reply.disarm()));
+        ctx.waitUntil(handleUpdate(env, update, { identities }).finally(() => reply.disarm()));
         const answer = await Promise.race([
           reply.promise,
           new Promise((resolve) => setTimeout(() => resolve(null), WEBHOOK_ANSWER_WAIT_MS)),
@@ -1258,7 +1367,7 @@ export default {
           })
           : new Response('ok');
       }
-      ctx.waitUntil(handleUpdate(env, update));
+      ctx.waitUntil(handleUpdate(env, update, { identities }));
       return new Response('ok');
     }
 

@@ -136,6 +136,13 @@ Returning to a visible app refreshes its current screen without replacing an
 open booking form. Telegram 6.1+ uses the native MainButton to save a booking;
 older clients and browser preview keep the page button. Unsaved form changes
 prompt before Back or Close, with Telegram closing confirmation on 6.2+.
+The booking form opens the sheet to full height, and moving its start time
+carries the finish with it, keeping the length and stopping at 10pm. Its court
+box takes a number, a letter or a name, read the way the chat's typed court
+is, so a court saved in chat as a name can still be edited here. A request
+that has not answered in fifteen seconds is given up with a toast, and the
+screen is asked again in case a write landed; an error page with no message
+of ours still says something went wrong.
 
 ## Upgrading a live database
 
@@ -163,6 +170,7 @@ npm run db:migrate:015
 npm run db:migrate:016
 npm run db:migrate:017
 npm run db:migrate:018
+npm run db:migrate:019
 npm run db:verify
 ```
 
@@ -173,7 +181,9 @@ table/index/trigger migrations. 018 replaces the alias-claim trigger, which
 `schema.sql` cannot do on a live database because its triggers are
 `IF NOT EXISTS`: the old one left a handle's charge behind when the same court
 was also billed to the verified id. It also adds the tab-notice index and
-moves any such leftover onto the id. 015
+moves any such leftover onto the id. 019 adds the index that finds your own
+tab by numeric id; `schema.sql` creates it too, so on a live database either
+one is enough. 015
 adds the table that records every Telegram update id once, so an update
 Telegram redelivers is answered and dropped rather than handled twice — the
 guard that keeps a redelivered `/debt` from writing a second row. 014 replaces

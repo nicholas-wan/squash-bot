@@ -8,7 +8,7 @@ import {
 } from './bookings.js';
 import { courtName, compactTimeRange, shortDate } from './format.js';
 import { verifyInitData } from './miniapp-auth.js';
-import { BookingParseError, bookingFromDraft, extractCourt } from './parser.js';
+import { BookingParseError, bookingFromDraft, extractCourt, parseField } from './parser.js';
 import { rememberLedgerIdentity } from './ledger-identity.js';
 import {
   chatRole, knownPlayers, ownerName, rememberPlayer, ROLE_FRESH_MS, RosterCapacityError,
@@ -60,10 +60,16 @@ const parseClock = (value) => {
 
 // The form's fields go through the same rules as a typed booking: opening
 // hours, a finish after the start, and the reminder times all come from
-// bookingFromDraft. The court is read the way the parser reads "court 4".
+// bookingFromDraft. The court is read the way the parser reads "court 4",
+// and a named court the way the chat wizard reads a typed one: a court saved
+// there as "GLASS" used to fail every Mini App save, even one that only
+// moved its date. Two courts in one box are still refused, not guessed.
 function bookingFromForm(body, now, tz) {
-  const court = extractCourt(`court ${String(body.court || '').replace(/^\s*court\s*/i, '')}`).value;
-  if (!court) throw new BookingParseError('Type a court number or letter.');
+  const raw = String(body.court || '').trim();
+  const listed = extractCourt(`court ${raw.replace(/^court\s*/i, '')}`);
+  const court = listed.value
+    || (listed.choices.length ? null : parseField('court', raw, now, tz).value);
+  if (!court) throw new BookingParseError('Type a court number or name, such as 4 or A.');
   const draft = {
     date: parseDate(body.date), start: parseClock(body.start), end: parseClock(body.end), court,
   };
@@ -292,13 +298,19 @@ const routes = [
     return personReply(env, chatId, undone.slug, {
       ok: true,
       message: `Undone: ${what.toLowerCase()} on ${undone.name}'s tab.`,
-    });
+    }, undone.name);
   }],
 ];
 
 // One person's tab for an admin, with whatever the action before it has to say.
-async function personReply(env, chatId, slug, extra = { ok: true }) {
+// An undo can take away the only row an account had — a /debt typed against
+// the wrong person, who had never played — and that is a success, so given
+// the name it is answered as an empty, settled tab rather than as a refusal.
+async function personReply(env, chatId, slug, extra = { ok: true }, emptyName = null) {
   const rows = await accountRows(env, chatId, slug);
+  if (!rows.length && emptyName) {
+    return json({ ...extra, person: { slug, name: emptyName, balance: 0, earlier: null, lines: [] } });
+  }
   if (!rows.length) return json({ ok: false, message: 'Nothing on that tab any more.' });
   return json({
     ...extra,

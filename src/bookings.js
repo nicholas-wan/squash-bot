@@ -114,18 +114,44 @@ async function confirmToBooker(env, chatId, bookingId, booking, capacity, from, 
   if (!from || !from.id) return;
   const tz = await getTimezone(env, chatId);
   const startsAt = booking.startsAt ?? booking.starts_at;
-  const endsAt = booking.endsAt ?? booking.ends_at;
-  const court = courtName(booking);
   const roster = await rosterFor(env, bookingId);
   // If OK is never tapped it still clears itself at the end of the day, and a
   // receipt Telegram could not keep private is removed rather than left up.
-  await sendPrivately(env, chatId,
-    `🎾 <b>${escapeHtml(court)} booked</b>\n` +
-    `${formatDate(startsAt, tz)} · ${compactTimeRange(startsAt, endsAt, tz)}\n` +
-    `👥 ${playerTags(roster)} · ${slotsLabel(roster, capacity)}`,
+  await sendPrivately(env, chatId, receiptHtml(booking, roster, capacity, tz),
     from.id, endOfLocalDay(startsAt, tz),
-    { callbackQueryId, replyMarkup: OK_MARKUP }
+    { callbackQueryId, replyMarkup: receiptMarkup(bookingId) }
   );
+}
+
+function receiptHtml(booking, roster, capacity, tz) {
+  const startsAt = booking.startsAt ?? booking.starts_at;
+  const endsAt = booking.endsAt ?? booking.ends_at;
+  return `🎾 <b>${escapeHtml(courtName(booking))} booked</b>\n` +
+    `${formatDate(startsAt, tz)} · ${compactTimeRange(startsAt, endsAt, tz)}\n` +
+    `👥 ${playerTags(roster)} · ${slotsLabel(roster, capacity)}`;
+}
+
+// Whoever booked a court may cancel it, but without the Mini App nothing they
+// could see led there: Manage is for admins, the court list only joins and
+// leaves, and /cancel wants an id no message ever showed. The receipt is the
+// one message every booker has, so it carries the way out. The trailing :r
+// marks the confirmation as opened from a receipt, so its Keep button can put
+// the receipt back instead of opening Manage, which a member is refused.
+function receiptMarkup(bookingId) {
+  return { inline_keyboard: [[
+    OK_MARKUP.inline_keyboard[0][0],
+    { text: '🗑 Cancel booking', callback_data: `sb:delete:${bookingId}:r` },
+  ]] };
+}
+
+// The receipt drawn again, for Keep booking on a cancel opened from it.
+export async function receiptView(env, chatId, bookingId) {
+  const { booking, roster, tz } = await courtWithRoster(env, chatId, bookingId);
+  if (!booking) return null;
+  return {
+    html: receiptHtml(booking, roster, booking.capacity || DEFAULT_CAPACITY, tz),
+    replyMarkup: receiptMarkup(booking.id),
+  };
 }
 
 export async function addBooking(
@@ -1080,15 +1106,25 @@ async function notifyRosterDirectly(env, chatId, roster, html, deleteAfter, excl
 // The person taken off is told privately. Deliberately narrower than the
 // join/leave notices: the rest of the court is not told a kick freed a slot —
 // an asymmetry recorded in docs/known-gaps.md, not an oversight.
-export async function notifyRemovedPlayer(env, chatId, player, booking) {
+export async function notifyRemovedPlayer(env, chatId, player, booking, now = Date.now()) {
   if (!player.user_id) return;
   const tz = await getTimezone(env, chatId);
+  // Joining closes when the court starts, so a player taken off during play
+  // cannot put themselves back, and being told to try would be a dead end.
+  const rejoin = booking.starts_at > now
+    ? `\nTap ${boardButtonName(env, chatId)} on the pinned board if that was a mistake.`
+    : '\nAsk a group admin if that was a mistake.';
   // The chat the admin acted in, for the same reason a join notice goes there.
   await sendPrivately(env, chatId,
     `🚪 You were taken off <b>${escapeHtml(courtName(booking))}</b> on ` +
-    `${formatDate(booking.starts_at, tz)} · ${formatTime(booking.starts_at, tz)}.\n` +
-    'Tap the 🙋 button on the pinned board if that was a mistake.',
+    `${formatDate(booking.starts_at, tz)} · ${formatTime(booking.starts_at, tz)}.` + rejoin,
     player.user_id, endOfLocalDay(booking.starts_at, tz), { replyMarkup: OK_MARKUP });
+}
+
+// With the Mini App registered the pinned board carries 🎾 Courts rather than
+// 🙋 Join, and pointing people at a button they cannot find is a dead end.
+export function boardButtonName(env, chatId) {
+  return miniAppLink(env, chatId) ? '🎾 Courts' : '🙋 Join';
 }
 
 // The board names who is on a court only once it is full, so the whole roster
@@ -1203,7 +1239,7 @@ export async function notifyRosterOfChange(
   };
 }
 
-export async function deletePanelView(env, chatId, bookingId, now = Date.now()) {
+export async function deletePanelView(env, chatId, bookingId, now = Date.now(), { fromReceipt = false } = {}) {
   const booking = await openBooking(env, chatId, bookingId);
   if (!booking) return null;
   const tz = await getTimezone(env, chatId);
@@ -1217,7 +1253,10 @@ export async function deletePanelView(env, chatId, bookingId, now = Date.now()) 
         : ''),
     replyMarkup: { inline_keyboard: [
       [{ text: '🗑 Confirm delete', callback_data: `sb:cancel:${booking.id}` }],
-      [{ text: '← Keep booking', callback_data: `sb:pick:${booking.id}` }, CLOSE_BUTTON],
+      [{
+        text: '← Keep booking',
+        callback_data: fromReceipt ? `sb:keep:${booking.id}` : `sb:pick:${booking.id}`,
+      }, CLOSE_BUTTON],
     ] },
   };
 }
@@ -1605,8 +1644,13 @@ async function removeExpiredBookings(env, now) {
 // isolate, a Telegram hiccup) used to leave the countdown wrong until the
 // next midnight, and one transient failure is not worth a day of lying.
 // Success trades the hour stamp for the day's, which ends the retrying.
+//
+// Under DATA_CHAT_ID one updateBoard redraws every group's board, so the
+// stale groups sharing one set of bookings are redrawn together, once. Called
+// per group, as it used to be, N groups cost N² edits every midnight.
 async function refreshStaleBoards(env, now) {
   let failures = 0;
+  const stale = new Map();
   for (const chatId of allowedChats(env)) {
     try {
       const tz = await getTimezone(env, chatId);
@@ -1620,13 +1664,62 @@ async function refreshStaleBoards(env, now) {
       if (setting.board_day === today || setting.board_day === attempt) continue;
       await env.DB.prepare('UPDATE settings SET board_day = ? WHERE chat_id = ?')
         .bind(attempt, chatId).run();
-      await updateBoard(env, chatId);
-      await env.DB.prepare('UPDATE settings SET board_day = ? WHERE chat_id = ?')
-        .bind(today, chatId).run();
+      const key = dataChatId(env, chatId);
+      if (!stale.has(key)) stale.set(key, []);
+      stale.get(key).push({ chatId, today });
+    } catch (error) {
+      failures += 1;
+      console.log(`Daily board redraw for chat ${chatId} failed: ${error.stack || error}`);
+    }
+  }
+  for (const group of stale.values()) {
+    try {
+      // The first stale group is the acting chat, whose failure is thrown;
+      // a sibling's is queued for a retry by updateBoard itself.
+      await updateBoard(env, group[0].chatId);
+      for (const { chatId, today } of group) {
+        await env.DB.prepare('UPDATE settings SET board_day = ? WHERE chat_id = ?')
+          .bind(today, chatId).run();
+      }
     } catch (error) {
       failures += 1;
       // One chat's dead board is its own problem; the others still redraw.
-      console.log(`Daily board redraw for chat ${chatId} failed: ${error.stack || error}`);
+      console.log(`Daily board redraw for chat ${group[0].chatId} failed: ${error.stack || error}`);
+    }
+  }
+  return failures;
+}
+
+// The board marks a court "playing now" once it starts, since its roster is
+// locked from then on, but nothing redrew the board at that moment: a court
+// in play kept offering its slots until it ended. The scheduler already wakes
+// at every start, so the sweep after one redraws the boards it concerns. The
+// window covers a tick that runs a little late; a repeat inside it changes
+// nothing on the board.
+const START_REDRAW_WINDOW_MS = 5 * 60 * 1000;
+
+async function refreshStartedBoards(env, now) {
+  const scope = chatScope(env, 'chat_id');
+  const since = now - START_REDRAW_WINDOW_MS;
+  const { results } = await env.DB.prepare(
+    `SELECT chat_id, starts_at, ends_at FROM bookings
+     WHERE starts_at <= ? AND starts_at > ? AND ends_at > ?${scope.sql}`
+  ).bind(now, since, now, ...scope.args).all();
+  // The rows are checked against the window and the allowlist again: a
+  // redraw is a Telegram call per group, and it must never reach a chat the
+  // sweep does not serve, whatever a looser database adapter hands back.
+  const chats = maintenanceChats(env);
+  const started = new Set(results
+    .filter((row) => row.starts_at <= now && row.starts_at > since && row.ends_at > now
+      && chats.includes(Number(row.chat_id)))
+    .map((row) => Number(row.chat_id)));
+  let failures = 0;
+  for (const chatId of started) {
+    try {
+      await updateBoard(env, chatId, now);
+    } catch (error) {
+      failures += 1;
+      console.log(`Board redraw at court start for chat ${chatId} failed: ${error.stack || error}`);
     }
   }
   return failures;
@@ -1919,6 +2012,7 @@ export async function runMaintenance(env, now = Date.now()) {
     ['two-hour reminders', () => sendPreReminders(env, now)],
     ['queued pinned refreshes', () => flushPendingRefreshes(env)],
     ['board refresh', () => refreshStaleBoards(env, now)],
+    ['court start redraw', () => refreshStartedBoards(env, now)],
     ['monthly tab notices', () => queueMonthlyTabNotices(env, now)],
     ['overdue tab notices', () => sendOverdueTabNotices(env, now)],
     ['day reminders', () => sendDueReminders(env, now)],

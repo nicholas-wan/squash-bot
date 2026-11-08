@@ -190,6 +190,11 @@ CREATE INDEX IF NOT EXISTS idx_booking_players_reminder
 CREATE INDEX IF NOT EXISTS idx_ledger_chat
   ON ledger (chat_id, slug);
 
+-- Your own tab is found by numeric id, which the slug index cannot serve, so
+-- every 🧾 open read the group's whole ledger.
+CREATE INDEX IF NOT EXISTS idx_ledger_user
+  ON ledger (chat_id, user_id, created_at);
+
 CREATE INDEX IF NOT EXISTS idx_sent_messages_due
   ON sent_messages (delete_after);
 

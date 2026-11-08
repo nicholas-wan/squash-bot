@@ -179,6 +179,11 @@ function writtenDate(input, current) {
   match = null;
   for (const numeric of input.matchAll(/\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b/g)) {
     if (followsCourtWord(input, numeric.index)) continue;
+    // A pair touching a clock is part of a time range, never a date: the
+    // "30-8" in "7:30-8:30pm" read as 30 Aug, and the "8-9" in "8-9:30pm"
+    // as 8 Sep, so "fri 7:30-8:30pm" was refused as a date already passed.
+    if (/[:.]$/.test(input.slice(0, numeric.index))
+      || /^(?:[:.]\d|\s*(?:am|pm)\b)/.test(input.slice(numeric.index + numeric[0].length))) continue;
     if (numeric[0].includes('-') && !numeric[3]
       && readsAsTimeRange(numeric[1], numeric[2])
       && !statesClockElsewhere(input, numeric.index, numeric[0].length)) continue;
@@ -241,11 +246,26 @@ function clockCandidates(raw, inheritedMeridiem = null) {
   const clean = String(raw).trim().toLowerCase().replace(/\s+/g, '');
   if (clean === 'noon') return [{ h: 12, mi: 0 }];
   if (clean === 'midnight') return [{ h: 0, mi: 0 }];
+  // "830pm" is 8:30pm written without its colon. With am or pm the hour must
+  // be a 12-hour one, so "2030pm" is refused rather than guessed at.
+  const compact = clean.match(/^(\d{1,2})(\d{2})(am|pm)$/);
+  if (compact) {
+    const h = Number(compact[1]);
+    const mi = Number(compact[2]);
+    if (h < 1 || h > 12 || mi > 59) return [];
+    return [{ h: h % 12 + (compact[3] === 'pm' ? 12 : 0), mi }];
+  }
   if (/^\d{3,4}$/.test(clean)) {
     const padded = clean.padStart(4, '0');
     const h = Number(padded.slice(0, 2));
     const mi = Number(padded.slice(2));
-    return h <= 23 && mi <= 59 ? [{ h, mi }] : [];
+    if (h > 23 || mi > 59) return [];
+    // The bare side of "730-830pm" borrows the other side's pm, as "7-9pm"
+    // does; a 24-hour figure such as 1930 has nothing to borrow.
+    if (inheritedMeridiem && h >= 1 && h <= 12) {
+      return [{ h: h % 12 + (inheritedMeridiem === 'pm' ? 12 : 0), mi }];
+    }
+    return [{ h, mi }];
   }
   const match = clean.match(/^(\d{1,2})(?:(?::|\.)(\d{2}))?(am|pm)?$/);
   if (!match) return [];
@@ -305,7 +325,7 @@ function statesClockElsewhere(input, index, length) {
 export function extractTime(text, nowMs = Date.now(), tz = 'Asia/Singapore') {
   const input = String(text).toLowerCase();
   const current = localParts(nowMs, tz);
-  const atom = '(?:\\d{1,2}(?:(?::|\\.)\\d{2})?\\s*(?:am|pm)?|\\d{3,4}|noon|midnight)';
+  const atom = '(?:\\d{1,2}(?:(?::|\\.)\\d{2})?\\s*(?:am|pm)?|\\d{3,4}(?:am|pm)?|noon|midnight)';
   // Never a piece of a date: "2026-08-13" holds "2026-08" and "08-13", and
   // neither is a time range.
   const range = input.match(new RegExp(
@@ -332,7 +352,7 @@ export function extractTime(text, nowMs = Date.now(), tz = 'Asia/Singapore') {
   }
 
   const tokens = [];
-  const explicit = /\b(?:\d{1,2}(?:(?::|\.)\d{2})?\s*(?:am|pm)|\d{1,2}(?::|\.)\d{2}|\d{3,4}|noon|midnight)\b/gi;
+  const explicit = /\b(?:\d{1,2}(?:(?::|\.)\d{2})?\s*(?:am|pm)|\d{1,2}(?::|\.)\d{2}|\d{3,4}(?:am|pm)?|noon|midnight)\b/gi;
   for (const match of input.matchAll(explicit)) {
     const token = match[0];
     const before = input.slice(Math.max(0, match.index - 20), match.index);
@@ -369,7 +389,9 @@ export function extractTime(text, nowMs = Date.now(), tz = 'Asia/Singapore') {
 // original, so a false positive here destroys somebody's unrelated text.
 // `ct`/`crt` are deliberate abbreviations and may keep their space.
 const COURT_ABBREVIATION = /\b(?:crt|ct)\s*#?\s*(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)\b|\bc#?\d{1,2}\b/i;
-const CLOCK_TOKEN = /\b(?:\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm)|\d{1,2}[:.]\d{2}|(?:[01]?\d|2[0-3])[0-5]\d|noon|midnight)\b/i;
+// Only a real 12-hour hour counts before am or pm: the "30pm" left over from
+// "8-9:30pm" once the pair is set aside is not a clock somewhere else.
+const CLOCK_TOKEN = /\b(?:(?:1[0-2]|0?[1-9])(?:[:.]?[0-5]\d)?\s*(?:am|pm)|\d{1,2}[:.]\d{2}|(?:[01]?\d|2[0-3])[0-5]\d|noon|midnight)\b/i;
 
 export function looksLikeBooking(text, forceIntent = false) {
   if (forceIntent) return true;

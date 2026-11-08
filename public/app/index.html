@@ -80,6 +80,9 @@ window.earlyFetch = (() => {
   .row .main { flex: 1; min-width: 0; }
   .row .title { font-weight: 600; }
   .row .meta { color: var(--hint); font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Who is playing is what the list is opened to read, so it wraps rather
+     than trailing off beside the Join button on a phone. */
+  .row .meta.names { white-space: normal; overflow-wrap: anywhere; }
   .row.link { color: var(--link); }
   .row.danger { color: var(--danger); }
   .row:disabled { opacity: 0.45; }
@@ -212,6 +215,13 @@ let running = 0;
 const supports = (version) => inTelegram && typeof tg.isVersionAtLeast === 'function'
   && tg.isVersionAtLeast(version);
 const nativeFormButton = supports('6.1') && tg.MainButton;
+// The page is drawn on the secondary background, as Telegram's own settings
+// screens are; left alone, the header and the overscroll stay the primary one
+// and a seam shows where they meet.
+if (supports('6.1') && tg.setHeaderColor && tg.setBackgroundColor) {
+  tg.setHeaderColor('secondary_bg_color');
+  tg.setBackgroundColor('secondary_bg_color');
+}
 
 function formChanged() {
   return state.screen === 'form' && JSON.stringify(state.values) !== state.initialValues;
@@ -300,28 +310,59 @@ function takeEarlyFetch(method, path) {
 // only sees "try again" when Telegram is properly down.
 const ROLE_RETRIES = [400, 1200];
 
+// A stalled phone connection never settles a fetch on its own, and while one
+// is out the whole page is greyed and closing it asks for confirmation. Past
+// this the request is given up and the person is told. AbortController stops
+// the download where the WebView has it; the timer alone ends the wait where
+// it does not.
+const REQUEST_TIMEOUT_MS = 15000;
+class SlowNetwork extends Error {}
+
+function withTimeout(start) {
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  let timer;
+  const expired = new Promise((resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new SlowNetwork());
+      if (controller) controller.abort();
+    }, REQUEST_TIMEOUT_MS);
+  });
+  return Promise.race([start(controller ? controller.signal : undefined), expired])
+    .finally(() => clearTimeout(timer));
+}
+
+// The body is read inside the same deadline as the headers.
+async function readAnswer(response) {
+  let data = {};
+  try { data = await response.json(); } catch { /* an empty body reads as a failure */ }
+  return { response, data };
+}
+
 async function api(method, path, body) {
   if (preview) return previewApi(method, path, body);
   const early = takeEarlyFetch(method, path);
-  let response = early && await early;
-  const send = () => fetch(`/api/app/${path}`, {
+  const send = () => withTimeout((signal) => fetch(`/api/app/${path}`, {
     method,
     headers: {
       Authorization: `tma ${inTelegram ? tg.initData : ''}`,
       ...(body ? { 'Content-Type': 'application/json' } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!response || response.status === 401) response = await send();
-  let data = {};
-  try { data = await response.json(); } catch { /* an empty body reads as a failure */ }
+    signal,
+  }).then(readAnswer));
+  let answer = early
+    ? await withTimeout(() => early.then((response) => response && readAnswer(response)))
+    : null;
+  if (!answer || answer.response.status === 401) answer = await send();
   for (const wait of ROLE_RETRIES) {
-    if (response.status !== 503 || !data.retry) break;
+    if (answer.response.status !== 503 || !answer.data.retry) break;
     await new Promise((resolve) => setTimeout(resolve, wait));
-    response = await send();
-    data = {};
-    try { data = await response.json(); } catch { /* as above */ }
+    answer = await send();
   }
+  const { response, data } = answer;
+  // A Cloudflare error page or a bare 404 has no message of ours, and a toast
+  // with nothing to say used to leave the tap looking ignored.
+  if (!response.ok && !data.message) data.message = 'Something went wrong. Please try again.';
   return { status: response.status, ...data };
 }
 
@@ -334,7 +375,14 @@ async function run(button, work) {
   try {
     return await work();
   } catch (error) {
-    toast('Could not reach SquashBot. Check your connection and try again.', 'error');
+    if (error instanceof SlowNetwork) {
+      toast('SquashBot is taking too long to answer. Check your connection and try again.', 'error');
+      // A write that timed out may still have landed, so the screen is asked
+      // again behind the toast; the form keeps what was typed.
+      setTimeout(() => refresh(), 0);
+    } else {
+      toast('Could not reach SquashBot. Check your connection and try again.', 'error');
+    }
     return null;
   } finally {
     running -= 1;
@@ -479,7 +527,7 @@ function courtRow(court, admin) {
     h('div', { class: 'title' }, `${court.court} · ${court.date}`),
     h('div', { class: 'meta' },
       `${court.time} · ${room > 0 ? `${room} left` : 'full'} · ${court.heads}/${court.capacity}`),
-    names ? h('div', { class: 'meta' }, `👥 ${names}`) : null,
+    names ? h('div', { class: 'meta names' }, `👥 ${names}`) : null,
   ];
   // An admin opens the court to manage it; whoever booked it opens it to change
   // or cancel it; anyone else's row is only its slot.
@@ -633,8 +681,32 @@ function form() {
   const players = state.players || [];
   const set = (key) => (event) => {
     values[key] = event.target.type === 'checkbox' ? event.target.checked : event.target.value;
-    state.conflict = null;
+    // Any change answers the overlap question afresh, so its warning goes
+    // and the button stops saying "Save anyway" while a tap would no longer
+    // force the save. Done in place: a redraw would take the keyboard away.
+    if (state.conflict) {
+      state.conflict = null;
+      const warning = document.getElementById('conflict');
+      if (warning) warning.remove();
+      const button = document.getElementById('save-button');
+      if (button) button.textContent = editing ? '✅ Save changes' : '✅ Add booking';
+    }
     syncControls();
+  };
+  // Moving the start carries the finish with it, keeping the length, so an
+  // 8–9pm court moved to 9pm is 9–10pm rather than refused as finishing
+  // before it starts. Capped at closing; the server still checks the rest.
+  const setStart = (event) => {
+    const before = minutesOf(state.lastStart ?? values.start);
+    const after = minutesOf(event.target.value);
+    const end = minutesOf(values.end);
+    set('start')(event);
+    if (after == null) return;
+    state.lastStart = event.target.value;
+    if (before == null || end == null || end <= before) return;
+    values.end = clockOf(Math.min(after + end - before, CLOSING_MINUTES));
+    const finish = document.getElementById('finish');
+    if (finish) finish.value = values.end;
   };
   const field = (label, input) => h('div', { class: 'field' }, h('label', null, label), input);
   return [
@@ -642,8 +714,8 @@ function form() {
     editing ? h('div', { class: 'sub' }, `Now ${state.court.date} · ${state.court.time}`) : null,
     h('div', { class: 'section' },
       field('Date', h('input', { type: 'date', value: values.date, min: state.today, oninput: set('date') })),
-      field('Start', h('input', { type: 'time', value: values.start, step: 900, min: '07:00', max: '21:00', oninput: set('start') })),
-      field('Finish', h('input', { type: 'time', value: values.end, step: 900, min: '07:15', max: '22:00', oninput: set('end') })),
+      field('Start', h('input', { type: 'time', value: values.start, step: 900, min: '07:00', max: '21:00', oninput: setStart })),
+      field('Finish', h('input', { id: 'finish', type: 'time', value: values.end, step: 900, min: '07:15', max: '22:00', oninput: set('end') })),
       field('Court', h('input', {
         type: 'text', value: values.court, placeholder: '4 or A', maxLength: 12,
         autocomplete: 'off', oninput: set('court'),
@@ -663,17 +735,28 @@ function form() {
             h('span')))),
     ] : null,
     h('div', { class: 'note' }, 'Courts run 7am to 10pm. No finish time means one hour.'),
-    state.conflict ? h('div', { class: 'warning' },
+    state.conflict ? h('div', { class: 'warning', id: 'conflict' },
       h('div', null, h('b', null, state.conflict.message)),
       state.conflict.conflicts.map((line) => h('div', null, line))) : null,
     !nativeFormButton ? h('button', {
-      class: 'primary', onclick: (event) => save(event.currentTarget, Boolean(state.conflict)),
+      class: 'primary', id: 'save-button',
+      onclick: (event) => save(event.currentTarget, Boolean(state.conflict)),
     }, state.conflict ? '⚠️ Save anyway' : (editing ? '✅ Save changes' : '✅ Add booking')) : null,
     // An admin deletes from the court screen; a booker has only this one.
     editing && !state.admin ? h('div', { class: 'section', style: 'margin-top:12px' },
       h('button', { class: 'row danger', onclick: (event) => remove(event.currentTarget) },
         '🗑 Cancel this booking')) : null,
   ];
+}
+
+// "20:30" and minutes past midnight, for carrying the finish with the start.
+const CLOSING_MINUTES = 22 * 60;
+function minutesOf(clock) {
+  const match = /^(\d{2}):(\d{2})$/.exec(String(clock || ''));
+  return match ? Number(match[1]) * 60 + Number(match[2]) : null;
+}
+function clockOf(minutes) {
+  return `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`;
 }
 
 // ---- The tab
@@ -928,6 +1011,9 @@ async function openForm(court) {
   const values = court
     ? { ...court.edit }
     : { date: today, start: '', end: '', court: '', booker: '', free: false };
+  // The form, its admin rows and the picker it opens do not fit the
+  // half-height sheet the app opens as, so it takes the full height.
+  if (inTelegram && typeof tg.expand === 'function') tg.expand();
   go('form', {
     court,
     players,

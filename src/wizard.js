@@ -6,7 +6,7 @@ import { courtName } from './format.js';
 import { parseBookingCompanions } from './booking-companions.js';
 import { isChatAdmin, knownPlayers, openBooking, RosterCapacityError } from './players.js';
 import {
-  analyzeBooking, bookingFromDraft, BookingParseError, formatClock, parseField,
+  analyzeBooking, bookingFromDraft, BookingParseError, formatClock, looksLikeBooking, parseField,
 } from './parser.js';
 import { formatDate, formatTime, localParts, zonedEpoch } from './time.js';
 import {
@@ -270,6 +270,20 @@ async function startWizard(env, msg, text, payload, callbackQueryId, bookingId =
     await env.DB.prepare('DELETE FROM booking_drafts WHERE id = ?').bind(id).run();
     throw new Error(`Could not start booking wizard: ${sent.description || 'Telegram error'}`);
   }
+  // Telegram falls back to an ordinary group message when it cannot deliver
+  // an ephemeral one, which put the form — and whatever was typed into /book —
+  // in front of the whole group. Same rule as every other private message:
+  // the public copy goes, and the person is told, while they are still there
+  // to try again.
+  if (!sent.result.ephemeral_message_id && sent.result.message_id) {
+    await Promise.all([
+      deleteMessage(env, msg.chat.id, sent.result.message_id),
+      env.DB.prepare('DELETE FROM booking_drafts WHERE id = ?').bind(id).run(),
+    ]);
+    const error = new Error('Booking form came back as a public message; removed');
+    error.userMessage = '⚠️ Telegram would not deliver your booking form privately. Please try again.';
+    throw error;
+  }
   const ephemeralId = sent.result.ephemeral_message_id || null;
   const messageId = ephemeralId || sent.result.message_id;
   await env.DB.prepare(
@@ -321,13 +335,25 @@ function applyParsedField(payload, field, parsed) {
   }
 }
 
+// Whether a typed message is a booking, read the one way both callers need:
+// the webhook decides from this whether to delete the message, and the form
+// opens from it. They used to read different text — the gate the whole
+// message, the form the message with its @handles and +1 taken out — so an
+// admin's "+1 for squash" passed the first, failed the second, and was
+// deleted with no form to show for it.
+export function bookingIntent(text, msg) {
+  return looksLikeBooking(parseBookingCompanions(text, msg).details);
+}
+
 export async function beginBooking(env, msg, text, {
   forceIntent = false, callbackQueryId = null,
 } = {}) {
+  if (!forceIntent && !bookingIntent(text, msg)) return false;
   const now = Date.now();
   const tz = await getTimezone(env, msg.chat.id);
   const { details, companions } = parseBookingCompanions(text, msg);
-  const payload = analyzeBooking(details, now, tz, { forceIntent });
+  // The intent is settled above, so the parser is not asked again.
+  const payload = analyzeBooking(details, now, tz, { forceIntent: true });
   if (!payload) return false;
   payload.companions = companions;
   payload.sourceText = text;
