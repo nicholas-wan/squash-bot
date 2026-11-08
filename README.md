@@ -335,6 +335,28 @@ The D1 database is bound as `DB`. Secrets: `BOT_TOKEN`, `WEBHOOK_SECRET`
 convert a basic group to a supergroup, which changes its id — `npx wrangler tail`
 logs the id of any chat the bot ignores.
 
+## Mini App response handling
+
+The opening court list reads the courts, rosters and timezone while Telegram
+checks membership. Nothing is returned to a non-member; admin-only lookups
+wait for the role check. Role changes and join/leave updates clear the local
+cache, writes recheck answers older than 30 seconds, and a membership lookup
+times out after four seconds. The page retries a membership 503 twice.
+Re-run `/setup` after deploying this version so the webhook requests
+`chat_member` updates.
+
+Join and Leave read and change the live court in one conditional D1 batch,
+checking the start time, chat, current capacity and numeric player identity.
+Saved payments, undos and roster changes answer before starting the pinned
+redraws and private notices. Toasts confirm the saved change without claiming
+that a later notice has arrived. Failed cleanup records or identity-link
+redraws are logged; identity ownership writes themselves still fail closed.
+
+Returning to a visible app refreshes its current screen without replacing an
+open booking form. Telegram 6.1+ uses the native MainButton to save a booking;
+older clients and browser preview keep the page button. Unsaved form changes
+prompt before Back or Close, with Telegram closing confirmation on 6.2+.
+
 ## Deploy
 
 Requirements: Telegram bot, Cloudflare Workers, and D1.

@@ -154,7 +154,7 @@ describe('The tab in the Mini App', () => {
     expect(tab.people).toEqual([{ slug: 'u5', name: 'u5', balance: 1735 }]);
     const paid = await call('tab/person/u5/pay', admin, { cents: 1000, expected: 1735 });
     expect(paid.ok).toBe(true);
-    expect(paid.message).toContain('They have a receipt');
+    expect(paid.message).toBe('$10.00 from u5 recorded.');
     expect(paid.person.balance).toBe(735);
     const receipt = requests.find((r) => r.method === 'sendMessage' && r.receiver_user_id === 5);
     expect(receipt.text).toContain('Payment received');
@@ -164,6 +164,41 @@ describe('The tab in the Mini App', () => {
     const undone = await call(`tab/entry/${line.id}/undo`, admin, {});
     expect(undone.person.balance).toBe(1735);
     expect(requests.filter((r) => r.receiver_user_id === 5).at(-1).text).toContain('was undone');
+  });
+
+  it('answers a saved payment and undo while Telegram is still delivering their follow-ups', async () => {
+    charge('u5', 1735, 'Court 4', { userId: 5, bookingId: 1 });
+    let release;
+    const stalled = new Promise((resolve) => { release = resolve; });
+    const original = globalThis.fetch;
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      if (/\/(sendMessage|editMessageText)$/.test(String(url))) await stalled;
+      return original(url, init);
+    }));
+    const jobs = [];
+    const ctx = { waitUntil: (job) => jobs.push(job) };
+    const request = async (path, body) => worker.fetch(new Request(`https://squashbot.test/api/app/${path}`, {
+      method: 'POST', headers: { Authorization: `tma ${await auth(admin)}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }), env, ctx);
+    let paid;
+    const pending = request('tab/person/u5/pay', { cents: 1000, expected: 1735 })
+      .then((reply) => reply.json()).then((reply) => { paid = reply; });
+    try {
+      await vi.waitFor(() => expect(paid?.person.balance).toBe(735));
+      expect(paid.ok).toBe(true);
+      expect(jobs.length).toBeGreaterThanOrEqual(1);
+      const line = paid.person.lines.find((entry) => entry.cents === -1000);
+      let undone;
+      const undoing = request(`tab/entry/${line.id}/undo`, {}).then((reply) => reply.json())
+        .then((reply) => { undone = reply; });
+      await vi.waitFor(() => expect(undone?.person.balance).toBe(1735));
+      await undoing;
+    } finally {
+      release();
+      await pending;
+      await Promise.all(jobs);
+    }
   });
 });
 

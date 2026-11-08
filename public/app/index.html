@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <title>SquashBot</title>
 <script>
 // Telegram's script below blocks the page until it has downloaded, and the
@@ -208,6 +208,36 @@ const roots = { list: null, tab: null };
 // Counts every request the person started. A background refresh that comes
 // back after one of them is older than what is on screen, and is dropped.
 let actions = 0;
+let running = 0;
+const supports = (version) => inTelegram && typeof tg.isVersionAtLeast === 'function'
+  && tg.isVersionAtLeast(version);
+const nativeFormButton = supports('6.1') && tg.MainButton;
+
+function formChanged() {
+  return state.screen === 'form' && JSON.stringify(state.values) !== state.initialValues;
+}
+
+function syncControls() {
+  if (nativeFormButton) {
+    if (state.screen === 'form') {
+      tg.MainButton.setParams({
+        text: state.conflict ? 'Save anyway' : (state.court ? 'Save changes' : 'Add booking'),
+        is_visible: true, is_active: running === 0,
+      });
+      if (running) tg.MainButton.showProgress(); else tg.MainButton.hideProgress();
+    } else tg.MainButton.hide();
+  }
+  if (supports('6.2') && tg.enableClosingConfirmation && tg.disableClosingConfirmation) {
+    if (formChanged() || running) tg.enableClosingConfirmation();
+    else tg.disableClosingConfirmation();
+  }
+}
+if (nativeFormButton) tg.MainButton.onClick(() => {
+  if (state.screen === 'form' && !running) save(null, Boolean(state.conflict));
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && !running) refresh();
+});
 
 // ---- Small DOM helper. Every name on screen arrives as text, never HTML.
 function h(tag, props, ...children) {
@@ -239,13 +269,14 @@ function toast(message, kind = 'success') {
 }
 
 function confirmAction(message) {
-  if (inTelegram && tg.showConfirm) {
+  if (supports('6.2') && tg.showConfirm) {
     return new Promise((resolve) => tg.showConfirm(message, resolve));
   }
   return Promise.resolve(window.confirm(message));
 }
 
-function closeApp() {
+async function closeApp() {
+  if (formChanged() && !(await confirmAction('Discard your unsaved booking changes?'))) return;
   if (inTelegram) tg.close();
   else toast('In Telegram this closes the sheet.');
 }
@@ -296,6 +327,8 @@ async function api(method, path, body) {
 
 async function run(button, work) {
   actions += 1;
+  running += 1;
+  syncControls();
   document.body.classList.add('busy');
   if (button) button.disabled = true;
   try {
@@ -304,8 +337,10 @@ async function run(button, work) {
     toast('Could not reach SquashBot. Check your connection and try again.', 'error');
     return null;
   } finally {
-    document.body.classList.remove('busy');
+    running -= 1;
+    if (!running) document.body.classList.remove('busy');
     if (button) button.disabled = false;
+    syncControls();
   }
 }
 
@@ -320,7 +355,8 @@ function go(screen, extra = {}, push = true) {
 // Back shows the screen as it was left, at once, and refreshes it behind:
 // waiting on the round trip left the old screen greyed out, and a failed
 // reload left it on show while its buttons acted on the screen behind it.
-function back() {
+async function back() {
+  if (formChanged() && !(await confirmAction('Discard your unsaved booking changes?'))) return;
   const previous = trail.pop();
   if (!previous) return;
   state = previous;
@@ -387,6 +423,7 @@ function header(title) {
 function render(keepScroll = false) {
   const screens = { loading, blocked, failed, list, court, form, tab, person };
   app.replaceChildren(...[].concat(screens[state.screen]()).flat(Infinity).filter(Boolean));
+  syncControls();
   if (!keepScroll) window.scrollTo(0, 0);
 }
 
@@ -597,6 +634,7 @@ function form() {
   const set = (key) => (event) => {
     values[key] = event.target.type === 'checkbox' ? event.target.checked : event.target.value;
     state.conflict = null;
+    syncControls();
   };
   const field = (label, input) => h('div', { class: 'field' }, h('label', null, label), input);
   return [
@@ -628,9 +666,9 @@ function form() {
     state.conflict ? h('div', { class: 'warning' },
       h('div', null, h('b', null, state.conflict.message)),
       state.conflict.conflicts.map((line) => h('div', null, line))) : null,
-    h('button', {
+    !nativeFormButton ? h('button', {
       class: 'primary', onclick: (event) => save(event.currentTarget, Boolean(state.conflict)),
-    }, state.conflict ? '⚠️ Save anyway' : (editing ? '✅ Save changes' : '✅ Add booking')),
+    }, state.conflict ? '⚠️ Save anyway' : (editing ? '✅ Save changes' : '✅ Add booking')) : null,
     // An admin deletes from the court screen; a booker has only this one.
     editing && !state.admin ? h('div', { class: 'section', style: 'margin-top:12px' },
       h('button', { class: 'row danger', onclick: (event) => remove(event.currentTarget) },
@@ -887,15 +925,17 @@ async function openForm(court) {
   // and whether this person is an admin.
   const listed = trail.concat(state).find((entry) => entry.screen === 'list');
   if (listed) ({ players, today, admin } = listed.data);
+  const values = court
+    ? { ...court.edit }
+    : { date: today, start: '', end: '', court: '', booker: '', free: false };
   go('form', {
     court,
     players,
     today,
     admin,
     conflict: null,
-    values: court
-      ? { ...court.edit }
-      : { date: today, start: '', end: '', court: '', booker: '', free: false },
+    values,
+    initialValues: JSON.stringify(values),
   });
 }
 

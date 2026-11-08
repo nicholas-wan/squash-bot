@@ -995,7 +995,7 @@ describe('Telegram commands', () => {
       .toContain('was seated on');
     const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
     expect(answer.body.text).toContain('@bo is on this court');
-    expect(answer.body.text).toContain('Some players could not be notified');
+    expect(answer.body.text).toBe('@bo is on this court.');
   });
 
   it('opens the seat and remove pickers privately from the availability message', async () => {
@@ -1225,7 +1225,8 @@ describe('Telegram commands', () => {
       .toContain('bringing a friend');
     const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
     expect(answer.body.text).toContain('now brings a +1');
-    expect(answer.body.text).toContain('Everyone has been told');
+    expect(answer.body.text).toContain('two shares on the tab');
+    expect(answer.body.text).not.toContain('told');
   });
 
   it('refuses a +1 when the court has no free slot for it', async () => {
@@ -1287,11 +1288,11 @@ describe('Telegram commands', () => {
     const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
     expect(answer.body.text).toContain('cleared');
     // Telegram answered with a plain message_id: the receipt fell back to the
-    // group, where it named a balance, so the public copy is taken down and
-    // the admin's toast says the debtor was not reached.
+    // group, where it named a balance, so the public copy is taken down.
+    // The earlier toast confirms the settlement without claiming delivery.
     expect(requests.find((request) => request.url.endsWith('/deleteMessage')).body.message_id)
       .toBe(1);
-    expect(answer.body.text).toContain('could not be told privately');
+    expect(answer.body.text).toBe('@bo cleared · $14.00');
   });
 
   // The confirmation said $14; a court charged since has made it $20. Clearing
@@ -1934,7 +1935,9 @@ describe('Telegram commands', () => {
           }; } };
         },
         async batch(statements) {
-          return statements.map(() => ({ success: true }));
+          return Promise.all(statements.map(async (statement) => ({
+            ...await statement.all(), ...await statement.run(),
+          })));
         },
       };
       await handleUpdate({

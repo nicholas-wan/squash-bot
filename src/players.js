@@ -379,6 +379,9 @@ export async function openBooking(env, chatId, bookingId) {
 }
 
 export async function joinBooking(env, chatId, bookingId, from, known = null) {
+  if (typeof env.DB.batch === 'function') {
+    return ownSlotBatch(env, chatId, bookingId, from, 'join');
+  }
   const booking = known || await openBooking(env, chatId, bookingId);
   if (!booking) return { status: 'gone' };
   if (booking.starts_at <= Date.now()) return { status: 'started', booking };
@@ -426,6 +429,9 @@ export async function toggleBooking(env, chatId, bookingId, from) {
 }
 
 export async function leaveBooking(env, chatId, bookingId, from, known = null) {
+  if (typeof env.DB.batch === 'function') {
+    return ownSlotBatch(env, chatId, bookingId, from, 'leave');
+  }
   const booking = known || await openBooking(env, chatId, bookingId);
   if (!booking) return { status: 'gone' };
   if (booking.starts_at <= Date.now()) return { status: 'started', booking };
@@ -436,6 +442,44 @@ export async function leaveBooking(env, chatId, bookingId, from, known = null) {
      )`
   ).bind(bookingId, identity(from).slug, from && from.id || 0).run();
   return { status: removed.meta.changes ? 'left' : 'absent', booking };
+}
+
+// The live court read and guarded mutation share one transaction and one
+// round trip. A delete, start, capacity change or another last-seat join
+// cannot slip between them. The final read explains a refused join.
+async function ownSlotBatch(env, chatId, bookingId, from, action) {
+  const now = Date.now();
+  const who = identity(from);
+  const dataChat = dataChatId(env, chatId);
+  const live = `SELECT * FROM bookings WHERE id = ? AND chat_id = ? AND ends_at > ?`;
+  const guard = `EXISTS (SELECT 1 FROM bookings b WHERE b.id = ? AND b.chat_id = ?
+    AND b.starts_at > ? AND b.ends_at > ?)`;
+  const mutation = action === 'join'
+    ? env.DB.prepare(`INSERT OR IGNORE INTO booking_players
+        (booking_id, chat_id, user_id, slug, name, added_by_user_id, heads, created_at)
+        SELECT ?, ?, ?, ?, ?, ?, 1, ?
+        WHERE ${guard}
+          AND NOT EXISTS (SELECT 1 FROM booking_players WHERE booking_id = ? AND user_id = ?)
+          AND (SELECT COALESCE(SUM(heads), 0) FROM booking_players WHERE booking_id = ?)
+            < (SELECT COALESCE(capacity, ?) FROM bookings WHERE id = ?)`)
+      .bind(bookingId, chatId, who.userId, who.slug, who.name, who.userId, now,
+        bookingId, dataChat, now, now, bookingId, who.userId, bookingId, DEFAULT_CAPACITY, bookingId)
+    : env.DB.prepare(`DELETE FROM booking_players WHERE booking_id = ?
+        AND ((user_id IS NULL AND slug = ?) OR user_id = ?) AND ${guard}`)
+      .bind(bookingId, who.slug, who.userId || 0, bookingId, dataChat, now, now);
+  const statements = [env.DB.prepare(live).bind(bookingId, dataChat, now), mutation];
+  if (action === 'join') statements.push(env.DB.prepare(
+    `SELECT id, slug, user_id FROM booking_players WHERE booking_id = ? AND (slug = ? OR user_id = ?)`
+  ).bind(bookingId, who.slug, who.userId));
+  const [read, changed, existing] = await env.DB.batch(statements);
+  const booking = read.results[0];
+  if (!booking) return { status: 'gone' };
+  if (booking.starts_at <= now) return { status: 'started', booking };
+  if (changed.meta.changes) return { status: action === 'join' ? 'joined' : 'left', booking };
+  if (action === 'leave') return { status: 'absent', booking };
+  const rows = existing.results;
+  return { status: rows.some((row) => matchesPlayer(row, from)) ? 'already'
+    : rows.length ? 'identity-conflict' : 'full', booking };
 }
 
 // Admins can take someone off a roster right up to the end of the slot, which is

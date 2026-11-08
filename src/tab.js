@@ -455,7 +455,7 @@ export async function confirmSettleMarkup(env, chatId, slug) {
 // nobody confirmed — so a balance that has moved since is not settled: it comes
 // back marked stale, with the amount it stands at now, for a fresh confirmation.
 // Null means there is nothing left to clear.
-export async function settleUser(env, chatId, slug, actor, expectedCents = null) {
+export async function settleUser(env, chatId, slug, actor, expectedCents = null, { defer } = {}) {
   const dataChat = dataChatId(env, chatId);
   const entry = findOwing(await tabBalances(env, chatId), slug);
   if (!entry) return null;
@@ -489,11 +489,7 @@ export async function settleUser(env, chatId, slug, actor, expectedCents = null)
   // The payment is written; the pinned tab is only a rendering of it. Same
   // rule as adjustBalance: a throw here would report a failure after the money
   // moved, and skip the debtor's receipt.
-  try {
-    await updateTab(env, chatId);
-  } catch (error) {
-    console.log(`Tab refresh after a settlement failed: ${error.stack || error}`);
-  }
+  await followUp(() => refreshTabQuietly(env, chatId, 'a settlement'), defer);
   return entry;
 }
 
@@ -507,7 +503,7 @@ export async function settleUser(env, chatId, slug, actor, expectedCents = null)
 const MAX_PAYMENT_CENTS = 100000;
 const PART_PAYMENT = 'Paid · recorded by ';
 
-export async function recordPayment(env, chatId, slug, cents, actor, expectedBalance) {
+export async function recordPayment(env, chatId, slug, cents, actor, expectedBalance, { defer } = {}) {
   if (!Number.isInteger(cents) || cents <= 0 || cents > MAX_PAYMENT_CENTS) {
     return { status: 'amount' };
   }
@@ -537,11 +533,7 @@ export async function recordPayment(env, chatId, slug, cents, actor, expectedBal
     const fresh = await accountRows(env, chatId, slug);
     return { status: 'stale', balance: fresh.reduce((sum, row) => sum + row.amount_cents, 0) };
   }
-  try {
-    await updateTab(env, chatId);
-  } catch (error) {
-    console.log(`Tab refresh after a payment failed: ${error.stack || error}`);
-  }
+  await followUp(() => refreshTabQuietly(env, chatId, 'a payment'), defer);
   return {
     status: 'paid',
     name: latest.name,
@@ -718,6 +710,15 @@ async function refreshTabQuietly(env, chatId, what) {
   }
 }
 
+// A saved payment or undo answers before receipts and pinned drawings.
+export function followUp(work, defer) {
+  const task = () => Promise.resolve().then(work).catch((error) => {
+    console.log(`Tab follow-up failed: ${error.stack || error}`);
+  });
+  if (defer) { defer(task); return; }
+  return task();
+}
+
 // "+5" and "-5" are one keystroke apart and mean opposite things, and the sign
 // is the one part of an entry nobody rereads. So /debt writes nothing at
 // first: it parks the entry here and shows the admin what it means in words,
@@ -785,7 +786,7 @@ function undoable(row, now = Date.now()) {
 
 // Takes back one /debt entry or one recorded payment, for the Mini App. One
 // statement, as undoAdjustment's, so two admins cannot remove it twice.
-export async function undoEntry(env, chatId, id) {
+export async function undoEntry(env, chatId, id, { defer } = {}) {
   const dataChat = dataChatId(env, chatId);
   const row = await env.DB.prepare(
     `DELETE FROM ledger
@@ -794,7 +795,7 @@ export async function undoEntry(env, chatId, id) {
   ).bind(Number(id), dataChat, Date.now() - UNDO_WINDOW_MS).first();
   if (!row) return null;
   const [total] = await Promise.all([
-    balanceOf(env, dataChat, row.slug), refreshTabQuietly(env, chatId, 'an undo'),
+    balanceOf(env, dataChat, row.slug), followUp(() => refreshTabQuietly(env, chatId, 'an undo'), defer),
   ]);
   return {
     slug: row.slug,

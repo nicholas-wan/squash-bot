@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import worker, { handleUpdate } from '../src/index.js';
 import { signInitData } from '../src/miniapp-auth.js';
 import { chatRole, clearAdminCache, forgetRole, ROLE_FRESH_MS } from '../src/players.js';
-import { d1, schemaDb } from './d1.js';
+import { countingDb, d1, schemaDb } from './d1.js';
 
 const TOKEN = 'test-token';
 const CHAT = -123456789;
@@ -136,6 +136,24 @@ describe('the Mini App', () => {
     headers: { Authorization: `tma ${await initData(ex)}`, 'Content-Type': 'application/json' },
     body: body ? JSON.stringify(body) : undefined,
   }), env);
+
+  it('reads the opening screen beside membership, but exposes nothing if Telegram refuses it', async () => {
+    const counted = countingDb(sql);
+    env.DB = counted.DB;
+    let release;
+    const paused = new Promise((resolve) => { release = resolve; });
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      await paused;
+      return new Response(JSON.stringify({ ok: true, result: { status: 'left' } }));
+    }));
+    const opening = call('courts');
+    try {
+      await vi.waitFor(() => expect(counted.ops.length).toBeGreaterThan(0));
+    } finally { release(); }
+    const response = await opening;
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ ok: false, admin: false, message: 'Only members of the group can use this.' });
+  });
 
   it('re-asks a half-minute-old membership before a write, and refuses a leaver', async () => {
     const startsAt = NOW + 3 * 86400000;

@@ -1,5 +1,5 @@
 import {
-  addSlot, flipOwnerGuest, flipPlusOne, kickPlayer, moveOwnSlot, seatPlayer, settleSlotMove,
+  addSlot, afterAnswer, flipOwnerGuest, flipPlusOne, kickPlayer, moveOwnSlot, seatPlayer, settleSlotMove,
 } from './actions.js';
 import {
   addBooking, authorizeBookingChange, BookingConflictError, BOOKING_CHANGED, BOOKING_STARTED,
@@ -15,7 +15,7 @@ import {
 } from './players.js';
 import { formatMoney } from './pricing.js';
 import {
-  accountRows, adminTabEntries, ledgerRowsFor, paymentReceiptHtml, recordPayment,
+  accountRows, adminTabEntries, followUp, ledgerRowsFor, paymentReceiptHtml, recordPayment,
   sendPrivateNote, tabStory, undoEntry,
 } from './tab.js';
 import { allowedChats } from './scope.js';
@@ -251,10 +251,10 @@ const routes = [
   }, { member: true }],
   ['GET', /^tab\/person\/([^/]+)$/, async ({ env, chatId, match }) =>
     personReply(env, chatId, decodeURIComponent(match[1]))],
-  ['POST', /^tab\/person\/([^/]+)\/pay$/, async ({ env, chatId, match, body, user }) => {
+  ['POST', /^tab\/person\/([^/]+)\/pay$/, async ({ env, chatId, match, body, user, defer }) => {
     const slug = decodeURIComponent(match[1]);
     const cents = Math.round(Number(body.cents));
-    const result = await recordPayment(env, chatId, slug, cents, user, Number(body.expected));
+    const result = await recordPayment(env, chatId, slug, cents, user, Number(body.expected), { defer });
     if (result.status === 'amount') {
       return json({ ok: false, message: 'Enter an amount between $0.01 and $1,000.' });
     }
@@ -266,17 +266,17 @@ const routes = [
       });
     }
     if (result.status !== 'paid') return json({ ok: false, message: 'Nothing on that tab any more.' });
-    const told = result.userId
-      ? await sendPrivateNote(env, chatId, result.userId, paymentReceiptHtml(result.paid, result.balance))
-      : 'failed';
+    await followUp(async () => {
+      if (result.userId) await sendPrivateNote(env, chatId, result.userId,
+        paymentReceiptHtml(result.paid, result.balance));
+    }, defer);
     return personReply(env, chatId, slug, {
       ok: true,
-      message: `${formatMoney(result.paid)} from ${result.name} recorded.`
-        + (told === 'private' ? ' They have a receipt.' : ' They could not be sent a receipt.'),
+      message: `${formatMoney(result.paid)} from ${result.name} recorded.`,
     });
   }],
-  ['POST', /^tab\/entry\/(\d+)\/undo$/, async ({ env, chatId, match }) => {
-    const undone = await undoEntry(env, chatId, Number(match[1]));
+  ['POST', /^tab\/entry\/(\d+)\/undo$/, async ({ env, chatId, match, defer }) => {
+    const undone = await undoEntry(env, chatId, Number(match[1]), { defer });
     if (!undone) {
       return json({ ok: false, message: 'That entry has already gone, or is too old to undo.' });
     }
@@ -285,14 +285,13 @@ const routes = [
     const standing = undone.balance > 0 ? `You now owe <b>${formatMoney(undone.balance)}</b>.`
       : undone.balance < 0 ? `You are <b>${formatMoney(-undone.balance)}</b> in credit.`
         : 'You are all settled.';
-    const told = undone.userId
-      ? await sendPrivateNote(env, chatId, undone.userId,
-        `↩️ <b>${what} on your squash tab was undone</b> — it was recorded by mistake.\n\n${standing}`)
-      : 'failed';
+    await followUp(async () => {
+      if (undone.userId) await sendPrivateNote(env, chatId, undone.userId,
+        `↩️ <b>${what} on your squash tab was undone</b> — it was recorded by mistake.\n\n${standing}`);
+    }, defer);
     return personReply(env, chatId, undone.slug, {
       ok: true,
-      message: `Undone: ${what.toLowerCase()} on ${undone.name}'s tab.`
-        + (told === 'private' ? ' They have been told.' : ' They could not be told privately.'),
+      message: `Undone: ${what.toLowerCase()} on ${undone.name}'s tab.`,
     });
   }],
 ];
@@ -316,10 +315,17 @@ const ROLE_UNKNOWN = 'Telegram did not answer just now. Please try again.';
 const NOT_A_MEMBER = 'Only members of the group can use this.';
 
 export async function handleMiniAppApi(request, env, path, now = Date.now(), ctx = null) {
-  // With the runtime's waitUntil the board and notices follow the reply;
-  // without it (tests, a direct call) they are awaited as before.
-  const defer = ctx && typeof ctx.waitUntil === 'function'
-    ? (work) => ctx.waitUntil(work) : undefined;
+  // Build the full response before starting optional work. A lazy queue
+  // prevents notices from racing ahead of the saved result's own reads.
+  const later = ctx && typeof ctx.waitUntil === 'function' ? afterAnswer() : null;
+  try {
+    return await miniAppReply(request, env, path, now, later?.defer);
+  } finally {
+    if (later) ctx.waitUntil(later.drain());
+  }
+}
+
+async function miniAppReply(request, env, path, now, defer) {
   const header = request.headers.get('Authorization') || '';
   const session = header.startsWith('tma ')
     ? await verifyInitData(env, header.slice(4), now) : null;
@@ -337,13 +343,27 @@ export async function handleMiniAppApi(request, env, path, now = Date.now(), ctx
     // remembered answer is half a minute old — a leave may have reached
     // another isolate — and that lookup runs beside the body read.
     const bodyRead = method === 'POST' ? readBody(request) : null;
-    const role = await chatRole(env, chatId, user,
+    const roleRead = chatRole(env, chatId, user,
       method === 'POST' ? { maxAgeMs: ROLE_FRESH_MS } : {});
+    // Start the opening screen's reads beside Telegram. Nothing is returned
+    // until membership is confirmed, and the admin-only lookups await it.
+    const listRead = method === 'GET' && path === 'courts'
+      ? courtList(env, chatId, { viewer: user, admin: roleRead.then((role) => role === 'admin') })
+        .then((data) => ({ data }), (error) => ({ error }))
+      : null;
+    if (listRead && defer) defer(listRead);
+    const role = await roleRead;
+    if (listRead && !defer && (role === 'unknown' || role === 'none')) await listRead;
     if (role === 'unknown') return json({ ok: false, retry: true, message: ROLE_UNKNOWN }, 503);
     if (role === 'none') return json({ ok: false, admin: false, message: NOT_A_MEMBER }, 403);
     const admin = role === 'admin';
     if (!member && !admin) return json({ ok: false, admin: false, message: MANAGE_ADMIN }, 403);
     try {
+      if (listRead) {
+        const result = await listRead;
+        if (result.error) throw result.error;
+        return json({ ok: true, ...result.data });
+      }
       let body = {};
       if (method === 'POST') {
         // What a tap in the chat does before anything else: tie this account

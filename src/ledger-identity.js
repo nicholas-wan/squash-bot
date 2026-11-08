@@ -27,9 +27,14 @@ export async function rememberLedgerIdentity(env, chatId, from) {
   if (seen.size >= MAX_SEEN) seen.clear();
   seen.add(key);
   if (!linked.meta.changes) return;
-  const history = await env.DB.prepare('SELECT id FROM ledger WHERE chat_id = ? AND user_id = ? LIMIT 1')
-    .bind(dataChat, from.id).first();
-  if (history) {
-    for (const chat of boardChats(env, chatId)) await queuePinnedRefresh(env, chat, 'tab');
+  try {
+    const history = await env.DB.prepare('SELECT id FROM ledger WHERE chat_id = ? AND user_id = ? LIMIT 1')
+      .bind(dataChat, from.id).first();
+    if (history) {
+      for (const chat of boardChats(env, chatId)) await queuePinnedRefresh(env, chat, 'tab');
+    }
+  } catch (error) {
+    // The alias is already committed; this only refreshes its drawing.
+    console.log(`Tab refresh after linking an identity failed: ${error.stack || error}`);
   }
 }

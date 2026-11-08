@@ -8,13 +8,30 @@
 export const INIT_DATA_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 const encoder = new TextEncoder();
+let signingToken;
+let signingKey;
 
-async function hmac(key, message) {
-  const imported = await crypto.subtle.importKey(
+function importKey(key) {
+  return crypto.subtle.importKey(
     'raw', typeof key === 'string' ? encoder.encode(key) : key,
     { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
   );
+}
+
+async function hmac(key, message) {
+  const imported = typeof key === 'string' || key instanceof Uint8Array ? await importKey(key) : key;
   return new Uint8Array(await crypto.subtle.sign('HMAC', imported, encoder.encode(message)));
+}
+
+function keyFor(botToken) {
+  const token = botToken.trim();
+  if (token !== signingToken || !signingKey) {
+    signingToken = token;
+    const pending = hmac('WebAppData', token).then(importKey);
+    signingKey = pending;
+    pending.catch(() => { if (signingKey === pending) signingKey = null; });
+  }
+  return signingKey;
 }
 
 const hex = (bytes) => [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
@@ -35,7 +52,7 @@ function sameHex(a, b) {
 export async function signInitData(botToken, fields) {
   const check = Object.keys(fields).filter((key) => key !== 'hash').sort()
     .map((key) => `${key}=${fields[key]}`).join('\n');
-  const secret = await hmac('WebAppData', botToken.trim());
+  const secret = await keyFor(botToken);
   return hex(await hmac(secret, check));
 }
 

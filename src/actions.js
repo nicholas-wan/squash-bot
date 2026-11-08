@@ -25,10 +25,6 @@ function plusOneCost(env, player) {
   return isHouseholdPlayer(env, player) ? 'the +1 plays free' : 'two shares on the tab';
 }
 
-function told(allTold, everyone = 'Everyone has been told.') {
-  return allTold ? everyone : 'Some players could not be notified.';
-}
-
 // The board is a drawing of what is already saved, so it never decides what a
 // tap answers. A failed redraw used to throw out of these actions after the
 // change had committed, which said "try again" about a change that had
@@ -41,20 +37,24 @@ function told(allTold, everyone = 'Everyone has been told.') {
 // inside waitUntil, so draining this at the end keeps the worker alive for it.
 export function afterAnswer() {
   const jobs = [];
-  return { defer: (work) => { jobs.push(work); }, drain: () => Promise.all(jobs) };
+  return {
+    defer: (work) => { jobs.push(work); },
+    drain: () => Promise.all(jobs.splice(0).map((work) =>
+      typeof work === 'function' ? work() : work)),
+  };
 }
 
 const noticeFailed = (error) => console.log(`Roster notice failed: ${error.stack || error}`);
 
 function afterwards(work, defer) {
-  const settled = work().catch((error) => {
+  const task = () => Promise.resolve().then(work).catch((error) => {
     console.log(`Board refresh after a roster change failed: ${error.stack || error}`);
   });
   if (defer) {
-    defer(settled);
+    defer(task);
     return undefined;
   }
-  return settled;
+  return task();
 }
 
 export async function seatPlayer(env, chatId, bookingId, slug, heads, actorId, { defer } = {}) {
@@ -75,18 +75,16 @@ export async function seatPlayer(env, chatId, bookingId, slug, heads, actorId, {
     };
     return { status: result.status, changed: false, alert: true, message: refusals[result.status] };
   }
-  // The seated player is the subject of the notice, not the admin tapping.
-  // The notices are awaited: the answer says whether everyone was told.
-  const { allTold } = await notifyRosterOfChange(
-    env, chatId, result.booking, subject(candidate), 'added', heads
-  );
-  await afterwards(() => updateBoard(env, chatId), defer);
-  const delivery = told(allTold, 'Everyone on it has been told.');
+  await afterwards(async () => {
+    await notifyRosterOfChange(env, chatId, result.booking, subject(candidate), 'added', heads)
+      .catch(noticeFailed);
+    await updateBoard(env, chatId);
+  }, defer);
   return {
     status: 'added', changed: true, alert: false,
     message: heads > 1
-      ? `${candidate.name} +1 are on this court — ${plusOneCost(env, candidate)}. ${delivery}`
-      : `${candidate.name} is on this court. ${delivery}`,
+      ? `${candidate.name} +1 are on this court — ${plusOneCost(env, candidate)}.`
+      : `${candidate.name} is on this court.`,
   };
 }
 
@@ -107,17 +105,17 @@ export async function flipPlusOne(env, chatId, bookingId, playerRowId, { want, d
     };
     return { status: result.status, changed: false, alert: true, message: refusals[result.status] };
   }
-  // The member whose share changed is the subject, not the tapping admin.
-  const { allTold } = await notifyRosterOfChange(
-    env, chatId, result.booking, subject(result.player), result.status
-  );
-  await afterwards(() => updateBoard(env, chatId), defer);
+  await afterwards(async () => {
+    await notifyRosterOfChange(env, chatId, result.booking, subject(result.player), result.status)
+      .catch(noticeFailed);
+    await updateBoard(env, chatId);
+  }, defer);
   const name = result.player.name;
   return {
     status: result.status, changed: true, alert: false,
     message: result.status === 'plus'
-      ? `${name} now brings a +1 — ${plusOneCost(env, result.player)}. ${told(allTold)}`
-      : `${name}'s +1 is off — one share again. ${told(allTold)}`,
+      ? `${name} now brings a +1 — ${plusOneCost(env, result.player)}.`
+      : `${name}'s +1 is off${isHouseholdPlayer(env, result.player) ? '.' : ' — one share again.'}`,
   };
 }
 
@@ -137,15 +135,16 @@ export async function flipOwnerGuest(env, chatId, bookingId, actorId, { want, de
     };
     return { status: result.status, changed: false, alert: true, message: refusals[result.status] };
   }
-  const { allTold } = await notifyRosterOfChange(
-    env, chatId, result.booking, subject(result.player, host), result.status
-  );
-  await afterwards(() => updateBoard(env, chatId), defer);
+  await afterwards(async () => {
+    await notifyRosterOfChange(env, chatId, result.booking, subject(result.player, host), result.status)
+      .catch(noticeFailed);
+    await updateBoard(env, chatId);
+  }, defer);
   return {
     status: result.status, changed: true, alert: false,
     message: result.status === 'plus'
-      ? `${host} +1 is on — the guest is not charged. ${told(allTold)}`
-      : `${host}'s guest is off. ${told(allTold)}`,
+      ? `${host} +1 is on — the guest is not charged.`
+      : `${host}'s guest is off.`,
   };
 }
 

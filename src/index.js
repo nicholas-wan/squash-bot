@@ -19,7 +19,7 @@ import { allowedChats } from './scope.js';
 import { formatMoney } from './pricing.js';
 import {
   adjustBalance, adjustmentNote, confirmSettleMarkup, draftAdjustment, matchAccount,
-  myTabView, parseDebtAdjustment, recentAdjustments, settleMarkup, settleUser,
+  followUp, myTabView, parseDebtAdjustment, recentAdjustments, settleMarkup, settleUser,
   tabBalances, takeDraft, theirTabView, undoAdjustment, updateTab,
 } from './tab.js';
 import {
@@ -576,7 +576,9 @@ async function openSettlePicker(env, callback) {
 
 async function settleTapped(env, callback, match) {
   const chatId = callback.message.chat.id;
-  const settled = await settleUser(env, chatId, match[2], callback.from, Number(match[1]));
+  const later = afterAnswer();
+  const settled = await settleUser(env, chatId, match[2], callback.from, Number(match[1]),
+    { defer: later.defer });
   // The balance moved after the confirmation was drawn — most often a court
   // charged in between. Nothing was written; the admin is shown the new amount
   // and confirms that instead.
@@ -591,22 +593,24 @@ async function settleTapped(env, callback, match) {
   // The ledger went quiet for the one person it is about: close the loop
   // with a private receipt, if they have an id to send it to. Through the
   // same gate as every panel: a receipt naming a balance must not fall back
-  // to the group, and the admin hears when it did not land.
-  let told = '';
-  if (settled && settled.user_id) {
-    const receipt = await deliverPrivately(env, chatId, settled.user_id,
-      `✅ <b>Payment received</b> — your ${formatMoney(settled.balance)} ` +
-      'squash tab is settled. Thank you!',
-      { replyMarkup: OK_MARKUP });
-    if (receipt.status !== 'private') told = ' · they could not be told privately';
+  // to the group. The toast confirms only the saved settlement.
+  try {
+    await answerCallback(env, callback.id,
+      settled ? `${settled.name} cleared · ${formatMoney(settled.balance)}`
+        : 'That balance is already clear.', !settled);
+  } finally {
+    await followUp(async () => {
+      if (settled && settled.user_id) {
+        await deliverPrivately(env, chatId, settled.user_id,
+          `✅ <b>Payment received</b> — your ${formatMoney(settled.balance)} `
+          + 'squash tab is settled. Thank you!', { replyMarkup: OK_MARKUP });
+      }
+      if (callback.message.ephemeral_message_id) {
+        await showPanel(env, callback, await settlePanel(env, chatId));
+      }
+    }, later.defer);
+    await later.drain();
   }
-  // Back to the list, for whoever paid next.
-  if (callback.message.ephemeral_message_id) {
-    await showPanel(env, callback, await settlePanel(env, chatId));
-  }
-  await answerCallback(env, callback.id,
-    settled ? `${settled.name} cleared · ${formatMoney(settled.balance)}${told}`
-      : 'That balance is already clear.', !settled);
 }
 
 // A step inside the settle panel. A tap from a pinned tab left showing the old

@@ -69,6 +69,9 @@ function bookingDb(booking, { ran = [], conflict = null, bound = [], player = nu
       return { results: sql.includes('ends_at >') ? [booking] : [] };
     },
     async run() {
+      if (sql.trim().startsWith('SELECT')) {
+        return { results: sql.includes('SELECT * FROM bookings WHERE id') ? [booking] : [], meta: { changes: 0 } };
+      }
       ran.push(sql.trim());
       return { meta: { changes: conflict && sql.trim().startsWith('UPDATE bookings') ? 0 : 1 } };
     },

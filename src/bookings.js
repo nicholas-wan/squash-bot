@@ -219,14 +219,14 @@ export async function addBooking(
 // `defer` the caller answers the person first and runs it after; without, it
 // is awaited here. It never rejects: each piece logs its own failure.
 async function afterCommit(work, defer) {
-  const settled = work().catch((error) => {
+  const task = () => Promise.resolve().then(work).catch((error) => {
     console.log(`Post-commit work failed: ${error.stack || error}`);
   });
   if (defer) {
-    defer(settled);
+    defer(task);
     return;
   }
-  await settled;
+  await task();
 }
 
 export async function updateBooking(
@@ -795,10 +795,12 @@ function courtSummary(env, booking, roster, tz, now, viewer = null) {
 // names only on the courts they are on. An admin sees every court, in play
 // too, with every roster, and who can be named as a booker.
 export async function courtList(env, chatId, { viewer = null, admin = false } = {}, now = Date.now()) {
-  const [active, tz, known, rosters] = await Promise.all([
+  const role = Promise.resolve(admin);
+  const [active, tz, known, rosters, isAdmin] = await Promise.all([
     activeBookings(env, chatId, now), getTimezone(env, chatId),
-    admin ? knownPlayers(env, chatId) : [], chatRosters(env, chatId),
+    role.then((allowed) => allowed ? knownPlayers(env, chatId) : []), chatRosters(env, chatId), role,
   ]);
+  admin = isAdmin;
   const bookings = admin ? active : active.filter((booking) => booking.starts_at > now);
   const courts = bookings.map((booking) =>
     courtSummary(env, booking, rosters.get(booking.id) || [], tz, now, viewer));
@@ -1069,10 +1071,7 @@ async function notifyRosterDirectly(env, chatId, roster, html, deleteAfter, excl
       { replyMarkup: OK_MARKUP, cleanups });
     if (outcome !== 'private') missed.push(player);
   }));
-  if (cleanups.length) {
-    if (typeof env.DB.batch === 'function') await env.DB.batch(cleanups);
-    else for (const statement of cleanups) await statement.run();
-  }
+  await saveCleanups(env, cleanups);
   if (!missed.length) return;
   const sent = await sendMessage(env, chatId, `${html}\n${playerTags(missed)}`, { silent: true });
   if (sent.ok && sent.result) await scheduleCleanup(env, chatId, sent.result, null, deleteAfter);
@@ -1195,10 +1194,7 @@ export async function notifyRosterOfChange(
         callbackQueryId: send.isActor ? send.callbackQueryId : null,
       }),
   })));
-  if (cleanups.length) {
-    if (typeof env.DB.batch === 'function') await env.DB.batch(cleanups);
-    else for (const statement of cleanups) await statement.run();
-  }
+  await saveCleanups(env, cleanups);
   // Admin actions report whether their subject and the rest of the court were
   // actually reached rather than claiming success for a refused private send.
   return {
@@ -1266,7 +1262,17 @@ function cleanupStatement(env, chatId, sent, receiverUserId, deleteAfter) {
 
 async function scheduleCleanup(env, chatId, sent, receiverUserId, deleteAfter) {
   const statement = cleanupStatement(env, chatId, sent, receiverUserId, deleteAfter);
-  if (statement) await statement.run();
+  await saveCleanups(env, statement ? [statement] : []);
+}
+
+async function saveCleanups(env, statements) {
+  if (!statements.length) return;
+  try {
+    if (typeof env.DB.batch === 'function') await env.DB.batch(statements);
+    else for (const statement of statements) await statement.run();
+  } catch (error) {
+    console.log(`Message cleanup record failed: ${error.stack || error}`);
+  }
 }
 
 // What Telegram says when a person is out of reach for good rather than for
@@ -1300,8 +1306,8 @@ async function sendPrivately(env, chatId, html, userId, deleteAfter, options = {
   }
   if (sent.result && sent.result.ephemeral_message_id) {
     const statement = cleanupStatement(env, chatId, sent.result, userId, deleteAfter);
-    if (cleanups) cleanups.push(statement);
-    else await statement.run();
+    if (cleanups && statement) cleanups.push(statement);
+    else await saveCleanups(env, statement ? [statement] : []);
     return 'private';
   }
   if (sent.result && sent.result.message_id) {
