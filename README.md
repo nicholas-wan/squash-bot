@@ -47,12 +47,13 @@ played its cost is split and added to a running tab.
 ## How it works
 
 ```mermaid
-flowchart LR
-    TG[Telegram] -- webhook --> W[Cloudflare Worker]
-    APP[Mini App] -- /api/app --> W
-    CRON[Cron, every minute] --> W
-    W <--> DB[(D1 database)]
-    W -- Bot API --> TG
+%%{init: {"flowchart": {"htmlLabels": false}}}%%
+flowchart TB
+    TG["Telegram"] -- "webhook" --> W["Cloudflare Worker"]
+    W -- "Bot API" --> TG
+    APP["Mini App"] -- "/api/app" --> W
+    CRON["Cron (every minute)"] --> W
+    W <--> DB[("D1 database")]
 ```
 
 - **Webhook** (`POST /webhook`): messages, button taps and membership changes
