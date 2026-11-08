@@ -4,18 +4,19 @@ import {
   settleSlotMove,
 } from './actions.js';
 import { handleMiniAppApi } from './miniapp-api.js';
-import { rememberLedgerIdentity } from './ledger-identity.js';
+import { ledgerIdentityPlan, rememberLedgerIdentity } from './ledger-identity.js';
 import {
   addPlayerView, authorizeBookingChange, bookingPanelView, cancelBooking, deletePanelView,
-  deliverSightedTabNotice, managerView, plusOneView,
+  deliverSightedTabNotice, managerView, plusOneView, sightedNoticeStatement,
   removePlayerView, restoreBoardButtons, runMaintenance, joinPickerView, updateBoard,
 } from './bookings.js';
 import {
   defaultCapacity, isChatAdmin, isHouseholdPlayer, isOwner, knownPlayers, ownerName,
-  rememberPlayer,
+  rememberPlayer, rememberPlayerStatements,
 } from './players.js';
 import { looksLikeBooking } from './parser.js';
 import { allowedChats } from './scope.js';
+import { timezonePrimer } from './settings.js';
 import { formatMoney } from './pricing.js';
 import {
   adjustBalance, adjustmentNote, confirmSettleMarkup, draftAdjustment, matchAccount,
@@ -557,8 +558,8 @@ async function openTheirTab(env, callback, match) {
 // list from before this change, Done puts the tab's buttons back.
 const SETTLE_HEADER = '💵 <b>Settle the tab</b>\n\nTap whoever has paid you. Only you can see this.';
 
-async function settlePanel(env, chatId) {
-  return { html: SETTLE_HEADER, replyMarkup: await settleMarkup(env, chatId) };
+async function settlePanel(env, chatId, balances = null) {
+  return { html: SETTLE_HEADER, replyMarkup: await settleMarkup(env, chatId, balances) };
 }
 
 async function closeSettlePicker(env, callback) {
@@ -574,9 +575,21 @@ async function openSettlePicker(env, callback) {
     callback.message.ephemeral_message_id ? '' : '💵 The settle list is below ⬇️');
 }
 
+// The pinned tab is redrawn once the admin has their toast: the money has
+// moved, and the tab is only a drawing of it.
 async function settleTapped(env, callback, match) {
+  const later = afterAnswer();
+  try {
+    await settleAndAnswer(env, callback, match, later.defer);
+  } finally {
+    await later.drain();
+  }
+}
+
+async function settleAndAnswer(env, callback, match, defer) {
   const chatId = callback.message.chat.id;
-  const settled = await settleUser(env, chatId, match[2], callback.from, Number(match[1]));
+  const settled = await settleUser(env, chatId, match[2], callback.from, Number(match[1]),
+    { defer });
   // The balance moved after the confirmation was drawn — most often a court
   // charged in between. Nothing was written; the admin is shown the new amount
   // and confirms that instead.
@@ -592,18 +605,20 @@ async function settleTapped(env, callback, match) {
   // with a private receipt, if they have an id to send it to. Through the
   // same gate as every panel: a receipt naming a balance must not fall back
   // to the group, and the admin hears when it did not land.
-  let told = '';
-  if (settled && settled.user_id) {
-    const receipt = await deliverPrivately(env, chatId, settled.user_id,
+  // Back to the list, for whoever paid next, drawn from the balances the
+  // settlement already read. The receipt and the list are separate messages,
+  // so they go out together.
+  const [receipt] = await Promise.all([
+    settled && settled.user_id ? deliverPrivately(env, chatId, settled.user_id,
       `✅ <b>Payment received</b> — your ${formatMoney(settled.balance)} ` +
       'squash tab is settled. Thank you!',
-      { replyMarkup: OK_MARKUP });
-    if (receipt.status !== 'private') told = ' · they could not be told privately';
-  }
-  // Back to the list, for whoever paid next.
-  if (callback.message.ephemeral_message_id) {
-    await showPanel(env, callback, await settlePanel(env, chatId));
-  }
+      { replyMarkup: OK_MARKUP }) : null,
+    callback.message.ephemeral_message_id
+      ? settlePanel(env, chatId, settled ? settled.remaining : null)
+        .then((panel) => showPanel(env, callback, panel))
+      : null,
+  ]);
+  const told = receipt && receipt.status !== 'private' ? ' · they could not be told privately' : '';
   await answerCallback(env, callback.id,
     settled ? `${settled.name} cleared · ${formatMoney(settled.balance)}${told}`
       : 'That balance is already clear.', !settled);
@@ -640,8 +655,17 @@ async function confirmSettle(env, callback, match) {
 // admin typed moments ago, and getting it back is retyping that line. The
 // player was sent a receipt for the entry, so they hear that it has gone.
 async function undoTapped(env, callback, match) {
+  const later = afterAnswer();
+  try {
+    await undoAndAnswer(env, callback, match, later.defer);
+  } finally {
+    await later.drain();
+  }
+}
+
+async function undoAndAnswer(env, callback, match, defer) {
   const chatId = callback.message.chat.id;
-  const undone = await undoAdjustment(env, chatId, match[1]);
+  const undone = await undoAdjustment(env, chatId, match[1], { defer });
   if (!undone) {
     await answerCallback(env, callback.id,
       'That entry has already been undone, or is too old to undo.', true);
@@ -701,6 +725,15 @@ function debtPreviewHtml(env, reader, name, cents, reason, balance) {
 }
 
 async function confirmDebtTapped(env, callback, match) {
+  const later = afterAnswer();
+  try {
+    await confirmDebtAndAnswer(env, callback, match, later.defer);
+  } finally {
+    await later.drain();
+  }
+}
+
+async function confirmDebtAndAnswer(env, callback, match, defer) {
   const chatId = callback.message.chat.id;
   const draft = await takeDraft(env, chatId, match[1], callback.from);
   if (!draft) {
@@ -711,7 +744,7 @@ async function confirmDebtTapped(env, callback, match) {
   }
   const entry = await adjustBalance(env, chatId,
     { slug: draft.slug, user_id: draft.user_id, name: draft.name },
-    draft.amount_cents, draft.reason, callback.from);
+    draft.amount_cents, draft.reason, callback.from, { defer });
   const moved = `${formatMoney(Math.abs(entry.cents))} `
     + `${entry.cents > 0 ? 'added to' : 'taken off'}`;
   // The ledger just moved for somebody who was not in the conversation, so
@@ -814,38 +847,58 @@ async function clearSentMessage(env, msg, kind = 'booking message') {
 // queued for them goes out once their own tap or message has been dealt with,
 // so their answer never waits behind it, and a failure here is logged rather
 // than allowed to fail the update it rode in on.
-export async function handleUpdate(env, update) {
+// `entry` is what the webhook's first batch already did for this update: the
+// sender's identity writes, and the read for a waiting tab notice. Left out
+// (tests, a direct call), both happen here as before.
+export async function handleUpdate(env, update, entry = {}) {
   try {
-    await dispatchUpdate(env, update);
+    await dispatchUpdate(env, update, entry);
   } finally {
-    await noticeSighting(env, update);
+    await Promise.all([noticeSighting(env, update, entry.notice), entry.pending]);
   }
 }
 
-async function noticeSighting(env, update) {
-  const source = (update.callback_query && update.callback_query.message)
+// Who sent an update, and from which chat, for the two jobs every update in
+// an allowed chat does: remember the sender, and hand them anything waiting.
+function sourceOf(update) {
+  const source = (update && update.callback_query && update.callback_query.message)
     ? { chat: update.callback_query.message.chat, from: update.callback_query.from }
-    : (update.message ? { chat: update.message.chat, from: update.message.from } : null);
-  if (!source || !source.chat || !source.from) return;
+    : (update && update.message ? { chat: update.message.chat, from: update.message.from } : null);
+  return source && source.chat && source.from ? source : null;
+}
+
+async function noticeSighting(env, update, found) {
+  const source = sourceOf(update);
+  if (!source) return;
   // Quietly: chatAllowed has already logged an ignored chat once for this update.
   if (!allowedChats(env).includes(Number(source.chat.id))) return;
   try {
-    await deliverSightedTabNotice(env, source.chat.id, source.from);
+    await deliverSightedTabNotice(env, source.chat.id, source.from, Date.now(), found);
   } catch (error) {
     console.log(`Sighted tab notice failed: ${error.stack || error}`);
   }
 }
 
-async function dispatchUpdate(env, update) {
+// The sender's identity writes, unless the webhook's batch already made them.
+// Then only a newly linked alias is left, which at most queues a tab redraw;
+// the handler does not wait on that, and handleUpdate collects it at the end.
+async function rememberSender(env, chatId, from, entry) {
+  if (entry.identity) {
+    entry.pending = entry.identity().catch((error) => {
+      console.log(`Ledger identity follow-up failed: ${error.stack || error}`);
+    });
+    return;
+  }
+  // Separate tables, so the two identity writes run together.
+  await Promise.all([rememberPlayer(env, from), rememberLedgerIdentity(env, chatId, from)]);
+}
+
+async function dispatchUpdate(env, update, entry = {}) {
   const callback = update.callback_query;
   if (callback && callback.message) {
     if (!chatAllowed(env, callback.message.chat)) return;
     try {
-      // Separate tables, so the two identity writes run together.
-      await Promise.all([
-        rememberPlayer(env, callback.from),
-        rememberLedgerIdentity(env, callback.message.chat.id, callback.from),
-      ]);
+      await rememberSender(env, callback.message.chat.id, callback.from, entry);
       if (await handleBoardCallback(env, callback)) return;
       if (await handleTabCallback(env, callback)) return;
       await handleBookingCallback(env, callback);
@@ -876,9 +929,7 @@ async function dispatchUpdate(env, update) {
   let clearedText = null;
 
   try {
-    await Promise.all([
-      rememberPlayer(env, msg.from), rememberLedgerIdentity(env, msg.chat.id, msg.from),
-    ]);
+    await rememberSender(env, msg.chat.id, msg.from, entry);
     if (await handleBookingReply(env, msg)) return;
     if (!text.startsWith('/')) {
       // The booking form repeats the text back, and the pinned board is the
@@ -1158,30 +1209,92 @@ const PROCESSED_UPDATE_TTL_MS = 24 * 60 * 60 * 1000;
 // a repeat is answered ok and dropped. An update with no id (tests, hand-sent
 // requests) is handled as before. The bookkeeping must not cost the update
 // itself, so a failure here is logged and the update goes through.
+//
+// Every update in an allowed chat also writes its sender's identity and asks
+// whether a tab notice waits for them. Those ride in the same batch, so the
+// tap pays one round trip to the database before its handler runs instead of
+// two, and the notice check after it pays none. Answers `fresh` and the
+// `entry` handleUpdate takes.
 async function firstSighting(env, update) {
   const updateId = update && update.update_id;
-  if (!Number.isInteger(updateId)) return true;
+  if (!Number.isInteger(updateId)) return { fresh: true, entry: {} };
   const now = Date.now();
   const record = env.DB.prepare(
     'INSERT OR IGNORE INTO processed_updates (update_id, seen_at) VALUES (?, ?)'
   ).bind(updateId, now);
   const prune = env.DB.prepare('DELETE FROM processed_updates WHERE seen_at < ?')
     .bind(now - PROCESSED_UPDATE_TTL_MS);
-  try {
-    let inserted;
-    if (typeof env.DB.batch === 'function') {
-      [inserted] = await env.DB.batch([record, prune]);
-    } else {
-      inserted = await record.run();
+  // A double that reports no change count is read as a first sighting: the
+  // only safe misreading is the one that handles an update.
+  const isFresh = (inserted) => !(inserted && inserted.meta && inserted.meta.changes === 0);
+  if (typeof env.DB.batch !== 'function') {
+    try {
+      const inserted = await record.run();
       await prune.run();
+      return { fresh: isFresh(inserted), entry: {} };
+    } catch (error) {
+      console.log(`Update dedup failed: ${error.stack || error}`);
+      return { fresh: true, entry: {} };
     }
-    // A double that reports no change count is read as a first sighting: the
-    // only safe misreading is the one that handles an update.
-    return !(inserted && inserted.meta && inserted.meta.changes === 0);
+  }
+  const extra = entryStatements(env, update, now);
+  if (extra.statements.length) {
+    try {
+      const results = await env.DB.batch([record, prune, ...extra.statements]);
+      return { fresh: isFresh(results[0]), entry: extra.read(results.slice(2)) };
+    } catch (error) {
+      // The update is what matters. Its bookkeeping is tried again below on
+      // its own, and the identity writes are left to the handler as before.
+      console.log(`Update entry batch failed: ${error.stack || error}`);
+    }
+  }
+  try {
+    const [inserted] = await env.DB.batch([record, prune]);
+    return { fresh: isFresh(inserted), entry: {} };
   } catch (error) {
     console.log(`Update dedup failed: ${error.stack || error}`);
-    return true;
+    return { fresh: true, entry: {} };
   }
+}
+
+// What an update's sender costs the database before anything is handled:
+// rememberPlayer's statements and the alias insert for a sender dispatch would
+// remember (a tap, or a text message), and the waiting-notice read for anyone
+// in an allowed chat, plus the chat's timezone when this isolate has not
+// cached it. `read` turns the batch's answers into handleUpdate's entry. A
+// read whose answer has no rows array (a test double) is left for the code
+// that needs it to make itself.
+function entryStatements(env, update, now) {
+  const none = { statements: [], read: () => ({}) };
+  const source = sourceOf(update);
+  if (!source || source.from.is_bot) return none;
+  const chatId = Number(source.chat.id);
+  if (!allowedChats(env).includes(chatId)) return none;
+  const msg = update.message;
+  const remembers = Boolean(update.callback_query)
+    || Boolean(msg && msg.text && !msg.pinned_message);
+  const player = remembers ? rememberPlayerStatements(env, source.from) : [];
+  const alias = remembers ? ledgerIdentityPlan(env, chatId, source.from) : null;
+  const notice = sightedNoticeStatement(env, chatId, source.from, now);
+  const zone = remembers ? timezonePrimer(env, chatId) : null;
+  const statements = [...player];
+  const at = (statement) => (statement ? statements.push(statement) - 1 : -1);
+  const aliasAt = at(alias && alias.statement);
+  const noticeAt = at(notice);
+  const zoneAt = at(zone && zone.statement);
+  return {
+    statements,
+    read(results) {
+      const aliasResult = aliasAt >= 0 ? results[aliasAt] : null;
+      const noticeResult = noticeAt >= 0 ? results[noticeAt] : null;
+      if (zoneAt >= 0) zone.settle(results[zoneAt]);
+      return {
+        identity: remembers ? async () => { if (alias) await alias.settle(aliasResult); } : null,
+        notice: noticeResult && Array.isArray(noticeResult.results)
+          ? (noticeResult.results[0] || null) : undefined,
+      };
+    },
+  };
 }
 
 export default {
@@ -1198,7 +1311,8 @@ export default {
       } catch {
         return new Response('bad request', { status: 400 });
       }
-      if (!(await firstSighting(env, update))) {
+      const { fresh, entry } = await firstSighting(env, update);
+      if (!fresh) {
         console.log(`Update ${update.update_id} redelivered by Telegram; already handled`);
         return new Response('ok');
       }
@@ -1211,7 +1325,7 @@ export default {
         // dropped, the answer falls back to HTTPS, and Telegram is not left
         // holding the webhook long enough to redeliver the whole update.
         const reply = armWebhookAnswer(callback.id);
-        ctx.waitUntil(handleUpdate(env, update).finally(() => reply.disarm()));
+        ctx.waitUntil(handleUpdate(env, update, entry).finally(() => reply.disarm()));
         const answer = await Promise.race([
           reply.promise,
           new Promise((resolve) => setTimeout(() => resolve(null), WEBHOOK_ANSWER_WAIT_MS)),
@@ -1232,7 +1346,7 @@ export default {
           })
           : new Response('ok');
       }
-      ctx.waitUntil(handleUpdate(env, update));
+      ctx.waitUntil(handleUpdate(env, update, entry));
       return new Response('ok');
     }
 

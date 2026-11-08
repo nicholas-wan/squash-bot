@@ -10,21 +10,41 @@ export const OK_MARKUP = { inline_keyboard: [[{ text: '👍 OK', callback_data: 
 // nothing. Fifteen seconds is far beyond any healthy Telegram round trip.
 const TELEGRAM_TIMEOUT_MS = 15 * 1000;
 
+// A call cut off by that bound may still have reached Telegram: the request
+// went, only the answer never came. timedOut marks it, so a private send that
+// timed out is never repeated, and never handed to the group instead.
+const isTimeout = (error) => Boolean(error
+  && (error.name === 'TimeoutError' || error.name === 'AbortError'));
+
+// A 429 that says how long to wait is waited out once, when the wait is short
+// enough to fit inside a request. A longer one, or one without retry_after,
+// is returned as before and left to the caller's own retry.
+const MAX_RATE_LIMIT_WAIT_S = 3;
+
 export async function telegram(env, method, body) {
   if (!env.BOT_TOKEN) return { ok: false, description: 'BOT_TOKEN is missing' };
-  try {
-    const response = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN.trim()}/${method}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
-    });
-    const data = await response.json();
+  for (let attempt = 0; ; attempt += 1) {
+    let data;
+    try {
+      const response = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN.trim()}/${method}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
+      });
+      data = await response.json();
+    } catch (error) {
+      console.log(`Telegram ${method} failed: ${error}`);
+      return { ok: false, description: String(error), timedOut: isTimeout(error) };
+    }
+    const wait = Number(data && data.parameters && data.parameters.retry_after);
+    if (data && data.error_code === 429 && attempt === 0
+      && wait > 0 && wait <= MAX_RATE_LIMIT_WAIT_S) {
+      await new Promise((resolve) => setTimeout(resolve, wait * 1000));
+      continue;
+    }
     if (!data.ok) console.log(`Telegram ${method} failed: ${JSON.stringify(data)}`);
     return data;
-  } catch (error) {
-    console.log(`Telegram ${method} failed: ${error}`);
-    return { ok: false, description: String(error) };
   }
 }
 

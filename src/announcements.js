@@ -2,7 +2,7 @@ import { compactTimeRange, courtName, formatCountdown, playerTags } from './form
 import { allowedChats, dataChatId } from './scope.js';
 import { DEFAULT_CAPACITY, rosterFor } from './players.js';
 import { miniAppLink } from './miniapp-link.js';
-import { getTimezone } from './settings.js';
+import { getTimezone, pinnedIds } from './settings.js';
 import { deleteMessage, editMessage, escapeHtml, sendMessage } from './telegram.js';
 
 // One silent message per group, always about the earliest upcoming court with a
@@ -37,39 +37,59 @@ async function closeAnnouncement(env, chatId, messageId, text) {
   throw new Error(closed.description || 'Announcement retirement failed');
 }
 
-async function nextOpenBooking(env, chatId, now) {
-  const booking = await env.DB.prepare(`SELECT b.* FROM bookings b
+// The court and its roster are read together: the roster query finds the
+// same court by itself, so neither waits for the other.
+const NEXT_OPEN = `SELECT b.* FROM bookings b
     WHERE b.chat_id = ? AND b.starts_at > ?
       AND b.capacity > (SELECT COALESCE(SUM(p.heads), 0)
         FROM booking_players p WHERE p.booking_id = b.id)
-    ORDER BY b.starts_at, b.id LIMIT 1`).bind(dataChatId(env, chatId), now).first();
+    ORDER BY b.starts_at, b.id LIMIT 1`;
+
+async function nextOpenBooking(env, chatId, now) {
+  const dataChat = dataChatId(env, chatId);
+  const [booking, players] = await Promise.all([
+    env.DB.prepare(NEXT_OPEN).bind(dataChat, now).first(),
+    env.DB.prepare(`SELECT * FROM booking_players
+      WHERE booking_id = (SELECT id FROM (${NEXT_OPEN})) ORDER BY id`).bind(dataChat, now).all(),
+  ]);
   if (!booking) return null;
-  const roster = await rosterFor(env, booking.id);
+  // Both reads name the same court unless one landed between them; then the
+  // roster is read again for the court that was found.
+  const rows = (players && players.results) || [];
+  const roster = rows.every((player) => player.booking_id === booking.id)
+    ? rows : await rosterFor(env, booking.id);
   const capacity = booking.capacity || DEFAULT_CAPACITY;
   const free = capacity - roster.reduce((sum, player) => sum + (player.heads || 1), 0);
   // The roster can fill between the two reads; the next sync sees the change.
   return free > 0 ? { booking, capacity, free, roster } : null;
 }
 
-export async function syncAnnouncements(env, chatId, now = Date.now()) {
+// `known.pinned` is the chat's pinned ids when the caller has them already, as
+// a board redraw does.
+export async function syncAnnouncements(env, chatId, now = Date.now(), known = {}) {
   // Serialize webhook/cron sends for this chat. Expiry recovers a dead worker.
   // One round trip creates the row if need be, claims the lease, and reads the
   // row back; no row comes back while another worker holds the lease.
   const lease = Date.now() + 60000;
-  const current = await env.DB.prepare(`INSERT INTO availability_notices (chat_id, lease_until)
-    VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET lease_until = excluded.lease_until
-    WHERE availability_notices.lease_until <= ? RETURNING *`)
-    .bind(chatId, lease, Date.now()).first();
+  // The reads go out with the claim rather than after it: they only decide
+  // what to send, and are dropped unread when the lease is somebody else's.
+  // The timezone is only needed when there is a court to announce, but it is
+  // usually cached, and fetching it alongside costs no extra wall clock.
+  const [current, next, pinned, tz] = await Promise.all([
+    env.DB.prepare(`INSERT INTO availability_notices (chat_id, lease_until)
+      VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET lease_until = excluded.lease_until
+      WHERE availability_notices.lease_until <= ? RETURNING *`)
+      .bind(chatId, lease, Date.now()).first(),
+    nextOpenBooking(env, chatId, now),
+    known.pinned !== undefined ? known.pinned : pinnedIds(env, chatId),
+    getTimezone(env, chatId),
+  ]);
   if (!current) return 0;
+  // The last write of a pass gives the lease back in the same statement, so
+  // the finally below has nothing left to do.
+  let released = false;
+  const RELEASE = 'lease_until = CASE WHEN lease_until = ? THEN 0 ELSE lease_until END';
   try {
-    // The timezone is only needed when there is a court to announce, but it is
-    // usually cached, and fetching it alongside costs no extra wall clock.
-    const [next, pinned, tz] = await Promise.all([
-      nextOpenBooking(env, chatId, now),
-      env.DB.prepare('SELECT board_message_id, tab_message_id FROM settings WHERE chat_id = ?')
-        .bind(chatId).first(),
-      getTimezone(env, chatId),
-    ]);
     // Message ids only grow within a chat, so a pinned board or tab with a
     // higher id was posted after this message and sits below it. The bot's
     // last word is meant to be the next open court; one buried under a freshly
@@ -100,11 +120,13 @@ export async function syncAnnouncements(env, chatId, now = Date.now()) {
       if (current.message_id && current.html !== NO_COURTS_HTML) {
         const kept = await closeAnnouncement(env, chatId, current.message_id, NO_COURTS_HTML);
         await env.DB.prepare(`UPDATE availability_notices SET booking_id = NULL, html = ?,
-          message_id = ? WHERE chat_id = ?`)
-          .bind(kept ? NO_COURTS_HTML : null, kept ? current.message_id : null, chatId).run();
+          message_id = ?, ${RELEASE} WHERE chat_id = ?`)
+          .bind(kept ? NO_COURTS_HTML : null, kept ? current.message_id : null, lease, chatId).run();
+        released = true;
       } else if (current.booking_id !== null) {
-        await env.DB.prepare('UPDATE availability_notices SET booking_id = NULL WHERE chat_id = ?')
-          .bind(chatId).run();
+        await env.DB.prepare(`UPDATE availability_notices SET booking_id = NULL, ${RELEASE}
+          WHERE chat_id = ?`).bind(lease, chatId).run();
+        released = true;
       }
       return 0;
     }
@@ -143,8 +165,9 @@ export async function syncAnnouncements(env, chatId, now = Date.now()) {
       const edited = await editMessage(env, chatId, current.message_id, html, replyMarkup);
       if (edited.ok || /message is not modified/i.test(edited.description || '')) {
         // booking_id moves too: a kept message may now show a different court.
-        await env.DB.prepare('UPDATE availability_notices SET booking_id = ?, html = ? WHERE chat_id = ?')
-          .bind(booking.id, signature, chatId).run();
+        await env.DB.prepare(`UPDATE availability_notices SET booking_id = ?, html = ?, ${RELEASE}
+          WHERE chat_id = ?`).bind(booking.id, signature, lease, chatId).run();
+        released = true;
         return 0;
       }
       if (!/message to edit not found/i.test(edited.description || '')) {
@@ -156,8 +179,10 @@ export async function syncAnnouncements(env, chatId, now = Date.now()) {
       throw new Error(sent.description || 'Announcement send failed');
     }
     try {
-      await env.DB.prepare(`UPDATE availability_notices SET booking_id = ?, message_id = ?, html = ?
-        WHERE chat_id = ?`).bind(booking.id, sent.result.message_id, signature, chatId).run();
+      await env.DB.prepare(`UPDATE availability_notices SET booking_id = ?, message_id = ?, html = ?,
+        ${RELEASE} WHERE chat_id = ?`)
+        .bind(booking.id, sent.result.message_id, signature, lease, chatId).run();
+      released = true;
     } catch (error) {
       // Telegram has already accepted this message. Remove it if persistence
       // failed, otherwise a retry could leave an untracked public duplicate.
@@ -176,8 +201,10 @@ export async function syncAnnouncements(env, chatId, now = Date.now()) {
     console.log(`Announcement for ${chatId} failed: ${error.message || error}`);
     return 1;
   } finally {
-    await env.DB.prepare(`UPDATE availability_notices SET lease_until = 0
-      WHERE chat_id = ? AND lease_until = ?`).bind(chatId, lease).run();
+    if (!released) {
+      await env.DB.prepare(`UPDATE availability_notices SET lease_until = 0
+        WHERE chat_id = ? AND lease_until = ?`).bind(chatId, lease).run();
+    }
   }
 }
 

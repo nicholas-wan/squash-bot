@@ -187,8 +187,19 @@ CREATE INDEX IF NOT EXISTS idx_booking_players_chat
 CREATE INDEX IF NOT EXISTS idx_booking_players_reminder
   ON booking_players (booking_id, reminder_sent, pre_reminder_sent);
 
-CREATE INDEX IF NOT EXISTS idx_ledger_chat
-  ON ledger (chat_id, slug);
+-- rememberPlayer finds the sender's rows by slug and by id on every update.
+CREATE INDEX IF NOT EXISTS idx_booking_players_slug
+  ON booking_players (slug);
+
+CREATE INDEX IF NOT EXISTS idx_booking_players_user
+  ON booking_players (user_id);
+
+-- One account's rows in time order: balances, the latest name, breakdowns.
+CREATE INDEX IF NOT EXISTS idx_ledger_account
+  ON ledger (chat_id, slug, created_at, id);
+
+CREATE INDEX IF NOT EXISTS idx_ledger_user
+  ON ledger (chat_id, user_id);
 
 CREATE INDEX IF NOT EXISTS idx_sent_messages_due
   ON sent_messages (delete_after);

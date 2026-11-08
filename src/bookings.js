@@ -10,11 +10,12 @@ import {
 export { formatCountdown } from './format.js';
 import { allowedChats, boardChats, dataChatId, reachableChat, sharingData } from './scope.js';
 import {
-  getTimezone, tabNoticeFallbackDay, tabNoticeThresholdCents, updatePinnedMessage,
+  getTimezone, pinnedIds, tabNoticeFallbackDay, tabNoticeThresholdCents, updatePinnedMessage,
 } from './settings.js';
 import { breakdownLines, chargeBooking, tabBalances, updateTab } from './tab.js';
-import { formatDate, formatTime, localParts, zonedEpoch } from './time.js';
+import { dateFormatter, formatDate, formatTime, localParts, zonedEpoch } from './time.js';
 import { queuePinnedRefresh } from './refresh-queue.js';
+import { serializedRedraw } from './redraw-queue.js';
 import { miniAppLink } from './miniapp-link.js';
 import { maintainAnnouncements, syncAnnouncements } from './announcements.js';
 import {
@@ -602,11 +603,14 @@ export async function joinPickerView(env, chatId, from, isAdmin = false, now = D
   };
 }
 
-async function renderBoard(env, chatId, now) {
-  const [tz, bookings, rosters] = await Promise.all([
+// `pinned` also reads each showing chat's pinned ids alongside, so the redraw
+// that follows edits straight away instead of reading them first.
+async function renderBoard(env, chatId, now, { pinned = false } = {}) {
+  const [tz, bookings, rosters, settings] = await Promise.all([
     getTimezone(env, chatId), activeBookings(env, chatId, now), chatRosters(env, chatId),
+    pinned ? Promise.all(boardChats(env, chatId).map((chat) => pinnedIds(env, chat))) : null,
   ]);
-  if (!bookings.length) return { html: null, bookings };
+  if (!bookings.length) return { html: null, bookings, settings };
 
   // A schedule: one line per court, and nothing to act on. It sat beside the
   // "next available court" message looking like a copy of it — same emoji,
@@ -632,7 +636,7 @@ async function renderBoard(env, chatId, now) {
     const bookedBy = bookedByLine(owner, booking);
     if (bookedBy) lines.push(bookedBy);
   }
-  return { html: lines.join('\n'), bookings };
+  return { html: lines.join('\n'), bookings, settings };
 }
 
 // "Today" and "Tomorrow" where they apply, the date otherwise. The board is
@@ -653,49 +657,49 @@ export async function boardHtml(env, chatId, now = Date.now()) {
 // which once turned one kicked group into every command failing everywhere.
 // Only the acting chat's own failure still surfaces, because there it is the
 // answer the person is waiting on.
-// Board redraws for one group run one at a time within the isolate. Tap
+// Board redraws for one group run one at a time within the isolate, and a
+// request while one is already waiting shares it (see serializedRedraw). Tap
 // replies no longer wait for the board, so a second tap's redraw could start
 // while the first was mid-edit and an older rendering could land last, or,
 // with no board pinned yet, both could post and pin one. Each queued redraw
 // reads the database when its turn comes, so the last one always shows the
 // latest state. Keyed by the shared data chat, since every redraw edits all
 // of its groups' boards.
-const boardQueues = new WeakMap();
-
 export function updateBoard(env, chatId, now) {
-  let queues = boardQueues.get(env.DB);
-  if (!queues) boardQueues.set(env.DB, (queues = new Map()));
-  const key = dataChatId(env, chatId);
-  const run = (queues.get(key) || Promise.resolve())
-    .catch(() => {})
-    .then(() => drawBoard(env, chatId, now ?? Date.now()));
-  queues.set(key, run);
-  const forget = () => { if (queues.get(key) === run) queues.delete(key); };
-  run.then(forget, forget);
-  return run;
+  return serializedRedraw(env.DB, `board:${dataChatId(env, chatId)}`, chatId,
+    () => drawBoard(env, chatId, now ?? Date.now()));
 }
 
 async function drawBoard(env, chatId, now) {
-  const board = await renderBoard(env, chatId, now);
+  const board = await renderBoard(env, chatId, now, { pinned: true });
   // Shared chats are independent Telegram calls. Running them together keeps a
   // dead sibling from adding one full network round trip per group, while the
   // acting chat still decides whether the operation itself succeeds.
-  const outcomes = await Promise.all(boardChats(env, chatId).map(async (chat) => {
+  const outcomes = await Promise.all(boardChats(env, chatId).map(async (chat, index) => {
     // The board goes first so that a board posted afresh — the first booking
     // after an empty spell — lands above the announcement rather than below
     // it. Announcement errors are retried by maintenance and do not block the
     // board, and a failed board still lets the announcement move on.
+    const setting = board.settings ? board.settings[index] : undefined;
     let outcome;
     try {
       const id = await updatePinnedMessage(
         env, chat, 'board_message_id', board.html,
-        board.html ? boardButtons(env, chat, board.bookings) : null, 'court board'
+        board.html ? boardButtons(env, chat, board.bookings) : null, 'court board',
+        setting === undefined ? {} : { existing: setting }
       );
       outcome = { chat, id };
     } catch (error) {
       outcome = { chat, error };
     }
-    try { await syncAnnouncements(env, chat, now); }
+    // The pinned ids as they stand now, so the announcement need not read
+    // them again: the board's is whatever was just drawn, or still the old
+    // one when the redraw failed.
+    const known = setting === undefined ? undefined : {
+      board_message_id: outcome.error ? setting?.board_message_id ?? null : outcome.id,
+      tab_message_id: setting?.tab_message_id ?? null,
+    };
+    try { await syncAnnouncements(env, chat, now, { pinned: known }); }
     catch (error) { console.log(`Announcement refresh failed: ${error.message || error}`); }
     return outcome;
   }));
@@ -794,10 +798,13 @@ function courtSummary(env, booking, roster, tz, now, viewer = null) {
 // Members get what the 🙋 Join list gives them: courts still to come, and the
 // names only on the courts they are on. An admin sees every court, in play
 // too, with every roster, and who can be named as a booker.
-export async function courtList(env, chatId, { viewer = null, admin = false } = {}, now = Date.now()) {
-  const [active, tz, known, rosters] = await Promise.all([
-    activeBookings(env, chatId, now), getTimezone(env, chatId),
-    admin ? knownPlayers(env, chatId) : [], chatRosters(env, chatId),
+// `admin` may be a promise still being answered, as the Mini App passes it:
+// the reads start at once and only the admin-only one waits for the answer.
+export async function courtList(env, chatId, { viewer = null, admin: role = false } = {}, now = Date.now()) {
+  const [active, tz, admin, known, rosters] = await Promise.all([
+    activeBookings(env, chatId, now), getTimezone(env, chatId), role,
+    Promise.resolve(role).then((yes) => (yes ? knownPlayers(env, chatId) : [])),
+    chatRosters(env, chatId),
   ]);
   const bookings = admin ? active : active.filter((booking) => booking.starts_at > now);
   const courts = bookings.map((booking) =>
@@ -1067,7 +1074,9 @@ async function notifyRosterDirectly(env, chatId, roster, html, deleteAfter, excl
     told.add(player.user_id);
     const outcome = await sendPrivately(env, chatId, html, player.user_id, deleteAfter,
       { replyMarkup: OK_MARKUP, cleanups });
-    if (outcome !== 'private') missed.push(player);
+    // A timed-out copy may well have landed; tagging them in the group as
+    // well would tell them twice, once in front of everybody.
+    if (outcome !== 'private' && outcome !== 'uncertain') missed.push(player);
   }));
   if (cleanups.length) {
     if (typeof env.DB.batch === 'function') await env.DB.batch(cleanups);
@@ -1291,10 +1300,12 @@ const CHAT_GONE = /forbidden|chat not found|bot was kicked|bot is not a member|g
 // A refusal is told apart from a failure: 'failed' is worth retrying — a
 // timeout, a 429, a Telegram hiccup — while 'refused' is Telegram saying this
 // person cannot be reached at all, and retrying that is a request per minute
-// that will never land.
+// that will never land. 'uncertain' is a send cut off by the timeout: it may
+// have arrived, so it is neither sent again nor repeated in the group.
 async function sendPrivately(env, chatId, html, userId, deleteAfter, options = {}) {
   const { cleanups, ...sendOptions } = options;
   const sent = await sendMessage(env, chatId, html, { ...sendOptions, receiverUserId: userId });
+  if (!sent.ok && sent.timedOut) return 'uncertain';
   if (!sent.ok) {
     return PERMANENT_REFUSAL.test(String(sent.description || '')) ? 'refused' : 'failed';
   }
@@ -1427,6 +1438,12 @@ async function sendClaimedReminders(env, now, column, headline) {
       );
 
       if (outcome === 'private') continue;
+      // Cut off by the timeout, it may have arrived: handing the claim back
+      // used to send it again next minute, a second reminder for one court.
+      if (outcome === 'uncertain') {
+        console.log(`${column} reminder for player ${row.player_row_id} timed out; not resent`);
+        continue;
+      }
       // Telegram will refuse this player every minute until the court starts,
       // and a claim handed back sorts straight to the front of the next
       // window's LIMIT. The claim stays spent: one line in the log is the whole
@@ -1511,8 +1528,9 @@ async function remindRosterlessBookings(env, now, column, headline) {
         await env.DB.prepare(`UPDATE bookings SET ${column}_sent = 0 WHERE id = ?`)
           .bind(booking.id).run();
         failures += 1;
-      } else if (outcome === 'refused') {
-        console.log(`${column} reminder ${booking.id} refused by Telegram; not retried`);
+      } else if (outcome === 'refused' || outcome === 'uncertain') {
+        console.log(`${column} reminder ${booking.id} ${outcome === 'refused'
+          ? 'refused by Telegram' : 'timed out, may have arrived'}; not retried`);
       }
     } catch (error) {
       failures += 1;
@@ -1743,7 +1761,7 @@ const NOTICE_CLAIM_GRACE_MS = 5 * 60 * 1000;
 // The ask arrives with its reasons: the same line-by-line story 🧾 My tab
 // tells, minus the rate card, so paying needs no second tap to trust.
 async function tabNoticeHtml(env, dataChat, slug, tz, now) {
-  const monthName = new Intl.DateTimeFormat('en-SG', {
+  const monthName = dateFormatter('en-SG', {
     timeZone: tz, month: 'long', year: 'numeric',
   }).format(new Date(now));
   const { results: rows } = await env.DB.prepare(
@@ -1837,6 +1855,12 @@ async function sendOverdueTabNoticesFor(env, now, chatId, fallbackChat) {
       await settle(outcome === 'private' ? 'delivered' : 'refused');
       continue;
     }
+    // Sent blind closes the row whatever happened, and a timed-out copy may
+    // have landed: asking again would nag whoever did read it.
+    if (outcome === 'uncertain') {
+      await settle('delivered', 'Telegram timed out; may have arrived');
+      continue;
+    }
     failures += 1;
     await settle('pending', `Telegram delivery ${outcome}`);
   }
@@ -1854,16 +1878,27 @@ async function sendOverdueTabNoticesFor(env, now, chatId, fallbackChat) {
 // alone rather than handed to the current holder. The amount is read fresh at
 // delivery: a balance paid off since the queue was written is not asked for,
 // and one that has dropped under the threshold is not either.
-export async function deliverSightedTabNotice(env, chatId, from, now = Date.now()) {
-  if (!from || !from.id) return;
-  const dataChat = dataChatId(env, chatId);
+// The read behind it, on its own, so the webhook can ask it in the batch it
+// sends for every update. Null for a sender with no id.
+export function sightedNoticeStatement(env, chatId, from, now = Date.now()) {
+  if (!from || !from.id) return null;
   const slugs = [...new Set([`u${from.id}`, identity(from).slug])];
-  const due = await env.DB.prepare(
+  return env.DB.prepare(
     `SELECT month, slug FROM monthly_notice_deliveries
      WHERE chat_id = ? AND slug IN (?, ?)
        AND (status = 'pending' OR (status = 'sending' AND last_attempt_at <= ?))
      ORDER BY month DESC LIMIT 1`
-  ).bind(dataChat, slugs[0], slugs[1] || slugs[0], now - NOTICE_CLAIM_GRACE_MS).first();
+  ).bind(dataChatId(env, chatId), slugs[0], slugs[1] || slugs[0], now - NOTICE_CLAIM_GRACE_MS);
+}
+
+// `found` is that read's answer when the caller already has it: the row, or
+// null for nothing waiting. Left out, it is read here.
+export async function deliverSightedTabNotice(env, chatId, from, now = Date.now(), found) {
+  if (!from || !from.id) return;
+  const dataChat = dataChatId(env, chatId);
+  const slugs = [...new Set([`u${from.id}`, identity(from).slug])];
+  const due = found !== undefined ? found
+    : await sightedNoticeStatement(env, chatId, from, now).first();
   if (!due) return;
   const claim = await env.DB.prepare(
     `UPDATE monthly_notice_deliveries
@@ -1894,8 +1929,11 @@ export async function deliverSightedTabNotice(env, chatId, from, now = Date.now(
   // message is certain to be looked at — and cleared with the day's receipts.
   const outcome = await sendPrivately(env, chatId, html, from.id, endOfLocalDay(now, tz),
     { replyMarkup: OK_MARKUP });
-  if (outcome === 'private' || outcome === 'refused') {
-    await settle(outcome === 'private' ? 'delivered' : 'refused');
+  if (outcome === 'private' || outcome === 'refused' || outcome === 'uncertain') {
+    // A timed-out copy may have landed, and a second ask for one balance is
+    // the thing this notice must never be.
+    await settle(outcome === 'refused' ? 'refused' : 'delivered',
+      outcome === 'uncertain' ? 'Telegram timed out; may have arrived' : null);
     // Older months still queued for the same person would be a second ask on
     // their next post, for a balance this notice already covers.
     await env.DB.prepare(

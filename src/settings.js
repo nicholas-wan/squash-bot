@@ -55,13 +55,44 @@ export async function getTimezone(env, chatId) {
   return chosen || env.DEFAULT_TIMEZONE || DEFAULT_TZ;
 }
 
-// Keeps one pinned message per column in sync. A null html removes the pin
-// entirely, so an empty board or a settled tab leaves no clutter behind.
-export async function updatePinnedMessage(env, chatId, column, html, replyMarkup, label) {
-  if (!PINNED_COLUMNS.has(column)) throw new Error(`Unknown pinned column: ${column}`);
-  const setting = await env.DB.prepare(
+// The same read for a caller sending a batch anyway, as the webhook does for
+// every update: a fresh isolate's first tap then learns the timezone in the
+// round trip it already pays. Null when the answer is cached. `settle` takes
+// the batch's answer, which must carry its rows; anything else is ignored and
+// getTimezone reads for itself.
+export function timezonePrimer(env, chatId) {
+  const perDb = tzCache.get(env.DB);
+  const cached = perDb && perDb.get(chatId);
+  if (cached && cached.expiresAt > Date.now()) return null;
+  return {
+    statement: env.DB.prepare('SELECT tz FROM settings WHERE chat_id = ?').bind(chatId),
+    settle(result) {
+      if (!result || !Array.isArray(result.results)) return;
+      let map = tzCache.get(env.DB);
+      if (!map) tzCache.set(env.DB, (map = new Map()));
+      const row = result.results[0];
+      map.set(chatId, {
+        chosen: row && row.tz !== SCHEMA_DEFAULT_TZ ? row.tz : null,
+        expiresAt: Date.now() + TZ_CACHE_TTL_MS,
+      });
+    },
+  };
+}
+
+// The ids of the chat's pinned board and tab: the settings row, or null.
+export function pinnedIds(env, chatId) {
+  return env.DB.prepare(
     'SELECT board_message_id, tab_message_id FROM settings WHERE chat_id = ?'
   ).bind(chatId).first();
+}
+
+// Keeps one pinned message per column in sync. A null html removes the pin
+// entirely, so an empty board or a settled tab leaves no clutter behind.
+// `existing` is the chat's settings row when the caller has just read it with
+// pinnedIds (null for no row), which spares this a read of its own.
+export async function updatePinnedMessage(env, chatId, column, html, replyMarkup, label, options = {}) {
+  if (!PINNED_COLUMNS.has(column)) throw new Error(`Unknown pinned column: ${column}`);
+  const setting = 'existing' in options ? options.existing : await pinnedIds(env, chatId);
   const existingId = setting && setting[column];
 
   if (!html) {

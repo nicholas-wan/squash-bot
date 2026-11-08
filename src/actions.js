@@ -217,14 +217,18 @@ export async function moveOwnSlot(env, chatId, bookingId, from, action) {
   };
 }
 
-// Telling the court comes before the board: updateBoard throws when the pinned
-// message cannot be edited or re-pinned, and that must not swallow the one
-// notice the people on the court are waiting on.
+// updateBoard throws when the pinned message cannot be edited or re-pinned,
+// and that must not swallow the one notice the people on the court are
+// waiting on. Each has its own catch, so the two run side by side: they are
+// private messages and a pinned edit, and neither reads what the other wrote.
 export async function settleSlotMove(env, chatId, result, from, options = {}) {
   const { defer, ...notice } = options;
   await afterwards(async () => {
-    await notifyRosterOfChange(env, chatId, result.booking, from, result.status, 1, notice)
-      .catch(noticeFailed);
-    await updateBoard(env, chatId);
+    const [, board] = await Promise.allSettled([
+      notifyRosterOfChange(env, chatId, result.booking, from, result.status, 1, notice)
+        .catch(noticeFailed),
+      updateBoard(env, chatId),
+    ]);
+    if (board.status === 'rejected') throw board.reason;
   }, defer);
 }

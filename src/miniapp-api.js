@@ -131,7 +131,7 @@ const wanted = (body) => (typeof body.on === 'boolean' ? body.on : undefined);
 const routes = [
   ['GET', /^courts$/, async ({ env, chatId, user, admin }) => json({
     ok: true, ...(await courtList(env, chatId, { viewer: user, admin })),
-  }), { member: true }],
+  }), { member: true, early: true }],
   ['POST', /^court\/(\d+)\/(join|leave)$/, async ({ env, chatId, match, user, admin, defer }) =>
     slotReply(env, chatId, Number(match[1]), user, admin, match[2], defer), { member: true }],
   ['GET', /^court\/(\d+)$/, async ({ env, chatId, match, user }) => {
@@ -238,23 +238,24 @@ const routes = [
   // The tab. Everyone reads their own; an admin also reads everybody's,
   // records payments of any size, and takes back a /debt entry or a payment
   // recorded by mistake. Slugs travel URL-encoded: a handle starts with @.
-  ['GET', /^tab$/, async ({ env, chatId, user, admin }) => {
-    const tz = await getTimezone(env, chatId);
-    const [mine, people] = await Promise.all([
-      ledgerRowsFor(env, chatId, user), admin ? adminTabEntries(env, chatId) : [],
+  ['GET', /^tab$/, async ({ env, chatId, user, admin: role }) => {
+    const [tz, mine, admin, people] = await Promise.all([
+      getTimezone(env, chatId), ledgerRowsFor(env, chatId, user), role,
+      Promise.resolve(role).then((yes) => (yes ? adminTabEntries(env, chatId) : [])),
     ]);
     return json({
       ok: true, admin, owner: ownerName(env),
       me: tabStory(mine, tz),
       people: people.map((entry) => ({ slug: entry.slug, name: entry.name, balance: entry.balance })),
     });
-  }, { member: true }],
+  }, { member: true, early: true }],
   ['GET', /^tab\/person\/([^/]+)$/, async ({ env, chatId, match }) =>
     personReply(env, chatId, decodeURIComponent(match[1]))],
-  ['POST', /^tab\/person\/([^/]+)\/pay$/, async ({ env, chatId, match, body, user }) => {
+  ['POST', /^tab\/person\/([^/]+)\/pay$/, async ({ env, chatId, match, body, user, defer }) => {
     const slug = decodeURIComponent(match[1]);
     const cents = Math.round(Number(body.cents));
-    const result = await recordPayment(env, chatId, slug, cents, user, Number(body.expected));
+    const result = await recordPayment(env, chatId, slug, cents, user, Number(body.expected),
+      { defer });
     if (result.status === 'amount') {
       return json({ ok: false, message: 'Enter an amount between $0.01 and $1,000.' });
     }
@@ -266,17 +267,20 @@ const routes = [
       });
     }
     if (result.status !== 'paid') return json({ ok: false, message: 'Nothing on that tab any more.' });
-    const told = result.userId
-      ? await sendPrivateNote(env, chatId, result.userId, paymentReceiptHtml(result.paid, result.balance))
-      : 'failed';
-    return personReply(env, chatId, slug, {
+    // The receipt and the redrawn person are independent, so they go
+    // together; the reply's wording waits for the receipt's outcome.
+    const receipt = result.userId
+      ? sendPrivateNote(env, chatId, result.userId, paymentReceiptHtml(result.paid, result.balance))
+      : Promise.resolve('failed');
+    const [told, reply] = await Promise.all([receipt, personReply(env, chatId, slug, {
       ok: true,
-      message: `${formatMoney(result.paid)} from ${result.name} recorded.`
-        + (told === 'private' ? ' They have a receipt.' : ' They could not be sent a receipt.'),
-    });
+      message: `${formatMoney(result.paid)} from ${result.name} recorded.`,
+    })]);
+    return withReceiptNote(reply, told === 'private' ? ' They have a receipt.'
+      : ' They could not be sent a receipt.');
   }],
-  ['POST', /^tab\/entry\/(\d+)\/undo$/, async ({ env, chatId, match }) => {
-    const undone = await undoEntry(env, chatId, Number(match[1]));
+  ['POST', /^tab\/entry\/(\d+)\/undo$/, async ({ env, chatId, match, defer }) => {
+    const undone = await undoEntry(env, chatId, Number(match[1]), { defer });
     if (!undone) {
       return json({ ok: false, message: 'That entry has already gone, or is too old to undo.' });
     }
@@ -297,16 +301,20 @@ const routes = [
   }],
 ];
 
+// A sentence added to a reply's message once something running beside it,
+// such as a receipt, has said how it went.
+async function withReceiptNote(reply, note) {
+  const body = await reply.clone().json();
+  return body.ok ? json({ ...body, message: `${body.message}${note}` }) : reply;
+}
+
 // One person's tab for an admin, with whatever the action before it has to say.
 async function personReply(env, chatId, slug, extra = { ok: true }) {
-  const rows = await accountRows(env, chatId, slug);
+  const [rows, tz] = await Promise.all([accountRows(env, chatId, slug), getTimezone(env, chatId)]);
   if (!rows.length) return json({ ok: false, message: 'Nothing on that tab any more.' });
   return json({
     ...extra,
-    person: {
-      slug, name: rows[rows.length - 1].name,
-      ...tabStory(rows, await getTimezone(env, chatId)),
-    },
+    person: { slug, name: rows[rows.length - 1].name, ...tabStory(rows, tz) },
   });
 }
 
@@ -327,29 +335,47 @@ export async function handleMiniAppApi(request, env, path, now = Date.now(), ctx
   const chatId = chatFromStartParam(env, session.startParam);
   if (!chatId) return json({ ok: false, message: 'This link is not for a SquashBot group.' }, 403);
   const { user } = session;
-  for (const [method, pattern, handler, { member = false } = {}] of routes) {
+  for (const [method, pattern, handler, { member = false, early = false } = {}] of routes) {
     const match = path.match(pattern);
     if (!match || request.method !== method) continue;
     // Membership is checked, not assumed: the launch link is signed, but
     // anybody who has seen it, somebody since removed from the group say,
     // could open it. The same cached getChatMember that answers "admin"
-    // answers this, so it costs nothing extra.
-    const role = await chatRole(env, chatId, user);
-    if (role === 'unknown') return json({ ok: false, retry: true, message: ROLE_UNKNOWN }, 503);
-    if (role === 'none') return json({ ok: false, admin: false, message: NOT_A_MEMBER }, 403);
-    const admin = role === 'admin';
-    if (!member && !admin) return json({ ok: false, admin: false, message: MANAGE_ADMIN }, 403);
+    // answers this, so it costs nothing extra. It is a Telegram round trip
+    // whenever the isolate has not asked lately, so it runs alongside the
+    // request's own first reads rather than in front of them: a POST's body,
+    // and for the two screens a member opens first (an `early` route, which
+    // only reads) the screen itself, which takes the admin answer as a
+    // promise. Nothing is written, and nothing read goes out, before it.
+    const role = chatRole(env, chatId, user);
+    const admin = role.then((answer) => answer === 'admin');
+    let body = {};
+    let started = null;
     try {
-      let body = {};
+      if (method === 'POST') {
+        [body] = await Promise.all([readBody(request), role]);
+      } else if (early) {
+        started = handler({ env, chatId, match, body, user, admin, now, defer });
+        started.catch(() => {});
+      }
+    } catch (error) {
+      console.log(`Mini App ${method} ${path} failed: ${error.stack || error}`);
+      return json({ ok: false, message: 'Something went wrong. Please try again.' }, 500);
+    }
+    const answer = await role;
+    if (answer === 'unknown') return json({ ok: false, retry: true, message: ROLE_UNKNOWN }, 503);
+    if (answer === 'none') return json({ ok: false, admin: false, message: NOT_A_MEMBER }, 403);
+    const isAdmin = answer === 'admin';
+    if (!member && !isAdmin) return json({ ok: false, admin: false, message: MANAGE_ADMIN }, 403);
+    try {
       if (method === 'POST') {
         // What a tap in the chat does before anything else: tie this account
-        // to the handle it was seeded under, so a write keys them as one person.
-        // Separate tables, so the two writes and the body read run together.
-        [body] = await Promise.all([
-          readBody(request), rememberPlayer(env, user), rememberLedgerIdentity(env, chatId, user),
-        ]);
+        // to the handle it was seeded under, so a write keys them as one
+        // person. Separate tables, so the two writes run together.
+        await Promise.all([rememberPlayer(env, user), rememberLedgerIdentity(env, chatId, user)]);
       }
-      return await handler({ env, chatId, match, body, user, admin, now, defer });
+      return await (started
+        || handler({ env, chatId, match, body, user, admin: isAdmin, now, defer }));
     } catch (error) {
       if (error instanceof BookingParseError) return json({ ok: false, message: error.message });
       console.log(`Mini App ${method} ${path} failed: ${error.stack || error}`);

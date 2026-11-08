@@ -8,7 +8,7 @@ import { isChatAdmin, knownPlayers, openBooking, RosterCapacityError } from './p
 import {
   analyzeBooking, bookingFromDraft, BookingParseError, formatClock, parseField,
 } from './parser.js';
-import { formatDate, formatTime, localParts, zonedEpoch } from './time.js';
+import { dateFormatter, formatDate, formatTime, localParts, zonedEpoch } from './time.js';
 import {
   answerCallback, deleteEphemeralMessage, deleteMessage, editEphemeralMessage,
   editMessage, escapeHtml, mentionHtml, sendMessage,
@@ -30,7 +30,7 @@ function dateAdd(y, mo, d, days) {
 function dateLabel(date, tz, short = false) {
   const epoch = zonedEpoch(date.y, date.mo, date.d, 12, 0, tz);
   if (!short) return formatDate(epoch, tz);
-  return new Intl.DateTimeFormat('en-SG', {
+  return dateFormatter('en-SG', {
     timeZone: tz, weekday: 'short', day: 'numeric', month: 'short',
   }).format(new Date(epoch));
 }
@@ -52,7 +52,7 @@ function firstMissing(payload) {
 }
 
 function defaultDateChoices(now, tz) {
-  const p = new Intl.DateTimeFormat('en-CA', {
+  const p = dateFormatter('en-CA', {
     timeZone: tz, year: 'numeric', month: 'numeric', day: 'numeric',
   }).formatToParts(new Date(now)).reduce((out, part) => {
     if (part.type === 'year') out.y = Number(part.value);
