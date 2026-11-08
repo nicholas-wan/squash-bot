@@ -56,7 +56,7 @@ crons = ["* * * * *"]
 
 [[d1_databases]]
 binding = "DB"
-database_name = "squashbot"
+database_name = "squashbot-eu"
 database_id = "YOUR_D1_DATABASE_ID"
 
 [observability]

@@ -105,6 +105,16 @@ point any uptime pinger at it. `npm run deploy` refuses to ship a red test
 suite; every Telegram call is bounded at fifteen seconds so a stalled fetch
 fails loudly instead of dying silently with the isolate.
 
+## Group wallpaper
+
+`assets/squash-group-wallpaper.png` (1440×3120) is the group's chat
+wallpaper: a calm dark field with a warm floor glow, a teal glass-wall glow and
+only the court's T in faint red, kept low-contrast so busy chats stay readable.
+It is rendered from `images/projects/squash-wallpaper.svg` in the website repo
+and dithered so the dark gradients do not band. Bots cannot set wallpapers: a
+group admin sets it under Edit > Appearance > Wallpaper, which Telegram only
+offers once the group has enough boosts.
+
 ## Mini App response handling
 
 The opening court list reads the courts, rosters and timezone while Telegram
