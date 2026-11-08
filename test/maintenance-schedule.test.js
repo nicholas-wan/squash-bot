@@ -63,6 +63,19 @@ it('excludes reminders already delivered to the whole roster', async () => {
   expect(await nextMaintenanceDue(env, now)).toBe(now + 4*3600000);
 });
 
+it('does not keep a past reminder alive for a player who joined after it', async () => {
+  booking();
+  // Joined after both reminders were due: the sender skips them, so the
+  // schedule must too, or it sweeps every minute until the court starts.
+  db.prepare(`INSERT INTO booking_players (booking_id,chat_id,slug,name,created_at)
+    VALUES (1,-123,'u1','Player',?)`).run(now + 3 * 3600000);
+  expect(await nextMaintenanceDue(env, now + 3 * 3600000)).toBe(now + 4 * 3600000);
+  // One who joined in time still holds the reminder.
+  db.prepare(`INSERT INTO booking_players (booking_id,chat_id,slug,name,created_at)
+    VALUES (1,-123,'u2','Early',?)`).run(now);
+  expect(await nextMaintenanceDue(env, now)).toBe(now + 3600000);
+});
+
 it('booking edits and roster changes invalidate the cached deadline', async () => {
   booking();
   await runScheduledMaintenance(env, success, prune, now);

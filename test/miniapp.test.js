@@ -49,10 +49,12 @@ function futureDate(days = 3) {
   return parts;
 }
 
-function bookingDb(booking, { ran = [], conflict = null, bound = [] } = {}) {
+function bookingDb(booking, { ran = [], conflict = null, bound = [], player = null } = {}) {
   const db = { prepare(sql) { return { bind(...args) { bound.push({ sql: sql.trim(), args }); return {
     async first() {
       if (sql.includes('SELECT tz')) return { tz: 'Asia/Singapore' };
+      if (sql.includes('FROM booking_players WHERE id = ?')) return player;
+      if (sql.includes('SELECT capacity FROM bookings')) return { capacity: booking.capacity };
       if (sql.includes('SELECT * FROM bookings WHERE id')) return booking;
       if (sql.includes('SELECT ends_at FROM bookings')) return { ends_at: booking.ends_at };
       if (sql.includes('board_message_id')) return { board_message_id: 55 };
@@ -209,6 +211,75 @@ describe('Mini App API', () => {
     // The seated player hears it, and the pinned board is redrawn.
     expect(requests.some((r) => r.url.endsWith('/sendMessage') && r.body.receiver_user_id === 42))
       .toBe(true);
+    expect(requests.some((r) => r.url.endsWith('/editMessageText') && r.body.message_id === 55))
+      .toBe(true);
+  });
+
+  it('turns away somebody no longer in the group, and asks for a retry when Telegram is down', async () => {
+    const auth = await initData({ user: JSON.stringify({ id: 8, first_name: 'Ex' }) });
+    stubTelegram([], { member: 'left' });
+    const gone = await worker.fetch(apiRequest('courts', auth), env(bookingDb(futureBooking())));
+    expect(gone.status).toBe(403);
+    expect((await gone.json()).message).toBe('Only members of the group can use this.');
+    clearAdminCache();
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      ok: false, error_code: 429, description: 'Too Many Requests',
+    }), { headers: { 'Content-Type': 'application/json' } })));
+    const down = await worker.fetch(apiRequest('courts', auth), env(bookingDb(futureBooking())));
+    expect(down.status).toBe(503);
+    expect(await down.json()).toMatchObject({ ok: false, retry: true });
+  });
+
+  it('treats a +1 or a slot the screen already showed as no change, not a flip back', async () => {
+    const ran = [];
+    stubTelegram([]);
+    const player = { id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick', heads: 2 };
+    const plus = await (await worker.fetch(
+      apiRequest('court/3/plus', await initData(), { player: 1, on: true }),
+      env(bookingDb(futureBooking(), { ran, player }))
+    )).json();
+    expect(plus).toMatchObject({ ok: true, message: 'Nick already brings a +1.' });
+    expect(plus.court.id).toBe(3);
+    expect(ran.some((sql) => sql.startsWith('UPDATE booking_players SET heads'))).toBe(false);
+    // Another admin opened the slot first: the guarded raise misses, and the
+    // court already holds more than this screen showed.
+    const raised = { ...futureBooking(), capacity: 4 };
+    const slot = await (await worker.fetch(
+      apiRequest('court/3/capacity', await initData(), { expected: 3 }),
+      env(bookingDb(raised, { ran }))
+    )).json();
+    expect(slot).toMatchObject({ ok: true, message: 'This court already holds 4 players.' });
+  });
+
+  it('reports a seated player as seated even when the board cannot be redrawn', async () => {
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(init.body) });
+      const failing = String(url).endsWith('/editMessageText');
+      return new Response(JSON.stringify(failing
+        ? { ok: false, error_code: 429, description: 'Too Many Requests: retry after 5' }
+        : { ok: true, result: { message_id: 1, ephemeral_message_id: 12 } }),
+      { headers: { 'Content-Type': 'application/json' } });
+    }));
+    const response = await worker.fetch(
+      apiRequest('court/3/seat', await initData(), { slug: '@bo', heads: 1 }),
+      env(bookingDb(futureBooking()))
+    );
+    expect(response.status).toBe(200);
+    expect((await response.json())).toMatchObject({ ok: true });
+  });
+
+  it('answers before the board is redrawn when the runtime can wait for it', async () => {
+    const requests = [];
+    stubTelegram(requests);
+    const tasks = [];
+    const response = await worker.fetch(
+      apiRequest('court/3/seat', await initData(), { slug: '@bo', heads: 1 }),
+      env(bookingDb(futureBooking())), { waitUntil: (task) => tasks.push(task) }
+    );
+    expect((await response.json()).ok).toBe(true);
+    expect(tasks.length).toBeGreaterThan(0);
+    await Promise.all(tasks);
     expect(requests.some((r) => r.url.endsWith('/editMessageText') && r.body.message_id === 55))
       .toBe(true);
   });

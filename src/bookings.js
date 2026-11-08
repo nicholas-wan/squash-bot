@@ -1,7 +1,7 @@
 import {
-  clearRoster, defaultCapacity, DEFAULT_CAPACITY, identity, isChatAdmin,
+  chatRosters, clearRoster, defaultCapacity, DEFAULT_CAPACITY, identity, isChatAdmin,
   isHouseholdPlayer, knownPlayers, matchesPlayer, MAX_CAPACITY, openBooking, ownerIdentity,
-  ownerName, ownerRow, rosterFor, rostersFor, seedRoster,
+  ownerName, ownerRow, rosterFor, seedRoster,
 } from './players.js';
 import {
   compactTimeRange, courtName, playerHeads, playerTags, rosterHeads, shortClock,
@@ -132,7 +132,7 @@ export async function addBooking(
   env, chatId, parsed, from, sourceText = null,
   {
     allowConflict = false, callbackQueryId = null, bookedFor = null, free = false, companions = {},
-    receipt = true,
+    receipt = true, defer = null,
   } = {}
 ) {
   const now = Date.now();
@@ -192,30 +192,46 @@ export async function addBooking(
     }
     throw error;
   }
-  try {
-    await updateBoard(env, chatId);
-  } catch (error) {
-    // The booking is committed. Reporting the whole operation as failed invites
-    // a duplicate retry; updateBoard has queued a maintenance retry.
-    console.log(`Board refresh after adding booking ${bookingId} failed: ${error.stack || error}`);
-  }
+  // The board and the receipt are independent, so they go out together, and
+  // each failure stays its own: the booking is committed, so reporting the
+  // whole operation as failed would invite a duplicate retry, and
+  // updateBoard has queued a maintenance retry of its own.
   // Booked on behalf, the receipt is skipped: it would be an unprompted
   // ephemeral to somebody who tapped nothing — the kind Telegram drops.
   // The attribution is for the record, and the board carries the news. The
   // Mini App asks for none: it shows its own confirmation, and has no tap for
   // Telegram to deliver an ephemeral receipt against.
-  if (!bookedFor && receipt) {
-    try {
-      await confirmToBooker(env, chatId, bookingId, parsed, capacity, from, callbackQueryId);
-    } catch (error) {
-      console.log(`Receipt for booking ${bookingId} failed: ${error.stack || error}`);
-    }
-  }
+  await afterCommit(() => Promise.all([
+    updateBoard(env, chatId).catch((error) => {
+      console.log(`Board refresh after adding booking ${bookingId} failed: ${error.stack || error}`);
+    }),
+    !bookedFor && receipt
+      ? confirmToBooker(env, chatId, bookingId, parsed, capacity, from, callbackQueryId)
+        .catch((error) => {
+          console.log(`Receipt for booking ${bookingId} failed: ${error.stack || error}`);
+        })
+      : null,
+  ]), defer);
   return bookingId;
 }
 
+// What follows a committed change: the board, notices and receipts. With
+// `defer` the caller answers the person first and runs it after; without, it
+// is awaited here. It never rejects: each piece logs its own failure.
+async function afterCommit(work, defer) {
+  const settled = work().catch((error) => {
+    console.log(`Post-commit work failed: ${error.stack || error}`);
+  });
+  if (defer) {
+    defer(settled);
+    return;
+  }
+  await settled;
+}
+
 export async function updateBooking(
-  env, chatId, id, parsed, from, sourceText = null, { allowConflict = false, expected = null } = {}
+  env, chatId, id, parsed, from, sourceText = null,
+  { allowConflict = false, expected = null, defer = null } = {}
 ) {
   const before = await env.DB.prepare('SELECT * FROM bookings WHERE id = ? AND chat_id = ?')
     .bind(id, dataChatId(env, chatId)).first();
@@ -246,7 +262,8 @@ export async function updateBooking(
     `UPDATE bookings SET
        court = ?, starts_at = ?, ends_at = ?, reminder_at = ?,
        reminder_sent = ?, pre_reminder_at = ?, pre_reminder_sent = ?
-     WHERE id = ? AND chat_id = ? AND ends_at > ? AND (
+     WHERE id = ? AND chat_id = ? AND ends_at > ?
+       AND court = ? AND starts_at = ? AND ends_at = ? AND (
        ? = 1 OR NOT EXISTS (
          SELECT 1 FROM bookings AS other
          WHERE other.chat_id = ?
@@ -258,6 +275,10 @@ export async function updateBooking(
     parsed.court, parsed.startsAt, parsed.endsAt, parsed.reminderAt,
     parsed.reminderAt <= now ? 1 : 0, preReminderAt,
     parsed.skipPreReminder || preReminderAt <= now ? 1 : 0, id, dataChatId(env, chatId), now,
+    // Only onto the row as it was read: two saves racing between that read
+    // and this write would otherwise both pass the `expected` check above,
+    // and the second would quietly undo the first.
+    before.court, before.starts_at, before.ends_at,
     allowConflict ? 1 : 0,
     dataChatId(env, chatId), parsed.court, parsed.endsAt, parsed.startsAt, id
   );
@@ -287,9 +308,11 @@ export async function updateBooking(
   }
   if (!result.meta.changes) {
     const current = await env.DB.prepare(
-      'SELECT ends_at FROM bookings WHERE id = ? AND chat_id = ?'
+      'SELECT * FROM bookings WHERE id = ? AND chat_id = ?'
     ).bind(id, dataChatId(env, chatId)).first();
     if (current && current.ends_at <= Date.now()) return 'played';
+    if (current && (String(current.court) !== String(before.court)
+      || current.starts_at !== before.starts_at || current.ends_at !== before.ends_at)) return 'changed';
     const conflicts = await findBookingConflicts(env, chatId, parsed, id);
     if (conflicts.length) throw new BookingConflictError(conflicts);
     return false;
@@ -303,8 +326,8 @@ export async function updateBooking(
   // A moved court is news to everyone on it: the re-armed reminders would say
   // so eventually, but not before somebody plans their evening around the old
   // time. Old details ride along so the change reads as a change.
-  const roster = await rosterFor(env, id);
-  try {
+  await afterCommit(async () => {
+    const roster = await rosterFor(env, id);
     if (roster.length) {
       const tz = await getTimezone(env, chatId);
       await notifyRosterDirectly(env, chatId, roster,
@@ -313,12 +336,12 @@ export async function updateBooking(
         `${compactTimeRange(parsed.startsAt, parsed.endsAt, tz)}\n` +
         `Was: ${escapeHtml(courtName(before))} · ${formatDate(before.starts_at, tz)} · ` +
         `${compactTimeRange(before.starts_at, before.ends_at, tz)}`,
-        endOfLocalDay(parsed.startsAt, tz), from && from.id);
+        endOfLocalDay(parsed.startsAt, tz), from && from.id).catch((error) => {
+        console.log(`Change notice for booking ${id} failed: ${error.stack || error}`);
+      });
     }
     await updateBoard(env, chatId);
-  } catch (error) {
-    console.log(`Post-commit work for edited booking ${id} failed: ${error.stack || error}`);
-  }
+  }, defer);
   return true;
 }
 
@@ -367,7 +390,9 @@ export async function authorizeBookingChange(env, chatId, id, from, action = 'ch
   return { allowed: true, status: 'ok', message: '', booking };
 }
 
-export async function cancelBooking(env, chatId, id, from = null, sourceText = null) {
+export async function cancelBooking(
+  env, chatId, id, from = null, sourceText = null, { defer = null } = {}
+) {
   const permitted = await authorizeBookingChange(env, chatId, id, from, 'cancel');
   if (!permitted.allowed) return permitted;
   const booking = permitted.booking;
@@ -410,7 +435,7 @@ export async function cancelBooking(env, chatId, id, from = null, sourceText = n
   // notice does: a board Telegram refuses to edit must not swallow the one
   // message that stops somebody showing up to a cancelled court. Their morning
   // reminder may already be in hand; silence here is how no-shows happen.
-  try {
+  await afterCommit(async () => {
     if (roster.length) {
       const tz = await getTimezone(env, chatId);
       await notifyRosterDirectly(env, chatId, roster,
@@ -418,12 +443,12 @@ export async function cancelBooking(env, chatId, id, from = null, sourceText = n
         `${formatDate(booking.starts_at, tz)} · ` +
         `${compactTimeRange(booking.starts_at, booking.ends_at, tz)}` +
         (from ? `\nCancelled by <b>${escapeHtml(actorName(from))}</b>.` : ''),
-        endOfLocalDay(booking.starts_at, tz), from && from.id);
+        endOfLocalDay(booking.starts_at, tz), from && from.id).catch((error) => {
+        console.log(`Cancel notice for booking ${id} failed: ${error.stack || error}`);
+      });
     }
     await updateBoard(env, chatId);
-  } catch (error) {
-    console.log(`Post-commit work for cancelled booking ${id} failed: ${error.stack || error}`);
-  }
+  }, defer);
   return { allowed: true, status: 'cancelled', message: '', booking };
 }
 
@@ -501,12 +526,11 @@ function shortBookingLabel(booking, tz) {
 // Join for courts they are not on and Leave for the ones they are. A shared
 // keyboard on the pinned board could never tell the two apart.
 export async function joinPickerView(env, chatId, from, isAdmin = false, now = Date.now()) {
-  const [active, tz] = await Promise.all([
-    activeBookings(env, chatId, now), getTimezone(env, chatId),
+  const [active, tz, rosters] = await Promise.all([
+    activeBookings(env, chatId, now), getTimezone(env, chatId), chatRosters(env, chatId),
   ]);
   const bookings = active.filter((booking) => booking.starts_at > now);
   if (!bookings.length) return null;
-  const rosters = await rostersFor(env, chatId, bookings.map((booking) => booking.id));
   // May be a promise started alongside the reads above, so the getChatMember
   // round trip it hides costs no extra wall clock. isChatAdmin never rejects,
   // which is what makes the early return above safe to leave it unawaited.
@@ -579,11 +603,10 @@ export async function joinPickerView(env, chatId, from, isAdmin = false, now = D
 }
 
 async function renderBoard(env, chatId, now) {
-  const [tz, bookings] = await Promise.all([
-    getTimezone(env, chatId), activeBookings(env, chatId, now),
+  const [tz, bookings, rosters] = await Promise.all([
+    getTimezone(env, chatId), activeBookings(env, chatId, now), chatRosters(env, chatId),
   ]);
   if (!bookings.length) return { html: null, bookings };
-  const rosters = await rostersFor(env, chatId, bookings.map((booking) => booking.id));
 
   // A schedule: one line per court, and nothing to act on. It sat beside the
   // "next available court" message looking like a copy of it — same emoji,
@@ -630,7 +653,29 @@ export async function boardHtml(env, chatId, now = Date.now()) {
 // which once turned one kicked group into every command failing everywhere.
 // Only the acting chat's own failure still surfaces, because there it is the
 // answer the person is waiting on.
-export async function updateBoard(env, chatId, now = Date.now()) {
+// Board redraws for one group run one at a time within the isolate. Tap
+// replies no longer wait for the board, so a second tap's redraw could start
+// while the first was mid-edit and an older rendering could land last, or,
+// with no board pinned yet, both could post and pin one. Each queued redraw
+// reads the database when its turn comes, so the last one always shows the
+// latest state. Keyed by the shared data chat, since every redraw edits all
+// of its groups' boards.
+const boardQueues = new WeakMap();
+
+export function updateBoard(env, chatId, now) {
+  let queues = boardQueues.get(env.DB);
+  if (!queues) boardQueues.set(env.DB, (queues = new Map()));
+  const key = dataChatId(env, chatId);
+  const run = (queues.get(key) || Promise.resolve())
+    .catch(() => {})
+    .then(() => drawBoard(env, chatId, now ?? Date.now()));
+  queues.set(key, run);
+  const forget = () => { if (queues.get(key) === run) queues.delete(key); };
+  run.then(forget, forget);
+  return run;
+}
+
+async function drawBoard(env, chatId, now) {
   const board = await renderBoard(env, chatId, now);
   // Shared chats are independent Telegram calls. Running them together keeps a
   // dead sibling from adding one full network round trip per group, while the
@@ -750,12 +795,11 @@ function courtSummary(env, booking, roster, tz, now, viewer = null) {
 // names only on the courts they are on. An admin sees every court, in play
 // too, with every roster, and who can be named as a booker.
 export async function courtList(env, chatId, { viewer = null, admin = false } = {}, now = Date.now()) {
-  const [active, tz, known] = await Promise.all([
+  const [active, tz, known, rosters] = await Promise.all([
     activeBookings(env, chatId, now), getTimezone(env, chatId),
-    admin ? knownPlayers(env, chatId) : [],
+    admin ? knownPlayers(env, chatId) : [], chatRosters(env, chatId),
   ]);
   const bookings = admin ? active : active.filter((booking) => booking.starts_at > now);
-  const rosters = await rostersFor(env, chatId, bookings.map((booking) => booking.id));
   const courts = bookings.map((booking) =>
     courtSummary(env, booking, rosters.get(booking.id) || [], tz, now, viewer));
   if (!admin) for (const court of courts) if (!court.mine) court.players = [];
@@ -771,11 +815,25 @@ export async function courtList(env, chatId, { viewer = null, admin = false } = 
   };
 }
 
+// A court, its roster and the timezone, read together: every panel starts
+// with these, and none depends on another. A roster read for a booking that
+// turns out to be gone is simply dropped.
+async function courtWithRoster(env, chatId, bookingId) {
+  const [booking, roster, tz] = await Promise.all([
+    openBooking(env, chatId, bookingId), rosterFor(env, bookingId), getTimezone(env, chatId),
+  ]);
+  return { booking, roster, tz };
+}
+
 export async function courtDetail(env, chatId, bookingId, viewer = null, now = Date.now()) {
-  const booking = await openBooking(env, chatId, bookingId);
-  if (!booking) return null;
-  const [roster, tz] = await Promise.all([rosterFor(env, bookingId), getTimezone(env, chatId)]);
-  const { free, guest, candidates } = await seatOptions(env, chatId, booking, roster);
+  // The seat picker's lookups need only the chat, so they start alongside.
+  const lookups = seatLookups(env, chatId);
+  const { booking, roster, tz } = await courtWithRoster(env, chatId, bookingId);
+  if (!booking) {
+    lookups.catch(() => {});
+    return null;
+  }
+  const { free, guest, candidates } = await seatOptions(env, chatId, booking, roster, 1, lookups);
   return {
     ...courtSummary(env, booking, roster, tz, now, viewer),
     bookedBy: booking.created_by_name || null,
@@ -790,9 +848,8 @@ export async function courtDetail(env, chatId, bookingId, viewer = null, now = D
 }
 
 export async function bookingPanelView(env, chatId, bookingId) {
-  const booking = await openBooking(env, chatId, bookingId);
+  const { booking, roster, tz } = await courtWithRoster(env, chatId, bookingId);
   if (!booking) return null;
-  const tz = await getTimezone(env, chatId);
   const capacity = booking.capacity || DEFAULT_CAPACITY;
   const rows = [
     [{ text: `✏️ ${bookingLabel(booking, tz)}`, callback_data: `sb:pick:${booking.id}` }],
@@ -807,7 +864,6 @@ export async function bookingPanelView(env, chatId, bookingId) {
       text: `👥 Admin: room for ${capacity + 1}`, callback_data: `sb:cap:${booking.id}`,
     }]);
   }
-  const roster = await rosterFor(env, booking.id);
   // Only while a slot is free: seating somebody never squeezes past capacity.
   if (rosterHeads(roster) < capacity) {
     rows.push([{
@@ -850,20 +906,29 @@ export async function bookingPanelView(env, chatId, bookingId) {
 // seat them twice, splitting the court over a head that was never there.
 // Everyone is compared by account: their id where one is known, directly or
 // through the alias a handle was first charged under.
-export async function seatOptions(env, chatId, booking, roster, heads = 1) {
+// The two reads behind the seat picker; they need only the chat, so a caller
+// can start them before it has the booking in hand.
+function seatLookups(env, chatId) {
+  return Promise.all([
+    knownPlayers(env, chatId),
+    env.DB.prepare(
+      'SELECT slug, user_id FROM ledger_identity_aliases WHERE chat_id = ? AND user_id > 0'
+    ).bind(dataChatId(env, chatId)).all(),
+  ]);
+}
+
+export async function seatOptions(env, chatId, booking, roster, heads = 1, lookups = null) {
   const capacity = booking.capacity || DEFAULT_CAPACITY;
   const free = capacity - rosterHeads(roster);
   const owner = ownerIdentity(env);
   const host = ownerRow(env, roster);
   const guestOn = Boolean(host) && playerHeads(host) > 1;
   const guest = owner && (guestOn || free >= (host ? 1 : 2)) ? { on: guestOn } : null;
-  if (heads > free) return { free, guest, candidates: [] };
-  const [known, aliases] = await Promise.all([
-    knownPlayers(env, chatId),
-    env.DB.prepare(
-      'SELECT slug, user_id FROM ledger_identity_aliases WHERE chat_id = ? AND user_id > 0'
-    ).bind(dataChatId(env, chatId)).all(),
-  ]);
+  if (heads > free) {
+    if (lookups) lookups.catch(() => {});
+    return { free, guest, candidates: [] };
+  }
+  const [known, aliases] = await (lookups || seatLookups(env, chatId));
   const aliasIds = new Map((aliases.results || []).map((row) => [row.slug, row.user_id]));
   const accountOf = (player) => {
     const slug = String(player.slug).toLowerCase();
@@ -896,10 +961,15 @@ export async function seatOptions(env, chatId, booking, roster, heads = 1) {
 // next person tapped with a friend, and needs two free slots rather than one,
 // so the whole panel is unavailable when only one is left.
 export async function addPlayerView(env, chatId, bookingId, heads = 1) {
-  const booking = await openBooking(env, chatId, bookingId);
-  if (!booking) return null;
-  const roster = await rosterFor(env, bookingId);
-  const { free, guest, candidates } = await seatOptions(env, chatId, booking, roster, heads);
+  const lookups = seatLookups(env, chatId);
+  const { booking, roster, tz } = await courtWithRoster(env, chatId, bookingId);
+  if (!booking) {
+    lookups.catch(() => {});
+    return null;
+  }
+  const { free, guest, candidates } = await seatOptions(
+    env, chatId, booking, roster, heads, lookups
+  );
   const guestRow = guest
     ? [{
       text: guest.on
@@ -909,7 +979,6 @@ export async function addPlayerView(env, chatId, bookingId, heads = 1) {
     }]
     : null;
   if (!candidates.length && !guestRow) return null;
-  const tz = await getTimezone(env, chatId);
   // The toggle sits above the names because it changes what tapping one of them
   // does, and a switch read after the fact is a switch nobody read.
   const rows = [[heads > 1
@@ -944,11 +1013,8 @@ export async function addPlayerView(env, chatId, bookingId, heads = 1) {
 // way tapping them flips. Keyed on the roster row id like the kick picker —
 // a row id cannot go stale into somebody else the way a re-typed handle can.
 export async function plusOneView(env, chatId, bookingId) {
-  const booking = await openBooking(env, chatId, bookingId);
-  if (!booking) return null;
-  const roster = await rosterFor(env, bookingId);
-  if (!roster.length) return null;
-  const tz = await getTimezone(env, chatId);
+  const { booking, roster, tz } = await courtWithRoster(env, chatId, bookingId);
+  if (!booking || !roster.length) return null;
   const rows = roster.map((player) => [{
     text: playerHeads(player) > 1
       ? `➖ ${player.name} +1 — back to one share`
@@ -965,11 +1031,8 @@ export async function plusOneView(env, chatId, bookingId) {
 }
 
 export async function removePlayerView(env, chatId, bookingId) {
-  const booking = await openBooking(env, chatId, bookingId);
-  if (!booking) return null;
-  const roster = await rosterFor(env, bookingId);
-  if (!roster.length) return null;
-  const tz = await getTimezone(env, chatId);
+  const { booking, roster, tz } = await courtWithRoster(env, chatId, bookingId);
+  if (!booking || !roster.length) return null;
   const rows = roster.map((player) => [{
     text: `🚪 ${player.name}`,
     callback_data: `sb:kick:${bookingId}:${player.id}`,
@@ -1492,8 +1555,8 @@ async function removeExpiredBookings(env, now) {
         const deleted = await env.DB.prepare(
           'DELETE FROM bookings WHERE id = ? AND chat_id = ? AND ends_at <= ?'
         ).bind(booking.id, chatId, now).run();
+        // trg_bookings_delete_dependants takes the roster with the booking.
         if (deleted.meta.changes) {
-          await clearRoster(env, booking.id);
           await recordAudit(
             env, booking.id, chatId, 'deleted', null, 'Expired automatically', booking, null
           );

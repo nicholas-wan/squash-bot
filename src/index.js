@@ -1,6 +1,7 @@
 import { runScheduledMaintenance } from './maintenance-schedule.js';
 import {
-  addSlot, flipOwnerGuest, flipPlusOne, kickPlayer, moveOwnSlot, seatPlayer, settleSlotMove,
+  addSlot, afterAnswer, flipOwnerGuest, flipPlusOne, kickPlayer, moveOwnSlot, seatPlayer,
+  settleSlotMove,
 } from './actions.js';
 import { handleMiniAppApi } from './miniapp-api.js';
 import { rememberLedgerIdentity } from './ledger-identity.js';
@@ -221,13 +222,18 @@ async function openDeleteConfirmation(env, callback, match) {
 }
 
 async function cancelFromPanel(env, callback, match) {
+  const later = afterAnswer();
   const result = await cancelBooking(
     env, callback.message.chat.id, Number(match[1]), callback.from,
-    'Deleted from pinned booking manager'
+    'Deleted from pinned booking manager', { defer: later.defer }
   );
   const removed = result.status === 'cancelled';
-  await answerCallback(env, callback.id,
-    removed ? 'Booking cancelled' : result.message, !removed);
+  try {
+    await answerCallback(env, callback.id,
+      removed ? 'Booking cancelled' : result.message, !removed);
+  } finally {
+    await later.drain();
+  }
 }
 
 async function openJoinPicker(env, callback) {
@@ -276,6 +282,19 @@ async function fullCourtToast(env, callback) {
     'That court is full. A group admin can open another slot.', true);
 }
 
+// The toast and the redrawn panel are the tapper's feedback; they go out
+// together, and the board follows.
+async function answerAndRedraw(env, callback, result, view, later) {
+  try {
+    await Promise.all([
+      answerCallback(env, callback.id, result.message, result.alert),
+      result.changed ? view().then((panel) => panel && showPanel(env, callback, panel)) : null,
+    ]);
+  } finally {
+    await later.drain();
+  }
+}
+
 async function moveSlot(env, callback, match) {
   const chatId = callback.message.chat.id;
   const result = await moveOwnSlot(env, chatId, Number(match[2]), callback.from, match[1]);
@@ -290,21 +309,26 @@ async function moveSlot(env, callback, match) {
   // which read as a tap that did nothing. The roster's private notices
   // carry the fuller story; the toast only confirms the slot moved.
   await answerCallback(env, callback.id, result.message);
-  await settleSlotMove(env, chatId, result, callback.from, { callbackQueryId: callback.id });
-  await refreshJoinPicker(env, callback);
+  // The tapper's own list (Join turning into Leave) is the visible change, so
+  // it is redrawn before the notices and the board rather than after them.
+  const later = afterAnswer();
+  try {
+    await settleSlotMove(env, chatId, result, callback.from,
+      { callbackQueryId: callback.id, defer: later.defer });
+    await refreshJoinPicker(env, callback);
+  } finally {
+    await later.drain();
+  }
 }
 
 async function seatPickedPlayer(env, callback, match) {
   const chatId = callback.message.chat.id;
   const bookingId = Number(match[1]);
+  const later = afterAnswer();
   const result = await seatPlayer(
-    env, chatId, bookingId, match[3], Number(match[2]), callback.from.id
+    env, chatId, bookingId, match[3], Number(match[2]), callback.from.id, { defer: later.defer }
   );
-  if (result.changed) {
-    const view = await bookingPanelView(env, chatId, bookingId);
-    if (view) await showPanel(env, callback, view);
-  }
-  await answerCallback(env, callback.id, result.message, result.alert);
+  await answerAndRedraw(env, callback, result, () => bookingPanelView(env, chatId, bookingId), later);
 }
 
 // Opening the picker and flipping its friend toggle are the same view drawn
@@ -324,12 +348,9 @@ async function openSeatPicker(env, callback, match) {
 async function flipPlusOneTapped(env, callback, match) {
   const chatId = callback.message.chat.id;
   const bookingId = Number(match[1]);
-  const result = await flipPlusOne(env, chatId, bookingId, Number(match[2]));
-  if (result.changed) {
-    const view = await plusOneView(env, chatId, bookingId);
-    if (view) await showPanel(env, callback, view);
-  }
-  await answerCallback(env, callback.id, result.message, result.alert);
+  const later = afterAnswer();
+  const result = await flipPlusOne(env, chatId, bookingId, Number(match[2]), { defer: later.defer });
+  await answerAndRedraw(env, callback, result, () => plusOneView(env, chatId, bookingId), later);
 }
 
 // The organiser's free guest, flipped from the seat picker. The picker is
@@ -338,12 +359,9 @@ async function flipPlusOneTapped(env, callback, match) {
 async function flipOwnerGuestTapped(env, callback, match) {
   const chatId = callback.message.chat.id;
   const bookingId = Number(match[1]);
-  const result = await flipOwnerGuest(env, chatId, bookingId, callback.from.id);
-  if (result.changed) {
-    const view = await addPlayerView(env, chatId, bookingId);
-    if (view) await showPanel(env, callback, view);
-  }
-  await answerCallback(env, callback.id, result.message, result.alert);
+  const later = afterAnswer();
+  const result = await flipOwnerGuest(env, chatId, bookingId, callback.from.id, { defer: later.defer });
+  await answerAndRedraw(env, callback, result, () => addPlayerView(env, chatId, bookingId), later);
 }
 
 async function openPlusOnePicker(env, callback, match) {
@@ -355,12 +373,9 @@ async function openPlusOnePicker(env, callback, match) {
 
 async function removePickedPlayer(env, callback, match) {
   const chatId = callback.message.chat.id;
-  const result = await kickPlayer(env, chatId, Number(match[1]), Number(match[2]));
-  if (result.changed) {
-    const view = await bookingPanelView(env, chatId, Number(match[1]));
-    if (view) await showPanel(env, callback, view);
-  }
-  await answerCallback(env, callback.id, result.message, result.alert);
+  const later = afterAnswer();
+  const result = await kickPlayer(env, chatId, Number(match[1]), Number(match[2]), { defer: later.defer });
+  await answerAndRedraw(env, callback, result, () => bookingPanelView(env, chatId, Number(match[1])), later);
 }
 
 async function openRemovePicker(env, callback, match) {
@@ -372,12 +387,9 @@ async function openRemovePicker(env, callback, match) {
 
 async function raiseSlotCount(env, callback, match) {
   const chatId = callback.message.chat.id;
-  const result = await addSlot(env, chatId, Number(match[1]));
-  if (result.changed) {
-    const view = await bookingPanelView(env, chatId, Number(match[1]));
-    if (view) await showPanel(env, callback, view);
-  }
-  await answerCallback(env, callback.id, result.message, result.alert);
+  const later = afterAnswer();
+  const result = await addSlot(env, chatId, Number(match[1]), { defer: later.defer });
+  await answerAndRedraw(env, callback, result, () => bookingPanelView(env, chatId, Number(match[1])), later);
 }
 
 // A private send can come back as an ordinary group message. Everything
@@ -829,8 +841,11 @@ async function dispatchUpdate(env, update) {
   if (callback && callback.message) {
     if (!chatAllowed(env, callback.message.chat)) return;
     try {
-      await rememberPlayer(env, callback.from);
-      await rememberLedgerIdentity(env, callback.message.chat.id, callback.from);
+      // Separate tables, so the two identity writes run together.
+      await Promise.all([
+        rememberPlayer(env, callback.from),
+        rememberLedgerIdentity(env, callback.message.chat.id, callback.from),
+      ]);
       if (await handleBoardCallback(env, callback)) return;
       if (await handleTabCallback(env, callback)) return;
       await handleBookingCallback(env, callback);
@@ -861,8 +876,9 @@ async function dispatchUpdate(env, update) {
   let clearedText = null;
 
   try {
-    await rememberPlayer(env, msg.from);
-    await rememberLedgerIdentity(env, msg.chat.id, msg.from);
+    await Promise.all([
+      rememberPlayer(env, msg.from), rememberLedgerIdentity(env, msg.chat.id, msg.from),
+    ]);
     if (await handleBookingReply(env, msg)) return;
     if (!text.startsWith('/')) {
       // The booking form repeats the text back, and the pinned board is the
@@ -1071,23 +1087,30 @@ async function dispatchUpdate(env, update) {
           })]);
         return;
       }
+      // The reply goes out before the roster's notices and the board.
+      const later = afterAnswer();
       const [result] = await Promise.all([
-        cancelBooking(env, msg.chat.id, Number(args), msg.from, `/cancel ${args}`),
+        cancelBooking(env, msg.chat.id, Number(args), msg.from, `/cancel ${args}`,
+          { defer: later.defer }),
         clearCommand,
       ]);
-      const replies = {
-        cancelled: `🗑 Removed booking <b>#${escapeHtml(args)}</b>.`,
-        gone: `I couldn't find booking <b>#${escapeHtml(args)}</b>.`,
-      };
-      await sendMessage(env, msg.chat.id,
-        replies[result.status] || escapeHtml(result.message),
-        {
-          silent: true,
-          receiverUserId: msg.from.id,
-          replyToEphemeral: msg.ephemeral_message_id || null,
-          replyMarkup: OK_MARKUP,
-        }
-      );
+      try {
+        const replies = {
+          cancelled: `🗑 Removed booking <b>#${escapeHtml(args)}</b>.`,
+          gone: `I couldn't find booking <b>#${escapeHtml(args)}</b>.`,
+        };
+        await sendMessage(env, msg.chat.id,
+          replies[result.status] || escapeHtml(result.message),
+          {
+            silent: true,
+            receiverUserId: msg.from.id,
+            replyToEphemeral: msg.ephemeral_message_id || null,
+            replyMarkup: OK_MARKUP,
+          }
+        );
+      } finally {
+        await later.drain();
+      }
       return;
     }
   } catch (error) {
@@ -1214,7 +1237,7 @@ export default {
     }
 
     if (url.pathname.startsWith('/api/app/')) {
-      return handleMiniAppApi(request, env, url.pathname.slice('/api/app/'.length));
+      return handleMiniAppApi(request, env, url.pathname.slice('/api/app/'.length), Date.now(), ctx);
     }
 
     if (url.pathname === '/setup') {

@@ -66,8 +66,10 @@ export async function updatePinnedMessage(env, chatId, column, html, replyMarkup
 
   if (!html) {
     if (existingId) {
-      await unpinMessage(env, chatId, existingId);
-      await deleteMessage(env, chatId, existingId);
+      // Independent calls: the unpin covers a message the bot cannot delete.
+      await Promise.all([
+        unpinMessage(env, chatId, existingId), deleteMessage(env, chatId, existingId),
+      ]);
       await env.DB.prepare(`UPDATE settings SET ${column} = NULL WHERE chat_id = ?`)
         .bind(chatId).run();
     }

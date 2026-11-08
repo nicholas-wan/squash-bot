@@ -11,7 +11,7 @@ import { verifyInitData } from './miniapp-auth.js';
 import { BookingParseError, bookingFromDraft, extractCourt } from './parser.js';
 import { rememberLedgerIdentity } from './ledger-identity.js';
 import {
-  isChatAdmin, knownPlayers, ownerName, rememberPlayer, RosterCapacityError,
+  chatRole, knownPlayers, ownerName, rememberPlayer, RosterCapacityError,
 } from './players.js';
 import { formatMoney } from './pricing.js';
 import {
@@ -22,8 +22,10 @@ import { allowedChats } from './scope.js';
 
 // The Mini App's API. The page is only a drawing of these answers: who is
 // asking comes from Telegram's signature, which group from the launch link's
-// startapp value, and every call asks Telegram whether that person is an
-// admin there. Members get the court list and their own Join and Leave, as
+// startapp value, and every call asks Telegram what that person is there:
+// somebody not in the group is turned away, and a lookup Telegram could not
+// answer comes back as a 503 the page retries. Members get the court list
+// and their own Join and Leave, as
 // the private 🙋 Join list gives them; everything else — reads included, since
 // the rosters are what the shared board deliberately leaves out — is for
 // admins. Refusals the chat panels show as alerts come back
@@ -92,9 +94,11 @@ async function readBody(request) {
 
 // After a change the court is drawn again from the database, so the page
 // never has to guess what its own tap did.
+// A tap that found the court already as the screen showed it is no failure:
+// the court is redrawn and the message says where it stands.
 async function actionReply(env, chatId, bookingId, result, user) {
   return json({
-    ok: result.changed, message: result.message,
+    ok: result.changed || Boolean(result.same), message: result.message,
     court: await courtDetail(env, chatId, bookingId, user),
   });
 }
@@ -110,14 +114,17 @@ async function savedReply(env, chatId, bookingId, user, admin, message) {
 // A member's own slot. The reply is the whole list again, since that is the
 // screen it was tapped on. The roster hears it as from the chat button; the
 // member's own copy is skipped, because the app has just said it on screen.
-async function slotReply(env, chatId, bookingId, user, admin, action) {
+// The notices and the board follow the reply when the runtime lets them.
+async function slotReply(env, chatId, bookingId, user, admin, action, defer) {
   const result = await moveOwnSlot(env, chatId, bookingId, user, action);
-  if (result.changed) await settleSlotMove(env, chatId, result, user, { tellActor: false });
+  if (result.changed) await settleSlotMove(env, chatId, result, user, { tellActor: false, defer });
   return json({
     ok: result.changed, message: result.message,
     ...(await courtList(env, chatId, { viewer: user, admin })),
   });
 }
+
+const wanted = (body) => (typeof body.on === 'boolean' ? body.on : undefined);
 
 // A route marked member is open to anyone in the group, as the private 🙋 Join
 // list is; every other one is refused to a member before its handler runs.
@@ -125,41 +132,48 @@ const routes = [
   ['GET', /^courts$/, async ({ env, chatId, user, admin }) => json({
     ok: true, ...(await courtList(env, chatId, { viewer: user, admin })),
   }), { member: true }],
-  ['POST', /^court\/(\d+)\/(join|leave)$/, async ({ env, chatId, match, user, admin }) =>
-    slotReply(env, chatId, Number(match[1]), user, admin, match[2]), { member: true }],
+  ['POST', /^court\/(\d+)\/(join|leave)$/, async ({ env, chatId, match, user, admin, defer }) =>
+    slotReply(env, chatId, Number(match[1]), user, admin, match[2], defer), { member: true }],
   ['GET', /^court\/(\d+)$/, async ({ env, chatId, match, user }) => {
     const court = await courtDetail(env, chatId, Number(match[1]), user);
     return court
       ? json({ ok: true, court })
       : json({ ok: false, message: 'That booking has already gone.' });
   }],
-  ['POST', /^court\/(\d+)\/seat$/, async ({ env, chatId, match, body, user }) => {
+  ['POST', /^court\/(\d+)\/seat$/, async ({ env, chatId, match, body, user, defer }) => {
     const heads = Number(body.heads) === 2 ? 2 : 1;
     const result = await seatPlayer(
-      env, chatId, Number(match[1]), String(body.slug || ''), heads, user.id
+      env, chatId, Number(match[1]), String(body.slug || ''), heads, user.id, { defer }
     );
     return actionReply(env, chatId, Number(match[1]), result, user);
   }],
-  ['POST', /^court\/(\d+)\/plus$/, async ({ env, chatId, match, body, user }) => actionReply(
+  // +1, guest and "room for N" carry the state the screen showed, so a retry
+  // or a second admin's stale screen lands as no change rather than undoing
+  // the first tap. A page from before this sent none, and still toggles.
+  ['POST', /^court\/(\d+)\/plus$/, async ({ env, chatId, match, body, user, defer }) => actionReply(
     env, chatId, Number(match[1]),
-    await flipPlusOne(env, chatId, Number(match[1]), Number(body.player)), user
+    await flipPlusOne(env, chatId, Number(match[1]), Number(body.player),
+      { want: wanted(body), defer }), user
   )],
-  ['POST', /^court\/(\d+)\/guest$/, async ({ env, chatId, match, user }) => actionReply(
+  ['POST', /^court\/(\d+)\/guest$/, async ({ env, chatId, match, body, user, defer }) => actionReply(
     env, chatId, Number(match[1]),
-    await flipOwnerGuest(env, chatId, Number(match[1]), user.id), user
+    await flipOwnerGuest(env, chatId, Number(match[1]), user.id, { want: wanted(body), defer }), user
   )],
-  ['POST', /^court\/(\d+)\/kick$/, async ({ env, chatId, match, body, user }) => actionReply(
+  ['POST', /^court\/(\d+)\/kick$/, async ({ env, chatId, match, body, user, defer }) => actionReply(
     env, chatId, Number(match[1]),
-    await kickPlayer(env, chatId, Number(match[1]), Number(body.player)), user
+    await kickPlayer(env, chatId, Number(match[1]), Number(body.player), { defer }), user
   )],
-  ['POST', /^court\/(\d+)\/capacity$/, async ({ env, chatId, match, user }) => actionReply(
-    env, chatId, Number(match[1]), await addSlot(env, chatId, Number(match[1])), user
+  ['POST', /^court\/(\d+)\/capacity$/, async ({ env, chatId, match, body, user, defer }) => actionReply(
+    env, chatId, Number(match[1]),
+    await addSlot(env, chatId, Number(match[1]), {
+      expected: Number.isInteger(body.expected) ? body.expected : undefined, defer,
+    }), user
   )],
   // Changing, cancelling and adding are open to members on the same terms as
   // the chat: anyone may book, and whoever booked a court — or an admin — may
   // change or cancel it until it starts. authorizeBookingChange is that rule,
   // and cancelBooking applies it itself.
-  ['POST', /^court\/(\d+)\/edit$/, async ({ env, chatId, match, body, user, admin, now }) => {
+  ['POST', /^court\/(\d+)\/edit$/, async ({ env, chatId, match, body, user, admin, now, defer }) => {
     const bookingId = Number(match[1]);
     const permitted = await authorizeBookingChange(env, chatId, bookingId, user, 'edit');
     if (!permitted.allowed) return json({ ok: false, message: permitted.message });
@@ -168,7 +182,7 @@ const routes = [
     try {
       saved = await updateBooking(
         env, chatId, bookingId, parsed, user, 'Edited in the Mini App',
-        { allowConflict: Boolean(body.force), expected: body.expected || null }
+        { allowConflict: Boolean(body.force), expected: body.expected || null, defer }
       );
     } catch (error) {
       if (error instanceof BookingConflictError) return conflictReply(env, chatId, error);
@@ -183,9 +197,9 @@ const routes = [
     if (saved !== true) return json({ ok: false, message: refusals[String(saved)] });
     return savedReply(env, chatId, bookingId, user, admin, '✅ Booking updated');
   }, { member: true }],
-  ['POST', /^court\/(\d+)\/delete$/, async ({ env, chatId, match, user, admin }) => {
+  ['POST', /^court\/(\d+)\/delete$/, async ({ env, chatId, match, user, admin, defer }) => {
     const result = await cancelBooking(
-      env, chatId, Number(match[1]), user, 'Deleted in the Mini App'
+      env, chatId, Number(match[1]), user, 'Deleted in the Mini App', { defer }
     );
     if (result.status !== 'cancelled') return json({ ok: false, message: result.message });
     return json({
@@ -193,7 +207,7 @@ const routes = [
       ...(await courtList(env, chatId, { viewer: user, admin })),
     });
   }, { member: true }],
-  ['POST', /^courts$/, async ({ env, chatId, body, user, admin, now }) => {
+  ['POST', /^courts$/, async ({ env, chatId, body, user, admin, now, defer }) => {
     const parsed = bookingFromForm(body, now, await getTimezone(env, chatId));
     // Naming somebody else as the booker, and marking a court free, change who
     // is billed: admin-only, as in the chat wizard. A member's form never
@@ -211,7 +225,7 @@ const routes = [
     try {
       bookingId = await addBooking(env, chatId, parsed, user, 'Added in the Mini App', {
         allowConflict: Boolean(body.force), bookedFor, free: admin && Boolean(body.free),
-        receipt: false,
+        receipt: false, defer,
       });
     } catch (error) {
       if (error instanceof BookingConflictError) return conflictReply(env, chatId, error);
@@ -296,7 +310,16 @@ async function personReply(env, chatId, slug, extra = { ok: true }) {
   });
 }
 
-export async function handleMiniAppApi(request, env, path, now = Date.now()) {
+// Told apart from a refusal, so the page offers a retry instead of locking
+// an admin out because one Telegram call timed out.
+const ROLE_UNKNOWN = 'Telegram did not answer just now. Please try again.';
+const NOT_A_MEMBER = 'Only members of the group can use this.';
+
+export async function handleMiniAppApi(request, env, path, now = Date.now(), ctx = null) {
+  // With the runtime's waitUntil the board and notices follow the reply;
+  // without it (tests, a direct call) they are awaited as before.
+  const defer = ctx && typeof ctx.waitUntil === 'function'
+    ? (work) => ctx.waitUntil(work) : undefined;
   const header = request.headers.get('Authorization') || '';
   const session = header.startsWith('tma ')
     ? await verifyInitData(env, header.slice(4), now) : null;
@@ -307,17 +330,26 @@ export async function handleMiniAppApi(request, env, path, now = Date.now()) {
   for (const [method, pattern, handler, { member = false } = {}] of routes) {
     const match = path.match(pattern);
     if (!match || request.method !== method) continue;
-    const admin = await isChatAdmin(env, chatId, user);
+    // Membership is checked, not assumed: the launch link is signed, but
+    // anybody who has seen it, somebody since removed from the group say,
+    // could open it. The same cached getChatMember that answers "admin"
+    // answers this, so it costs nothing extra.
+    const role = await chatRole(env, chatId, user);
+    if (role === 'unknown') return json({ ok: false, retry: true, message: ROLE_UNKNOWN }, 503);
+    if (role === 'none') return json({ ok: false, admin: false, message: NOT_A_MEMBER }, 403);
+    const admin = role === 'admin';
     if (!member && !admin) return json({ ok: false, admin: false, message: MANAGE_ADMIN }, 403);
     try {
+      let body = {};
       if (method === 'POST') {
         // What a tap in the chat does before anything else: tie this account
         // to the handle it was seeded under, so a write keys them as one person.
-        await rememberPlayer(env, user);
-        await rememberLedgerIdentity(env, chatId, user);
+        // Separate tables, so the two writes and the body read run together.
+        [body] = await Promise.all([
+          readBody(request), rememberPlayer(env, user), rememberLedgerIdentity(env, chatId, user),
+        ]);
       }
-      const body = method === 'POST' ? await readBody(request) : {};
-      return await handler({ env, chatId, match, body, user, admin, now });
+      return await handler({ env, chatId, match, body, user, admin, now, defer });
     } catch (error) {
       if (error instanceof BookingParseError) return json({ ok: false, message: error.message });
       console.log(`Mini App ${method} ${path} failed: ${error.stack || error}`);

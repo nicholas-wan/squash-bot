@@ -196,6 +196,11 @@ CREATE INDEX IF NOT EXISTS idx_sent_messages_due
 CREATE INDEX IF NOT EXISTS idx_monthly_notice_pending
   ON monthly_notice_deliveries (chat_id, month, status, last_attempt_at);
 
+-- The tab-notice check after every update looks a debtor up by slug, which
+-- the primary key (chat_id, month, slug) cannot serve.
+CREATE INDEX IF NOT EXISTS idx_monthly_notice_slug
+  ON monthly_notice_deliveries (chat_id, slug, status);
+
 -- One charge per player per booking, so a retried cleanup cannot double bill.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_booking_slug
   ON ledger (booking_id, slug)
@@ -383,10 +388,21 @@ BEGIN
   SELECT RAISE(ABORT, 'Ledger identity aliases cannot be reassigned');
 END;
 
+-- A booking can already hold a charge under both spellings: a legacy @handle
+-- seat plus the same person joining by id. Re-keying the handle's row would
+-- then hit the one-charge-per-booking index, and the INSERT OR IGNORE that
+-- claimed the alias silently skips it, leaving a stray @handle balance that
+-- every Clear credits to the id instead. Both heads were billed, so both
+-- amounts stay: the handle's row lets go of its booking first, then moves.
 CREATE TRIGGER IF NOT EXISTS ledger_alias_claim
 AFTER INSERT ON ledger_identity_aliases
 WHEN NEW.user_id > 0
 BEGIN
+  UPDATE ledger SET booking_id = NULL
+  WHERE chat_id = NEW.chat_id AND slug = NEW.slug AND user_id IS NULL
+    AND booking_id IS NOT NULL
+    AND EXISTS (SELECT 1 FROM ledger AS claimed
+      WHERE claimed.booking_id = ledger.booking_id AND claimed.slug = 'u' || NEW.user_id);
   UPDATE ledger SET user_id = NEW.user_id, slug = 'u' || NEW.user_id
   WHERE chat_id = NEW.chat_id AND slug = NEW.slug AND user_id IS NULL;
 END;

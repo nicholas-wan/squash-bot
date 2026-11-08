@@ -55,30 +55,59 @@ export async function chargeBooking(env, booking, roster) {
     + `${formatMoney(totalCents)} ÷ ${heads}`;
 
   let charged = 0;
-  if (share > 0) {
-    for (const player of roster) {
-      // By slug or by numeric id: the organiser changing their handle re-keys
-      // their roster rows, and only the id still says the court is theirs.
-      if (isHouseholdPlayer(env, player)) continue;
+  // By slug or by numeric id: the organiser changing their handle re-keys
+  // their roster rows, and only the id still says the court is theirs.
+  const payers = share > 0 ? roster.filter((player) => !isHouseholdPlayer(env, player)) : [];
+  if (payers.length) {
+    // Players seeded without an id are looked up in one read rather than one
+    // each, and the charges then go in side by side: the cron used to spend
+    // two round trips per player here. The unique index still makes a retry
+    // safe, and the booking is only marked charged once every insert is in.
+    const unlinked = [...new Set(payers.filter((player) => !player.user_id)
+      .map((player) => player.slug))];
+    const linked = new Map();
+    if (unlinked.length) {
+      const { results } = await env.DB.prepare(
+        `SELECT slug, user_id FROM ledger_identity_aliases
+         WHERE chat_id = ? AND slug IN (${unlinked.map(() => '?').join(', ')})`
+      ).bind(booking.chat_id, ...unlinked).all();
+      for (const row of results || []) linked.set(row.slug, row.user_id);
+    }
+    const now = Date.now();
+    const inserted = await Promise.all(payers.map((player) => {
+      // The same rule as ledgerAccount: alias user_id 0 is the reserved
+      // ambiguous one, falsy, so it falls back to the slug.
+      const userId = player.user_id || linked.get(player.slug) || null;
       // One row per person however many heads they brought — the unique index
       // allows only one per booking anyway — so the reason carries the count,
       // which is the only place a doubled charge can explain itself.
       const brought = player.heads || 1;
-      const account = await ledgerAccount(env, booking.chat_id, player);
-      const inserted = await env.DB.prepare(
+      return env.DB.prepare(
         `INSERT OR IGNORE INTO ledger
           (chat_id, slug, user_id, name, amount_cents, booking_id, reason, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       ).bind(
-        booking.chat_id, account.slug, account.userId, player.name,
-        share * brought, booking.id, brought > 1 ? `${reason} · for ${brought}` : reason,
-        Date.now()
+        booking.chat_id, userId ? `u${userId}` : player.slug, userId, player.name,
+        share * brought, booking.id, brought > 1 ? `${reason} · for ${brought}` : reason, now
       ).run();
-      charged += inserted.meta.changes ? 1 : 0;
-    }
+    }));
+    charged = inserted.filter((result) => result.meta.changes).length;
   }
   await env.DB.prepare('UPDATE bookings SET charged = 1 WHERE id = ?').bind(booking.id).run();
   return charged;
+}
+
+// The ledger's insert trigger re-keys a row written under a handle whose alias
+// was claimed a moment ago onto the verified id, and then reports no change
+// and a stale last_row_id. So "nothing written" is only believed once the row
+// itself is not there. Every caller stamps its own created_at and reason, which
+// together pick out the one row it tried to write.
+async function landedRow(env, dataChat, cents, reason, createdAt) {
+  return env.DB.prepare(
+    `SELECT id, slug FROM ledger
+     WHERE chat_id = ? AND amount_cents = ? AND reason = ? AND created_at = ?
+     ORDER BY id DESC LIMIT 1`
+  ).bind(dataChat, cents, reason, createdAt).first();
 }
 
 export async function tabBalances(env, chatId) {
@@ -200,16 +229,18 @@ export function breakdownLines(env, rows, tz, { pricing = true } = {}) {
 // the ledger touched inside the history window — settling up must not make a
 // player unfindable while their recent story is still worth reading.
 export async function adminTabEntries(env, chatId) {
-  const balances = await tabBalances(env, chatId);
+  const [balances, { results: recent }] = await Promise.all([
+    tabBalances(env, chatId),
+    env.DB.prepare(
+      `SELECT l.slug AS slug, MAX(l.user_id) AS user_id,
+              (SELECT name FROM ledger
+                WHERE chat_id = l.chat_id AND slug = l.slug
+                ORDER BY created_at DESC, id DESC LIMIT 1) AS name
+       FROM ledger AS l WHERE l.chat_id = ? AND l.created_at > ?
+       GROUP BY l.slug ORDER BY l.slug`
+    ).bind(dataChatId(env, chatId), Date.now() - HISTORY_WINDOW_MS).all(),
+  ]);
   const known = new Set(balances.map((entry) => entry.slug));
-  const { results: recent } = await env.DB.prepare(
-    `SELECT l.slug AS slug, MAX(l.user_id) AS user_id,
-            (SELECT name FROM ledger
-              WHERE chat_id = l.chat_id AND slug = l.slug
-              ORDER BY created_at DESC, id DESC LIMIT 1) AS name
-     FROM ledger AS l WHERE l.chat_id = ? AND l.created_at > ?
-     GROUP BY l.slug ORDER BY l.slug`
-  ).bind(dataChatId(env, chatId), Date.now() - HISTORY_WINDOW_MS).all();
   for (const row of recent) {
     if (!known.has(row.slug)) balances.push({ ...row, balance: 0 });
   }
@@ -269,13 +300,21 @@ export function tabStory(rows, tz, now = Date.now()) {
 }
 
 export async function myTabView(env, chatId, from, isAdmin = false) {
-  const results = await ledgerRowsFor(env, chatId, from);
+  // isAdmin may be a promise started alongside this call, and isChatAdmin
+  // never rejects. The admin's list of balances is read as soon as the answer
+  // is in, alongside the person's own rows, instead of after them.
+  const [results, tz, admin, entries] = await Promise.all([
+    ledgerRowsFor(env, chatId, from),
+    getTimezone(env, chatId),
+    isAdmin,
+    Promise.resolve(isAdmin).then((yes) => (yes ? adminTabEntries(env, chatId) : [])),
+  ]);
 
   const lines = ['🧾 <b>Your squash tab</b>'];
   if (!results.length) {
     lines.push('', 'Nothing here — you have never been charged.');
   } else {
-    lines.push(...breakdownLines(env, results, await getTimezone(env, chatId)));
+    lines.push(...breakdownLines(env, results, tz));
   }
   lines.push('', 'Only you can see this.');
 
@@ -284,12 +323,8 @@ export async function myTabView(env, chatId, from, isAdmin = false) {
   // owes is part of keeping the household straight, the same reason Manage
   // shows them every roster.
   let replyMarkup = OK_MARKUP;
-  // May be a promise started alongside the ledger read; awaited only here,
-  // where the answer is first needed. isChatAdmin never rejects.
-  isAdmin = await isAdmin;
-  if (isAdmin) {
-    const others = (await adminTabEntries(env, chatId))
-      .filter((entry) => settleKey(entry.slug));
+  if (admin) {
+    const others = entries.filter((entry) => settleKey(entry.slug));
     if (others.length) {
       replyMarkup = { inline_keyboard: [
         ...others.map((entry) => [{
@@ -428,6 +463,8 @@ export async function settleUser(env, chatId, slug, actor, expectedCents = null)
     return { ...entry, stale: true };
   }
   const who = identity(actor);
+  const reason = `Cleared by ${who.name}`;
+  const now = Date.now();
   const result = await env.DB.prepare(
     `INSERT INTO ledger
       (chat_id, slug, user_id, name, amount_cents, booking_id, reason, created_at)
@@ -437,11 +474,12 @@ export async function settleUser(env, chatId, slug, actor, expectedCents = null)
        WHERE chat_id = ? AND slug = ?
      ) = ?`
   ).bind(
-    dataChat, entry.slug, entry.user_id, entry.name, -entry.balance,
-    `Cleared by ${who.name}`, Date.now(),
+    dataChat, entry.slug, entry.user_id, entry.name, -entry.balance, reason, now,
     dataChat, entry.slug, entry.balance
   ).run();
-  if (!result.meta.changes) {
+  // Zero changes can still mean the payment landed, re-keyed by the trigger.
+  // Calling that stale would invite a second confirm and a second credit.
+  if (!result.meta.changes && !await landedRow(env, dataChat, -entry.balance, reason, now)) {
     // The balance moved between the read and the write. Either another admin
     // cleared it first, or a charge landed — and "already clear" would be a
     // lie about a debt that is still open.
@@ -480,6 +518,8 @@ export async function recordPayment(env, chatId, slug, cents, actor, expectedBal
   if (balance !== expectedBalance) return { status: 'stale', balance };
   const latest = rows[rows.length - 1];
   const who = identity(actor);
+  const reason = cents === balance ? `Cleared by ${who.name}` : `${PART_PAYMENT}${who.name}`;
+  const now = Date.now();
   const result = await env.DB.prepare(
     `INSERT INTO ledger
       (chat_id, slug, user_id, name, amount_cents, booking_id, reason, created_at)
@@ -490,10 +530,10 @@ export async function recordPayment(env, chatId, slug, cents, actor, expectedBal
      ) = ?`
   ).bind(
     dataChat, String(slug), rows.find((row) => row.user_id)?.user_id || null, latest.name,
-    -cents, cents === balance ? `Cleared by ${who.name}` : `${PART_PAYMENT}${who.name}`,
-    Date.now(), dataChat, String(slug), balance
+    -cents, reason, now, dataChat, String(slug), balance
   ).run();
-  if (!result.meta.changes) {
+  // As in settleUser: a payment the trigger re-keyed is still a payment.
+  if (!result.meta.changes && !await landedRow(env, dataChat, -cents, reason, now)) {
     const fresh = await accountRows(env, chatId, slug);
     return { status: 'stale', balance: fresh.reduce((sum, row) => sum + row.amount_cents, 0) };
   }
@@ -625,37 +665,57 @@ export async function adjustBalance(env, chatId, player, cents, reason, actor) {
   ]);
   const now = Date.now();
   const note = `${reason} · by ${identity(actor).name}`;
+  const written = cents > 0 ? `${note} · ${shortDay(now, tz)}` : note;
   const inserted = await env.DB.prepare(
     `INSERT INTO ledger
       (chat_id, slug, user_id, name, amount_cents, booking_id, reason, created_at)
      VALUES (?, ?, ?, ?, ?, NULL, ?, ?)`
-  ).bind(
-    dataChat, account.slug, account.userId, player.name, cents,
-    cents > 0 ? `${note} · ${shortDay(now, tz)}` : note, now
-  ).run();
+  ).bind(dataChat, account.slug, account.userId, player.name, cents, written, now).run();
+  // An alias claimed between the account lookup and the insert has the
+  // trigger move the row onto the id, reporting no change and somebody
+  // else's row id. The Undo button must name the row actually written, so in
+  // that case it is found by what was written, and offered only if found.
+  const landed = inserted.meta.changes === 1
+    ? { id: inserted.meta.last_row_id, slug: account.slug }
+    : await landedRow(env, dataChat, cents, written, now);
   // Read back rather than added to a balance fetched earlier: the point of the
   // reply is to say where the person stands now, and a court that expired
-  // mid-command would make an arithmetic answer quietly wrong.
-  const total = await env.DB.prepare(
-    'SELECT COALESCE(SUM(amount_cents), 0) AS balance FROM ledger WHERE chat_id = ? AND slug = ?'
-  ).bind(dataChat, account.slug).first();
+  // mid-command would make an arithmetic answer quietly wrong. The pinned tab
+  // is redrawn alongside, since neither waits on the other.
+  //
   // The row is written and the pinned tab is only a rendering of it. Throwing
   // past this point would tell the admin something went wrong after the money
   // had moved, and the natural response — typing it again — is a second
   // entry. updateTab has already queued a refresh for any chat it could not
   // reach, so the failure is logged and the reply still says what happened.
-  try {
-    await updateTab(env, chatId);
-  } catch (error) {
-    console.log(`Tab refresh after a /debt entry failed: ${error.stack || error}`);
-  }
+  const [total] = await Promise.all([
+    balanceOf(env, dataChat, landed?.slug || account.slug),
+    refreshTabQuietly(env, chatId, 'a /debt entry'),
+  ]);
   return {
-    id: inserted.meta.last_row_id || null,
+    id: landed?.id || null,
     name: player.name,
     userId: account.userId,
     cents,
-    balance: (total && total.balance) || 0,
+    balance: total,
   };
+}
+
+async function balanceOf(env, dataChat, slug) {
+  const total = await env.DB.prepare(
+    'SELECT COALESCE(SUM(amount_cents), 0) AS balance FROM ledger WHERE chat_id = ? AND slug = ?'
+  ).bind(dataChat, slug).first();
+  return (total && total.balance) || 0;
+}
+
+// The money has already moved by the time this runs, so a failed redraw is
+// logged, never thrown: see adjustBalance.
+async function refreshTabQuietly(env, chatId, what) {
+  try {
+    await updateTab(env, chatId);
+  } catch (error) {
+    console.log(`Tab refresh after ${what} failed: ${error.stack || error}`);
+  }
 }
 
 // "+5" and "-5" are one keystroke apart and mean opposite things, and the sign
@@ -670,8 +730,8 @@ const DRAFT_TTL_MS = 24 * 60 * 60 * 1000;
 export async function draftAdjustment(env, chatId, player, cents, reason, actor) {
   const dataChat = dataChatId(env, chatId);
   const now = Date.now();
-  const account = await ledgerAccount(env, dataChat, player);
-  const [inserted, total] = await Promise.all([
+  // Only the balance needs the account; the draft and the sweep start at once.
+  const [inserted, balance] = await Promise.all([
     env.DB.prepare(
       `INSERT INTO debt_drafts
         (chat_id, actor_id, slug, user_id, name, amount_cents, reason, created_at)
@@ -679,13 +739,11 @@ export async function draftAdjustment(env, chatId, player, cents, reason, actor)
     ).bind(
       dataChat, actor.id, player.slug, player.user_id || null, player.name, cents, reason, now
     ).run(),
-    env.DB.prepare(
-      'SELECT COALESCE(SUM(amount_cents), 0) AS balance FROM ledger WHERE chat_id = ? AND slug = ?'
-    ).bind(dataChat, account.slug).first(),
+    ledgerAccount(env, dataChat, player).then((account) => balanceOf(env, dataChat, account.slug)),
     // Abandoned drafts are swept as new ones arrive; nothing else reads them.
     env.DB.prepare('DELETE FROM debt_drafts WHERE created_at < ?').bind(now - DRAFT_TTL_MS).run(),
   ]);
-  return { id: inserted.meta.last_row_id, balance: (total && total.balance) || 0 };
+  return { id: inserted.meta.last_row_id, balance };
 }
 
 // Taken, not read: the delete is what makes a second Confirm tap find nothing
@@ -735,14 +793,9 @@ export async function undoEntry(env, chatId, id) {
      RETURNING *`
   ).bind(Number(id), dataChat, Date.now() - UNDO_WINDOW_MS).first();
   if (!row) return null;
-  const total = await env.DB.prepare(
-    'SELECT COALESCE(SUM(amount_cents), 0) AS balance FROM ledger WHERE chat_id = ? AND slug = ?'
-  ).bind(dataChat, row.slug).first();
-  try {
-    await updateTab(env, chatId);
-  } catch (error) {
-    console.log(`Tab refresh after an undo failed: ${error.stack || error}`);
-  }
+  const [total] = await Promise.all([
+    balanceOf(env, dataChat, row.slug), refreshTabQuietly(env, chatId, 'an undo'),
+  ]);
   return {
     slug: row.slug,
     name: row.name,
@@ -750,7 +803,7 @@ export async function undoEntry(env, chatId, id) {
     cents: row.amount_cents,
     payment: isPaymentRow(row),
     note: isPaymentRow(row) ? 'A payment' : adjustmentNote(row),
-    balance: (total && total.balance) || 0,
+    balance: total,
   };
 }
 
@@ -777,21 +830,16 @@ export async function undoAdjustment(env, chatId, id) {
      RETURNING *`
   ).bind(Number(id), dataChat, Date.now() - UNDO_WINDOW_MS).first();
   if (!row) return null;
-  const total = await env.DB.prepare(
-    'SELECT COALESCE(SUM(amount_cents), 0) AS balance FROM ledger WHERE chat_id = ? AND slug = ?'
-  ).bind(dataChat, row.slug).first();
   // Same rule as adjustBalance: the row is gone, so a refresh failure is
   // logged rather than reported as though the undo had not happened.
-  try {
-    await updateTab(env, chatId);
-  } catch (error) {
-    console.log(`Tab refresh after a /debt undo failed: ${error.stack || error}`);
-  }
+  const [total] = await Promise.all([
+    balanceOf(env, dataChat, row.slug), refreshTabQuietly(env, chatId, 'a /debt undo'),
+  ]);
   return {
     name: row.name,
     userId: row.user_id,
     cents: row.amount_cents,
     note: adjustmentNote(row),
-    balance: (total && total.balance) || 0,
+    balance: total,
   };
 }

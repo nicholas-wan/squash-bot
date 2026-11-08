@@ -1,6 +1,7 @@
 import {
   addBooking, BOOKING_CHANGED, BOOKING_STARTED, BookingConflictError, getTimezone, updateBooking,
 } from './bookings.js';
+import { afterAnswer } from './actions.js';
 import { courtName } from './format.js';
 import { parseBookingCompanions } from './booking-companions.js';
 import { isChatAdmin, knownPlayers, openBooking, RosterCapacityError } from './players.js';
@@ -550,13 +551,16 @@ export async function handleBookingCallback(env, callback) {
       await answerCallback(env, callback.id, 'This booking was already handled.', true);
       return true;
     }
+    // The toast is answered as soon as the booking is saved; the board, the
+    // roster's notices and the receipt follow it rather than holding it up.
+    const later = afterAnswer();
     let saved;
     try {
       if (payload.operation === 'edit') {
         saved = await updateBooking(
           env, chatId, payload.bookingId, booking, callback.from,
           payload.editSourceText || 'Edited with SquashBot',
-          { allowConflict: action === 'o', expected: payload.expected || null }
+          { allowConflict: action === 'o', expected: payload.expected || null, defer: later.defer }
         );
       } else {
         saved = await addBooking(
@@ -568,6 +572,7 @@ export async function handleBookingCallback(env, callback) {
             bookedFor: payload.booker || null,
             free: Boolean(payload.free),
             companions: payload.companions,
+            defer: later.defer,
           }
         );
       }
@@ -618,13 +623,16 @@ export async function handleBookingCallback(env, callback) {
     // The form has done its job: the tap confirmation says it worked and the
     // pinned board carries the result, so the form itself goes away.
     const editing = payload.operation === 'edit';
-    if (row.wizard_ephemeral) {
-      await deleteEphemeralMessage(env, chatId, row.user_id, row.wizard_message_id);
-    } else {
-      await deleteMessage(env, chatId, row.wizard_message_id);
+    try {
+      await Promise.all([
+        answerCallback(env, callback.id, editing ? '✅ Booking updated' : '✅ Booking added'),
+        row.wizard_ephemeral
+          ? deleteEphemeralMessage(env, chatId, row.user_id, row.wizard_message_id)
+          : deleteMessage(env, chatId, row.wizard_message_id),
+      ]);
+    } finally {
+      await later.drain();
     }
-    await answerCallback(env, callback.id,
-      editing ? '✅ Booking updated' : '✅ Booking added');
     return true;
   }
   return false;

@@ -306,16 +306,25 @@ export function extractTime(text, nowMs = Date.now(), tz = 'Asia/Singapore') {
   const input = String(text).toLowerCase();
   const current = localParts(nowMs, tz);
   const atom = '(?:\\d{1,2}(?:(?::|\\.)\\d{2})?\\s*(?:am|pm)?|\\d{3,4}|noon|midnight)';
-  const range = input.match(new RegExp(`\\b(${atom})\\s*(?:-|–|—|to|until)\\s*(${atom})\\b`, 'i'));
+  // Never a piece of a date: "2026-08-13" holds "2026-08" and "08-13", and
+  // neither is a time range.
+  const range = input.match(new RegExp(
+    `(?<!\\d[-/])\\b(${atom})\\s*(?:-|–|—|to|until)\\s*(${atom})\\b(?![-/]\\d)`, 'i'));
   if (range && !statesClockElsewhere(input, range.index, range[0].length)) {
     const firstMeridiem = (range[1].match(/(am|pm)/i) || [])[1] || null;
     const secondMeridiem = (range[2].match(/(am|pm)/i) || [])[1] || null;
-    const starts = clockCandidates(range[1], secondMeridiem);
-    const ends = clockCandidates(range[2], firstMeridiem);
-    const choices = [];
-    for (const start of starts) {
-      for (const end of ends) if (validRange(start, end)) choices.push(timeChoice(start, end));
-    }
+    const pairs = (starts, ends) => {
+      const found = [];
+      for (const start of starts) {
+        for (const end of ends) if (validRange(start, end)) found.push(timeChoice(start, end));
+      }
+      return found;
+    };
+    // A bare side borrows the other's am/pm, so "7-9pm" is 7pm–9pm. When that
+    // reading is no range at all it is dropped: "11-1pm" is 11am–1pm, where
+    // borrowing made it 11pm–1pm, fourteen hours, and refused it.
+    let choices = pairs(clockCandidates(range[1], secondMeridiem), clockCandidates(range[2], firstMeridiem));
+    if (!choices.length) choices = pairs(clockCandidates(range[1]), clockCandidates(range[2]));
     const unique = [...new Map(choices.map((choice) => [choice.label, choice])).values()];
     if (unique.length === 1) return { value: unique[0], choices: [] };
     if (unique.length > 1) return { value: null, choices: unique, issue: 'Which time range did you mean?' };

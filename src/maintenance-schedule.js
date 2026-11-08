@@ -13,8 +13,9 @@ export async function nextMaintenanceDue(env, now) {
   const monthlyScopes = [];
   const monthlyArgs = [];
   const fallbackDay = tabNoticeFallbackDay(env);
-  for (const chat of scope) {
-    const tz = await getTimezone(env, chat);
+  const zones = await Promise.all(scope.map(chat => getTimezone(env, chat)));
+  for (const [index, chat] of scope.entries()) {
+    const tz = zones[index];
     const p = localParts(now, tz);
     if (chats.includes(chat)) deadlines.push(zonedEpoch(p.y, p.mo, p.d + 1, 0, 0, tz));
     deadlines.push(zonedEpoch(p.y, p.mo, p.d + (p.h >= 9 ? 1 : 0), 9, 0, tz));
@@ -25,6 +26,9 @@ export async function nextMaintenanceDue(env, now) {
   }
   // One aggregate over the existing deadlines, only when a sweep was needed.
   // A spent reminder is excluded even if its original deadline is in the past.
+  // So is a player who joined after it was due: the sender skips them on
+  // purpose, so counting them kept a past deadline alive and ran a full sweep
+  // every minute until the court started.
   // A queued tab notice is the debtor's next post to deliver, not cron's, so
   // it is no deadline before the fallback day, and from then on only a copy
   // that failed in transit — or a claim a dead worker left behind — is worth
@@ -36,10 +40,12 @@ export async function nextMaintenanceDue(env, now) {
       (SELECT MIN(starts_at) FROM scoped WHERE starts_at > ?) AS starts_due,
       (SELECT MIN(reminder_at) FROM scoped b WHERE starts_at > ? AND reminder_sent = 0
         AND (NOT EXISTS (SELECT 1 FROM booking_players p WHERE p.booking_id = b.id)
-          OR EXISTS (SELECT 1 FROM booking_players p WHERE p.booking_id = b.id AND p.reminder_sent = 0))) AS reminder_due,
+          OR EXISTS (SELECT 1 FROM booking_players p WHERE p.booking_id = b.id AND p.reminder_sent = 0
+            AND p.created_at <= b.reminder_at))) AS reminder_due,
       (SELECT MIN(pre_reminder_at) FROM scoped b WHERE starts_at > ? AND pre_reminder_sent = 0
         AND (NOT EXISTS (SELECT 1 FROM booking_players p WHERE p.booking_id = b.id)
-          OR EXISTS (SELECT 1 FROM booking_players p WHERE p.booking_id = b.id AND p.pre_reminder_sent = 0))) AS pre_due,
+          OR EXISTS (SELECT 1 FROM booking_players p WHERE p.booking_id = b.id AND p.pre_reminder_sent = 0
+            AND p.created_at <= b.pre_reminder_at))) AS pre_due,
       (SELECT MIN(delete_after) FROM sent_messages WHERE chat_id IN (${ids})) AS cleanup_due,
       (SELECT MIN(created_at) + 86400000 FROM booking_drafts) AS draft_due,
       (SELECT MIN(?) FROM pending_refreshes WHERE chat_id IN (${ids})) AS refresh_due,
@@ -64,8 +70,9 @@ export async function runScheduledMaintenance(env, maintain, prune, now = Date.n
     return { ok: true, failures: [], skipped: true, nextDue: state.next_due };
   }
   // The state is seeded by migration. INSERT also supports an intentionally
-  // cleared scheduler without missing future trigger invalidations.
-  await env.DB.prepare('INSERT OR IGNORE INTO maintenance_schedule (id) VALUES (?)').bind(1).run();
+  // cleared scheduler without missing future trigger invalidations; with the
+  // row there it would change nothing, so it is skipped.
+  if (!state) await env.DB.prepare('INSERT OR IGNORE INTO maintenance_schedule (id) VALUES (?)').bind(1).run();
   const [maintenance, drafts] = await Promise.allSettled([maintain(env, now), prune(env, now)]);
   const failures = maintenance.status === 'fulfilled' ? [...maintenance.value.failures]
     : [String(maintenance.reason)];

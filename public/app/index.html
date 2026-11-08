@@ -4,6 +4,25 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>SquashBot</title>
+<script>
+// Telegram's script below blocks the page until it has downloaded, and the
+// first request used to wait behind it. The signed data it reads is already
+// in the URL, so the first screen's request starts here, alongside it. The
+// page uses this answer only when the SDK's own initData matches it exactly,
+// and asks again if it was refused, so a misread here costs nothing.
+window.earlyFetch = (() => {
+  try {
+    const initData = new URLSearchParams(location.hash.slice(1)).get('tgWebAppData');
+    if (!initData) return null;
+    const startParam = new URLSearchParams(initData).get('start_param') || '';
+    const path = /_tab$/.test(startParam) || new URLSearchParams(location.search).has('tab')
+      ? 'tab' : 'courts';
+    const response = fetch(`/api/app/${path}`, { headers: { Authorization: `tma ${initData}` } });
+    response.catch(() => {});
+    return { initData, path, response };
+  } catch { return null; }
+})();
+</script>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   /* Telegram hands the page its own theme as --tg-theme-* variables, so the
@@ -155,6 +174,8 @@
     padding: 12px 14px; border-radius: var(--radius); font-size: 14px;
     background: rgba(30, 30, 34, 0.94); color: #fff; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
     transform: translateY(calc(100% + 40px)); visibility: hidden; z-index: 10;
+    /* It sits over the bottom of a half-height sheet; taps go through it. */
+    pointer-events: none;
     transition: transform 0.2s ease-out, visibility 0s linear 0.2s;
   }
   .toast.show { transform: none; visibility: visible; transition: transform 0.2s ease-out; }
@@ -181,6 +202,12 @@ if (inTelegram) {
 const app = document.getElementById('app');
 let state = { screen: 'loading' };
 let trail = [];
+// The last answer for each root screen, so the Courts / Tab switch can show
+// it straight away and refresh behind it.
+const roots = { list: null, tab: null };
+// Counts every request the person started. A background refresh that comes
+// back after one of them is older than what is on screen, and is dropped.
+let actions = 0;
 
 // ---- Small DOM helper. Every name on screen arrives as text, never HTML.
 function h(tag, props, ...children) {
@@ -224,22 +251,39 @@ function closeApp() {
 }
 
 // ---- API
+// The request the head started, handed over once and only for the screen it
+// was for, signed with exactly what the SDK now holds.
+// start() drops it once the first screen is up, so it can never stand in for
+// a later reload.
+function takeEarlyFetch(method, path) {
+  const early = window.earlyFetch;
+  if (!early || method !== 'GET' || early.path !== path) return null;
+  window.earlyFetch = null;
+  if (!inTelegram || early.initData !== tg.initData) return null;
+  return early.response.catch(() => null);
+}
+
 async function api(method, path, body) {
   if (preview) return previewApi(method, path, body);
-  const response = await fetch(`/api/app/${path}`, {
-    method,
-    headers: {
-      Authorization: `tma ${inTelegram ? tg.initData : ''}`,
-      ...(body ? { 'Content-Type': 'application/json' } : {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  const early = takeEarlyFetch(method, path);
+  let response = early && await early;
+  if (!response || response.status === 401) {
+    response = await fetch(`/api/app/${path}`, {
+      method,
+      headers: {
+        Authorization: `tma ${inTelegram ? tg.initData : ''}`,
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  }
   let data = {};
   try { data = await response.json(); } catch { /* an empty body reads as a failure */ }
   return { status: response.status, ...data };
 }
 
 async function run(button, work) {
+  actions += 1;
   document.body.classList.add('busy');
   if (button) button.disabled = true;
   try {
@@ -256,21 +300,64 @@ async function run(button, work) {
 // ---- Navigation. Telegram's own back button in its header, an in-page one
 // in the preview.
 function go(screen, extra = {}, push = true) {
-  if (push && state.screen !== 'loading' && state.screen !== 'blocked') trail.push(state);
+  if (push && !['loading', 'blocked', 'failed'].includes(state.screen)) trail.push(state);
   state = { screen, ...extra };
+  if (screen === 'list' || screen === 'tab') roots[screen] = state.data;
   render();
 }
+// Back shows the screen as it was left, at once, and refreshes it behind:
+// waiting on the round trip left the old screen greyed out, and a failed
+// reload left it on show while its buttons acted on the screen behind it.
 function back() {
   const previous = trail.pop();
   if (!previous) return;
   state = previous;
-  if (state.screen === 'list') return loadList(false);
-  if (state.screen === 'court') return openCourt(state.court.id, false);
-  if (state.screen === 'tab') return loadTab(false);
-  if (state.screen === 'person') return openPerson(state.person.slug, false);
   render();
+  refresh();
 }
 if (inTelegram) tg.BackButton.onClick(back);
+
+// Brings the screen on show up to date without blocking it. Dropped if the
+// person has moved on or started anything meanwhile, and on any failure: the
+// screen stays as it was, and the next action answers with the fresh state.
+async function refresh() {
+  const shown = state;
+  const started = actions;
+  const paths = {
+    list: () => 'courts',
+    tab: () => 'tab',
+    court: () => `court/${shown.court.id}`,
+    person: () => `tab/person/${encodeURIComponent(shown.person.slug)}`,
+  };
+  if (!paths[shown.screen]) return;
+  let result;
+  try { result = await api('GET', paths[shown.screen]()); } catch { return; }
+  if (state !== shown || actions !== started) return;
+  if (blockedBy(result)) return;
+  if (!result.ok) {
+    // A court or a tab that has gone since: say so, and fall back to its list.
+    if (result.retry || result.status >= 500) return;
+    toast(result.message, 'error');
+    trail = [];
+    if (shown.screen === 'court') loadList(false);
+    else if (shown.screen === 'person') loadTab(false);
+    return;
+  }
+  // Re-drawing under a field being typed in would take the keyboard away.
+  const typing = document.activeElement && app.contains(document.activeElement)
+    && /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName);
+  if (typing) return;
+  if (shown.screen === 'list' || shown.screen === 'tab') {
+    shown.data = result;
+    roots[shown.screen] = result;
+  } else if (shown.screen === 'court') {
+    shown.court = result.court;
+    if (result.court.capacity - result.court.heads < 2) shown.friend = false;
+  } else {
+    shown.person = result.person;
+  }
+  render(true);
+}
 
 function header(title) {
   const showBack = trail.length > 0;
@@ -284,14 +371,25 @@ function header(title) {
 }
 
 // ---- Screens
-function render() {
-  const screens = { loading, blocked, list, court, form, tab, person };
+// A background refresh keeps the scroll position; a new screen starts at the top.
+function render(keepScroll = false) {
+  const screens = { loading, blocked, failed, list, court, form, tab, person };
   app.replaceChildren(...[].concat(screens[state.screen]()).flat(Infinity).filter(Boolean));
-  window.scrollTo(0, 0);
+  if (!keepScroll) window.scrollTo(0, 0);
 }
 
 function loading() {
   return h('div', { class: 'empty' }, 'Loading…');
+}
+
+// The first screen could not load. Unlike "blocked", this can be tried again.
+function failed() {
+  return [
+    h('div', { class: 'empty' },
+      h('div', { class: 'big' }, '⚠️'),
+      h('div', null, state.message)),
+    h('button', { class: 'primary', onclick: () => start() }, 'Try again'),
+  ];
 }
 
 function blocked() {
@@ -353,7 +451,18 @@ function courtRow(court, admin) {
 function sections(current) {
   const option = (key, label, open) => h('button', {
     class: current === key ? 'on' : '', 'aria-pressed': current === key ? 'true' : 'false',
-    onclick: () => { if (current !== key) { trail = []; open(false); } },
+    onclick: () => {
+      if (current === key) return;
+      // The last answer goes up at once and is refreshed behind; only a root
+      // never opened yet waits for its first load.
+      if (roots[key]) {
+        trail = [];
+        go(key, { data: roots[key] }, false);
+        refresh();
+      } else {
+        open(false).then((shown) => { if (shown) trail = []; });
+      }
+    },
   }, label);
   return h('div', { class: 'seg', role: 'group' },
     option('list', '🎾 Courts', loadList), option('tab', '🧾 Tab', loadTab));
@@ -395,7 +504,9 @@ function court() {
         class: player.heads > 1 ? 'icon-btn on' : 'icon-btn',
         'aria-label': player.heads > 1 ? `Take ${player.name}'s +1 off` : `Give ${player.name} a +1`,
         disabled: player.heads < 2 && room < 1,
-        onclick: (event) => act(event.currentTarget, 'plus', { player: player.id }),
+        // The state the button offers, not a flip: a retry or a screen another
+        // admin has since changed must not turn the +1 back off.
+        onclick: (event) => act(event.currentTarget, 'plus', { player: player.id, on: player.heads < 2 }),
       }, '+1'),
       h('button', {
         class: 'icon-btn remove', 'aria-label': `Remove ${player.name}`,
@@ -432,7 +543,8 @@ function court() {
   }
   if (c.seat.guest) {
     seatRows.push(h('button', {
-      class: 'row link', onclick: (event) => act(event.currentTarget, 'guest'),
+      class: 'row link',
+      onclick: (event) => act(event.currentTarget, 'guest', { on: !c.seat.guest.on }),
     }, c.seat.guest.on ? `➖ ${c.seat.host} +1 — guest off` : `🎁 ${c.seat.host} +1 — free guest`));
   }
 
@@ -456,7 +568,9 @@ function court() {
     h('div', { class: 'label' }, 'Booking'),
     h('div', { class: 'section' },
       c.canRaise ? h('button', {
-        class: 'row link', onclick: (event) => act(event.currentTarget, 'capacity'),
+        // The capacity on screen, so a retry cannot raise it a second time.
+        class: 'row link',
+        onclick: (event) => act(event.currentTarget, 'capacity', { expected: c.capacity }),
       }, `👥 Room for ${c.capacity + 1}`) : null,
       h('button', { class: 'row link', onclick: () => openForm(c) }, '✏️ Change date, court or time'),
       h('button', { class: 'row danger', onclick: (event) => remove(event.currentTarget) },
@@ -617,10 +731,25 @@ function person() {
   ];
 }
 
-async function loadTab(push = true) {
-  const result = await run(null, () => api('GET', 'tab'));
-  if (!result || blockedBy(result)) return;
-  go('tab', { data: result }, push);
+// Resolves true once the screen is up. A failure on the very first screen has
+// nothing behind it to fall back to, so it gets a screen with Try again; any
+// later one leaves the current screen as it is and says why.
+async function loadRoot(screen, path, push) {
+  const result = await run(null, () => api('GET', path));
+  if (result && blockedBy(result)) return false;
+  if (!result || !result.ok) {
+    const message = (result && result.message)
+      || 'Could not reach SquashBot. Check your connection and try again.';
+    if (['loading', 'failed'].includes(state.screen)) go('failed', { message }, false);
+    else if (result) toast(message, 'error');
+    return false;
+  }
+  go(screen, { data: result }, push);
+  return true;
+}
+
+function loadTab(push = true) {
+  return loadRoot('tab', 'tab', push);
 }
 
 async function openPerson(slug, push = true) {
@@ -680,15 +809,18 @@ function blockedBy(result) {
   return false;
 }
 
-async function loadList(push = true) {
-  const result = await run(null, () => api('GET', 'courts'));
-  if (!result || blockedBy(result)) return;
-  go('list', { data: result }, push);
+function loadList(push = true) {
+  return loadRoot('list', 'courts', push);
 }
 
 async function openCourt(id, push = true) {
   const result = await run(null, () => api('GET', `court/${id}`));
   if (!result || blockedBy(result)) return;
+  // The bot could not check who this is; the court is still there.
+  if (result.retry) {
+    toast(result.message, 'error');
+    return;
+  }
   if (!result.ok) {
     toast(result.message, 'error');
     trail = [];
@@ -717,7 +849,8 @@ async function moveSlot(button, court, action) {
   toast(result.message, result.ok ? 'success' : 'error');
   if (result.courts) {
     state.data = result;
-    render();
+    roots.list = result;
+    render(true);
   }
 }
 
@@ -781,6 +914,8 @@ async function save(button, force) {
 
 // ---- Start. A link can name one court with "_b<id>" after the group.
 async function start() {
+  trail = [];
+  state = { screen: 'loading' };
   render();
   if (!inTelegram && !preview) {
     go('blocked', { message: 'Open this from the 🙋 Join button on the pinned court board.' }, false);
@@ -791,12 +926,23 @@ async function start() {
   // The pinned tab's button opens on the tab; everything else on the courts.
   if (/_tab$/.test(startParam) || new URLSearchParams(location.search).has('tab')) {
     await loadTab(false);
+    window.earlyFetch = null;
     return;
   }
-  await loadList(false);
-  // A court link is the announcement's admin button. A member who taps it
-  // gets the list, which is where their own Join is.
-  if (courtId && state.screen === 'list' && state.data.admin) openCourt(Number(courtId));
+  // A court link is the announcement's admin button. Its court is fetched
+  // alongside the list rather than after it, and used only if the list says
+  // this is an admin: a member who taps it gets the list, which is where
+  // their own Join is, and its refusal must not lock them out.
+  const linked = courtId ? api('GET', `court/${courtId}`).catch(() => null) : null;
+  const listed = await loadList(false);
+  window.earlyFetch = null;
+  if (!listed || !linked || !state.data.admin) return;
+  const shown = state;
+  const result = await linked;
+  if (state !== shown) return;
+  if (!result) openCourt(Number(courtId));
+  else if (result.ok) go('court', { court: result.court, friend: false });
+  else toast(result.message, 'error');
 }
 
 // ---- Preview data. Only ever used at localhost, outside Telegram.
@@ -903,17 +1049,18 @@ function previewApi(method, path, body) {
   }
   if (action === 'plus') {
     const player = c.roster.find((entry) => entry.id === body.player);
-    player.heads = player.heads > 1 ? 1 : 2;
+    player.heads = body.on ? 2 : 1;
     return done(player.heads > 1 ? `${player.name} now brings a +1 — two shares. Everyone has been told.`
       : `${player.name}'s +1 is off — one share again. Everyone has been told.`);
   }
   if (action === 'guest') {
     let host = c.roster.find((player) => player.slug === '@nicholaswan');
     if (!host) { host = sample.seat('@nicholaswan'); host.heads = 0; c.roster.push(host); }
-    host.heads = host.heads > 1 ? 1 : 2;
+    host.heads = body.on ? 2 : 1;
     return done(host.heads > 1 ? 'Nicholas +1 is on — the guest is not charged.' : "Nicholas's guest is off.");
   }
   if (action === 'capacity') {
+    if (body.expected !== c.capacity) return done(`This court already holds ${c.capacity} players.`);
     c.capacity += 1;
     return done(`This court now holds ${c.capacity} players.`);
   }

@@ -44,6 +44,13 @@ DEFAULT_CAPACITY = "3"
 [assets]
 directory = "./public"
 
+# Run beside the database and Telegram's API, wherever the request came from.
+# Webhooks already arrive from Amsterdam, but a Mini App request comes from the
+# member's phone, which in Singapore meant a worker in Singapore paying a
+# round trip to Europe on every D1 query and Telegram call.
+[placement]
+region = "gcp:europe-west4"
+
 [triggers]
 crons = ["* * * * *"]
 

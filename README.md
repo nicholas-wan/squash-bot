@@ -353,6 +353,11 @@ npx wrangler d1 create squashbot-eu --location weur
 The location hint matters: Telegram delivers webhooks from Amsterdam, so the
 Worker executes there, and a database in another region charges every query a
 cross-region round trip — measured at ~200ms each while this one lived in APAC.
+The Mini App is the exception: its requests come from members' phones, so
+without help the Worker ran in Singapore and paid that round trip on every
+query and Telegram call. `[placement] region = "gcp:europe-west4"` in
+`wrangler.toml` pins it beside the database and Telegram for every request;
+the `cf-placement` response header shows where a request ran.
 The retired APAC database is gone; `backup-20260817.sql` is the pre-migration
 snapshot.
 
@@ -428,13 +433,18 @@ npm run db:migrate:014
 npm run db:migrate:015
 npm run db:migrate:016
 npm run db:migrate:017
+npm run db:migrate:018
 npm run db:verify
 ```
 
 Run them in that order. Everything the migrations used to create now lives in
 `schema.sql`, leaving 002, 003, 005, 006, and 016 (free courts) as `ALTER TABLE` alone, 004 as a
 no-op, and 007–013, 015 and 017 (pending `/debt` drafts) as idempotent
-table/index/trigger migrations. 015
+table/index/trigger migrations. 018 replaces the alias-claim trigger, which
+`schema.sql` cannot do on a live database because its triggers are
+`IF NOT EXISTS`: the old one left a handle's charge behind when the same court
+was also billed to the verified id. It also adds the tab-notice index and
+moves any such leftover onto the id. 015
 adds the table that records every Telegram update id once, so an update
 Telegram redelivers is answered and dropped rather than handled twice — the
 guard that keeps a redelivered `/debt` from writing a second row. 014 replaces

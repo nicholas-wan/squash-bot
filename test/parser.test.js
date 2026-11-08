@@ -203,6 +203,27 @@ describe('confidence-based natural language parsing', () => {
     expect(draft.timeChoices.map((choice) => choice.label)).toEqual(['8am–9am', '8pm–9pm']);
   });
 
+  it.each([
+    ['11-1pm', { h: 11, mi: 0 }, { h: 13, mi: 0 }],
+    ['10-12pm', { h: 10, mi: 0 }, { h: 12, mi: 0 }],
+    ['11-12pm', { h: 11, mi: 0 }, { h: 12, mi: 0 }],
+    ['11am-1', { h: 11, mi: 0 }, { h: 13, mi: 0 }],
+    ['7-9pm', { h: 19, mi: 0 }, { h: 21, mi: 0 }],
+    ['8-10pm', { h: 20, mi: 0 }, { h: 22, mi: 0 }],
+  ])('reads "friday %s" across noon only when borrowing am/pm makes no range', (range, start, end) => {
+    const draft = analyzeBooking(`friday ${range} court 2`, NOW, TZ);
+    expect(draft.start).toEqual(start);
+    expect(draft.end).toEqual(end);
+    expect(draft.issues).toEqual([]);
+  });
+
+  it('never reads part of an ISO date as a time range', () => {
+    const draft = analyzeBooking('2026-08-13 court 4 at 9', NOW, TZ);
+    expect(draft.date).toMatchObject({ y: 2026, mo: 8, d: 13 });
+    expect(draft.timeChoices.map((choice) => choice.label)).toEqual(['9am', '9pm']);
+    expect(draft.issues).not.toContain('That time range is invalid or longer than 6 hours.');
+  });
+
   it('reads a dashed pair as a date when the message states the time elsewhere', () => {
     // "15-8" is also a valid 3pm–8pm range, so only the trailing 9pm settles it.
     const draft = analyzeBooking('court 4 15-8 9pm', NOW, TZ);

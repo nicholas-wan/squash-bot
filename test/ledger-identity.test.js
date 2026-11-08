@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
 import { beforeEach, afterEach, it, expect, vi } from 'vitest';
 import { rememberLedgerIdentity } from '../src/ledger-identity.js';
-import { myTabView, tabBalances, settleUser, chargeBooking } from '../src/tab.js';
+import { adjustBalance, myTabView, tabBalances, settleUser, chargeBooking } from '../src/tab.js';
 
 let db, env;
 beforeEach(() => {
@@ -111,4 +111,77 @@ it('settles only the amount the admin confirmed, not a charge that landed since'
   expect((await tabBalances(env,-123))[0].balance).toBe(1600);
   expect((await settleUser(env,-123,'u42',{id:1,first_name:'Admin'},1600)).balance).toBe(1600);
   expect(await tabBalances(env,-123)).toEqual([]);
+});
+
+const ADMIN = { id: 1, first_name: 'Admin' };
+const ledgerRows = () => db.prepare(
+  "SELECT slug, user_id, amount_cents, booking_id FROM ledger WHERE slug IN ('@x','u123') ORDER BY id"
+).all().map((row) => ({ ...row }));
+
+it('keeps both charges when a claimed handle already shared a booking with the id', async () => {
+  // A legacy @x seat and the same person joining by id were both billed for
+  // booking 9. The claim used to skip the @x row, leaving a stray balance.
+  charge('@x', null, 300, 9);
+  charge('u123', 123, 300, 9);
+  charge('@x', null, 50, 10);
+  await rememberLedgerIdentity(env, -123, { id: 123, username: 'x' });
+  expect(ledgerRows().filter((row) => row.slug === '@x')).toEqual([]);
+  expect(await tabBalances(env, -123)).toMatchObject([{ slug: 'u123', balance: 650 }]);
+  expect(await settleUser(env, -123, 'u123', ADMIN, 650)).toMatchObject({ balance: 650 });
+  expect(await tabBalances(env, -123)).toEqual([]);
+});
+
+it('migration 018 replaces the claim trigger on a database that has the old one', async () => {
+  const migration = readFileSync(new URL('../migrations/018-ledger-alias-conflicts.sql', import.meta.url), 'utf8');
+  db.exec(migration); db.exec(migration);
+  charge('@x', null, 300, 9);
+  charge('u123', 123, 300, 9);
+  await rememberLedgerIdentity(env, -123, { id: 123, username: 'x' });
+  expect(await tabBalances(env, -123)).toMatchObject([{ slug: 'u123', balance: 600 }]);
+  expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'idx_monthly_notice_slug'").get())
+    .toBeTruthy();
+});
+
+it('migration 018 moves a stray handle balance the old trigger left onto the id', async () => {
+  charge('u123', 123, 300, 9);
+  charge('@x', null, 300, 9);
+  // The old trigger's leftover, recreated with the claim trigger out of the way.
+  db.exec('DROP TRIGGER ledger_alias_claim');
+  db.prepare('INSERT INTO ledger_identity_aliases (chat_id, slug, user_id) VALUES (-123, ?, 123)').run('@x');
+  expect(db.prepare("SELECT COUNT(*) AS n FROM ledger WHERE slug = '@x'").get().n).toBe(1);
+  const migration = readFileSync(new URL('../migrations/018-ledger-alias-conflicts.sql', import.meta.url), 'utf8');
+  db.exec(migration); db.exec(migration);
+  expect(await tabBalances(env, -123)).toMatchObject([{ slug: 'u123', balance: 600 }]);
+  expect(db.prepare("SELECT COUNT(*) AS n FROM ledger WHERE slug = '@x'").get().n).toBe(0);
+});
+
+it('does not call a clear stale when the trigger re-keyed the payment onto the id', async () => {
+  // A stray @x balance the old trigger left behind, recreated by claiming the
+  // alias with the claim trigger out of the way.
+  charge('@x', null, 300, 9);
+  db.exec('DROP TRIGGER ledger_alias_claim');
+  db.prepare('INSERT INTO ledger_identity_aliases (chat_id, slug, user_id) VALUES (-123, ?, 123)').run('@x');
+  const cleared = await settleUser(env, -123, '@x', ADMIN, 300);
+  expect(cleared).toMatchObject({ balance: 300 });
+  expect(cleared.stale).toBeUndefined();
+  // One payment, not one per confirm.
+  expect(db.prepare("SELECT COUNT(*) AS n FROM ledger WHERE reason LIKE 'Cleared by%'").get().n).toBe(1);
+});
+
+it('offers Undo for the row actually written when an alias is claimed mid-entry', async () => {
+  charge('u9', 9, 100);
+  const raced = { ...env, DB: { prepare(sql) {
+    const real = env.DB.prepare(sql);
+    if (!/^SELECT user_id FROM ledger_identity_aliases/.test(sql)) return real;
+    // The account lookup finds no alias; the alias lands just after it.
+    return { bind(...args) { return { async first() {
+      const found = await real.bind(...args).first();
+      db.prepare('INSERT INTO ledger_identity_aliases (chat_id, slug, user_id) VALUES (-123, ?, 123)').run('@x');
+      return found;
+    } }; } };
+  } } };
+  const entry = await adjustBalance(raced, -123, { slug: '@x', user_id: null, name: '@x' }, 500, 'Balls', ADMIN);
+  const written = db.prepare("SELECT id, slug FROM ledger WHERE reason LIKE 'Balls%'").get();
+  expect(written.slug).toBe('u123');
+  expect(entry).toMatchObject({ id: written.id, balance: 500 });
 });

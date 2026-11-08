@@ -160,18 +160,29 @@ export function isOwner(env, from) {
     : owner.slug === who.slug));
 }
 
-export async function isChatAdmin(env, chatId, from) {
-  if (!from || !from.id) return false;
-  if (isOwner(env, from)) return true;
+// What the person is in the group: 'admin', 'member', 'none' (left, kicked,
+// or never joined) or 'unknown' when Telegram could not be asked. Only real
+// answers are cached; an unknown is retried on the next tap rather than
+// remembered, so a Telegram hiccup never sticks.
+export async function chatRole(env, chatId, from) {
+  if (!from || !from.id) return 'none';
+  if (isOwner(env, from)) return 'admin';
   const key = `${chatId}:${from.id}`;
   const now = Date.now();
   const cached = adminCache.get(key);
-  if (cached && cached.expiresAt > now) return cached.isAdmin;
+  if (cached && cached.expiresAt > now) return cached.role;
   if (cached) adminCache.delete(key);
+  // telegram() never rejects; a network failure comes back as ok: false.
   const member = await telegram(env, 'getChatMember', { chat_id: chatId, user_id: from.id });
-  if (!member.ok) return false;
-  const isAdmin = member.result.status === 'creator' || member.result.status === 'administrator';
-  adminCache.set(key, { isAdmin, expiresAt: now + ADMIN_CACHE_TTL_MS });
+  // A 400 (no such member) or a 403 (the bot itself is no longer in the
+  // group) is Telegram's own answer; a rate limit, a 5xx or a timeout says
+  // nothing about the person, and is retried rather than remembered.
+  if (!member?.ok && member?.error_code !== 400 && member?.error_code !== 403) return 'unknown';
+  const { status, is_member: isMember } = member.result || {};
+  const role = status === 'creator' || status === 'administrator' ? 'admin'
+    : status === 'member' || (status === 'restricted' && isMember) ? 'member'
+      : 'none';
+  adminCache.set(key, { role, expiresAt: now + ADMIN_CACHE_TTL_MS });
   // The bot serves a bounded set of groups, but pruning keeps a busy public
   // group from turning an optimisation into unbounded isolate memory.
   if (adminCache.size > MAX_ADMIN_CACHE_ENTRIES) {
@@ -181,7 +192,13 @@ export async function isChatAdmin(env, chatId, from) {
       }
     }
   }
-  return isAdmin;
+  return role;
+}
+
+// Never rejects: an unknown role reads as not an admin, which is the safe
+// answer for the chat panels.
+export async function isChatAdmin(env, chatId, from) {
+  return (await chatRole(env, chatId, from)) === 'admin';
 }
 
 // Fills in the numeric id of a player who was seeded from config by username,
@@ -231,7 +248,7 @@ export async function rememberPlayer(env, from) {
   for (const statement of statements) await statement.run();
 }
 
-async function addPlayer(env, chatId, bookingId, player, addedByUserId) {
+function addPlayerStatement(env, chatId, bookingId, player, addedByUserId) {
   return env.DB.prepare(
     `INSERT OR IGNORE INTO booking_players
       (booking_id, chat_id, user_id, slug, name, added_by_user_id, heads, created_at)
@@ -239,7 +256,7 @@ async function addPlayer(env, chatId, bookingId, player, addedByUserId) {
   ).bind(
     bookingId, chatId, player.userId || null, player.slug, player.name,
     addedByUserId || null, player.heads || 1, Date.now()
-  ).run();
+  );
 }
 
 // Every booking starts with whoever booked it plus the organiser's household.
@@ -275,11 +292,19 @@ export async function seedRoster(env, chatId, bookingId, from, capacity, bookedF
   seat(ownerIdentity(env));
   for (const player of defaultPlayers(env)) seat(player);
   let remaining = capacity;
+  const inserts = [];
   for (const player of seats) {
     const heads = player.heads || 1;
     if (heads > remaining) continue;
-    await addPlayer(env, chatId, bookingId, player, from && from.id);
+    inserts.push(addPlayerStatement(env, chatId, bookingId, player, from && from.id));
     remaining -= heads;
+  }
+  // One round trip for the whole roster. A batch runs its statements in
+  // order, so the booker still gets the first row and so the first seat.
+  if (inserts.length && typeof env.DB.batch === 'function') {
+    await env.DB.batch(inserts);
+  } else {
+    for (const insert of inserts) await insert.run();
   }
 }
 
@@ -292,6 +317,23 @@ export async function rosterFor(env, bookingId) {
 // One query for the whole board. Players are matched through their booking
 // rather than their own chat_id, because a shared booking can hold people who
 // joined from different groups.
+// Every roster in the chat, keyed by booking. The query needs only the chat,
+// so a caller can run it alongside the bookings read instead of after it;
+// a booking with nobody on it is simply absent, which `get(id) || []` reads.
+export async function chatRosters(env, chatId) {
+  const rosters = new Map();
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM booking_players
+     WHERE booking_id IN (SELECT id FROM bookings WHERE chat_id = ?)
+     ORDER BY booking_id, id`
+  ).bind(dataChatId(env, chatId)).all();
+  for (const player of results) {
+    if (!rosters.has(player.booking_id)) rosters.set(player.booking_id, []);
+    rosters.get(player.booking_id).push(player);
+  }
+  return rosters;
+}
+
 export async function rostersFor(env, chatId, bookingIds) {
   const rosters = new Map(bookingIds.map((id) => [id, []]));
   if (!bookingIds.length) return rosters;
@@ -317,8 +359,8 @@ export async function openBooking(env, chatId, bookingId) {
   ).bind(bookingId, dataChatId(env, chatId), Date.now()).first();
 }
 
-export async function joinBooking(env, chatId, bookingId, from) {
-  const booking = await openBooking(env, chatId, bookingId);
+export async function joinBooking(env, chatId, bookingId, from, known = null) {
+  const booking = known || await openBooking(env, chatId, bookingId);
   if (!booking) return { status: 'gone' };
   if (booking.starts_at <= Date.now()) return { status: 'started', booking };
 
@@ -354,17 +396,18 @@ export async function joinBooking(env, chatId, bookingId, from) {
 // One shared button per court, doing opposite things to the two kinds of person
 // who can tap it. Which one you are is read at the moment of the tap.
 export async function toggleBooking(env, chatId, bookingId, from) {
-  const booking = await openBooking(env, chatId, bookingId);
+  const [booking, roster] = await Promise.all([
+    openBooking(env, chatId, bookingId), rosterFor(env, bookingId),
+  ]);
   if (!booking) return { status: 'gone', left: false };
-  const roster = await rosterFor(env, bookingId);
   const onIt = roster.some((player) => matchesPlayer(player, from));
   return onIt
-    ? leaveBooking(env, chatId, bookingId, from)
-    : joinBooking(env, chatId, bookingId, from);
+    ? leaveBooking(env, chatId, bookingId, from, booking)
+    : joinBooking(env, chatId, bookingId, from, booking);
 }
 
-export async function leaveBooking(env, chatId, bookingId, from) {
-  const booking = await openBooking(env, chatId, bookingId);
+export async function leaveBooking(env, chatId, bookingId, from, known = null) {
+  const booking = known || await openBooking(env, chatId, bookingId);
   if (!booking) return { status: 'gone' };
   if (booking.starts_at <= Date.now()) return { status: 'started', booking };
   const removed = await env.DB.prepare(
@@ -380,12 +423,12 @@ export async function leaveBooking(env, chatId, bookingId, from) {
 // also how a no-show is kept off the tab: charging happens once the court
 // expires, using whoever is still on the roster then.
 export async function removeBookingPlayer(env, chatId, bookingId, playerRowId) {
-  const booking = await openBooking(env, chatId, bookingId);
-  if (!booking) return null;
-  const player = await env.DB.prepare(
-    'SELECT * FROM booking_players WHERE id = ? AND booking_id = ?'
-  ).bind(playerRowId, bookingId).first();
-  if (!player) return null;
+  const [booking, player] = await Promise.all([
+    openBooking(env, chatId, bookingId),
+    env.DB.prepare('SELECT * FROM booking_players WHERE id = ? AND booking_id = ?')
+      .bind(playerRowId, bookingId).first(),
+  ]);
+  if (!booking || !player) return null;
   const removed = await env.DB.prepare(
     'DELETE FROM booking_players WHERE id = ? AND booking_id = ?'
   ).bind(playerRowId, bookingId).run();
@@ -414,18 +457,22 @@ export async function knownPlayers(env, chatId) {
   // Grouped rather than scanned: the ledger is append-only and grows forever,
   // and this sits on the hot path of every admin panel. The name subquery
   // keeps the latest spelling, the same rule the pinned tab uses.
-  const { results: charged } = await env.DB.prepare(
-    `SELECT l.slug AS slug, MAX(l.user_id) AS user_id,
-            (SELECT name FROM ledger
-              WHERE chat_id = l.chat_id AND slug = l.slug
-              ORDER BY created_at DESC, id DESC LIMIT 1) AS name
-     FROM ledger AS l WHERE l.chat_id = ? GROUP BY l.slug ORDER BY l.slug`
-  ).bind(dataChat).all();
+  // The two reads are independent, so they run together; they are merged in
+  // the same order as before, ledger first, so the name and id rules hold.
+  const [{ results: charged }, { results: seated }] = await Promise.all([
+    env.DB.prepare(
+      `SELECT l.slug AS slug, MAX(l.user_id) AS user_id,
+              (SELECT name FROM ledger
+                WHERE chat_id = l.chat_id AND slug = l.slug
+                ORDER BY created_at DESC, id DESC LIMIT 1) AS name
+       FROM ledger AS l WHERE l.chat_id = ? GROUP BY l.slug ORDER BY l.slug`
+    ).bind(dataChat).all(),
+    env.DB.prepare(
+      `SELECT slug, name, user_id FROM booking_players
+       WHERE booking_id IN (SELECT id FROM bookings WHERE chat_id = ?) ORDER BY id`
+    ).bind(dataChat).all(),
+  ]);
   for (const row of charged) remember(row.slug, row.name, row.user_id);
-  const { results: seated } = await env.DB.prepare(
-    `SELECT slug, name, user_id FROM booking_players
-     WHERE booking_id IN (SELECT id FROM bookings WHERE chat_id = ?) ORDER BY id`
-  ).bind(dataChat).all();
   for (const row of seated) remember(row.slug, row.name, row.user_id);
   return [...players.values()];
 }
@@ -473,17 +520,27 @@ export async function adminAddPlayer(env, chatId, bookingId, player, addedByUser
 // capacity inside the update, the same race-proof shape as the inserts;
 // taking it back always succeeds, since it only frees a slot. Charging reads
 // heads when the court expires, so flipping any time before then is enough.
-export async function togglePlusOne(env, chatId, bookingId, playerRowId) {
-  const booking = await openBooking(env, chatId, bookingId);
-  if (!booking) return { status: 'gone' };
-  const player = await env.DB.prepare(
-    'SELECT * FROM booking_players WHERE id = ? AND booking_id = ?'
-  ).bind(playerRowId, bookingId).first();
-  if (!player) return { status: 'gone' };
-  if ((player.heads || 1) > 1) {
-    await env.DB.prepare('UPDATE booking_players SET heads = 1 WHERE id = ?')
-      .bind(playerRowId).run();
-    return { status: 'minus', booking, player };
+//
+// `want` is the state the tapper saw it end up in: true for on, false for off.
+// Given, a tap that finds it already there changes nothing ('same'), so a
+// retry, or two admins on one court, cannot flip it back. Left out, the tap
+// toggles, as the chat panels do: they are redrawn after every tap.
+export async function togglePlusOne(env, chatId, bookingId, playerRowId, want) {
+  const [booking, player] = await Promise.all([
+    openBooking(env, chatId, bookingId),
+    env.DB.prepare('SELECT * FROM booking_players WHERE id = ? AND booking_id = ?')
+      .bind(playerRowId, bookingId).first(),
+  ]);
+  if (!booking || !player) return { status: 'gone' };
+  const on = (player.heads || 1) > 1;
+  if (want !== undefined && Boolean(want) === on) return { status: 'same', booking, player };
+  if (on) {
+    const dropped = await env.DB.prepare(
+      'UPDATE booking_players SET heads = 1 WHERE id = ? AND heads > 1'
+    ).bind(playerRowId).run();
+    return dropped.meta.changes
+      ? { status: 'minus', booking, player }
+      : { status: 'same', booking, player };
   }
   const capacity = booking.capacity || DEFAULT_CAPACITY;
   const bumped = await env.DB.prepare(
@@ -491,9 +548,12 @@ export async function togglePlusOne(env, chatId, bookingId, playerRowId) {
      WHERE id = ? AND heads = 1
        AND (SELECT COALESCE(SUM(heads), 0) FROM booking_players WHERE booking_id = ?) < ?`
   ).bind(playerRowId, bookingId, capacity).run();
-  return bumped.meta.changes
-    ? { status: 'plus', booking, player }
-    : { status: 'full', booking };
+  if (bumped.meta.changes) return { status: 'plus', booking, player };
+  // Missed: either the court is full, or a tap a moment ago already turned it
+  // on, which for a tap that wanted it on is no change rather than "full".
+  const now = await env.DB.prepare('SELECT heads FROM booking_players WHERE id = ?')
+    .bind(playerRowId).first();
+  return now && now.heads > 1 ? { status: 'same', booking, player } : { status: 'full', booking };
 }
 
 // The organiser's row on a roster, by id where config pins one, else by slug.
@@ -510,27 +570,35 @@ export function ownerRow(env, roster) {
 // guest nothing: the organiser absorbs it, exactly as they absorb the
 // household's. Flips the +1 when they are seated; seats them with it when an
 // admin took them off.
-export async function toggleOwnerGuest(env, chatId, bookingId, addedByUserId) {
+export async function toggleOwnerGuest(env, chatId, bookingId, addedByUserId, want) {
   const owner = ownerIdentity(env);
   if (!owner) return { status: 'gone' };
-  const booking = await openBooking(env, chatId, bookingId);
+  const [booking, roster] = await Promise.all([
+    openBooking(env, chatId, bookingId), rosterFor(env, bookingId),
+  ]);
   if (!booking) return { status: 'gone' };
-  const row = ownerRow(env, await rosterFor(env, bookingId));
-  if (row) return togglePlusOne(env, chatId, bookingId, row.id);
+  const row = ownerRow(env, roster);
+  if (row) return togglePlusOne(env, chatId, bookingId, row.id, want);
   const player = { slug: owner.slug, user_id: owner.userId || null, name: owner.name };
+  if (want === false) return { status: 'same', booking, player };
   const added = await adminAddPlayer(env, chatId, bookingId, player, addedByUserId, 2);
-  return added.status === 'added' ? { status: 'plus', booking, player } : added;
+  if (added.status === 'added') return { status: 'plus', booking, player };
+  // Seated by a tap a moment ago: for one that wanted the guest on, no change.
+  if (added.status === 'already' && want === true) return { status: 'same', booking, player };
+  return added;
 }
 
-export async function raiseCapacity(env, chatId, bookingId) {
-  const result = await env.DB.prepare(
+// `expected` is the capacity the tapper saw. Given, the raise only lands on
+// that count, so a retry or a second admin cannot open two slots for one tap.
+export async function raiseCapacity(env, chatId, bookingId, expected) {
+  const guard = Number.isInteger(expected) ? ' AND capacity = ?' : '';
+  const raised = await env.DB.prepare(
     `UPDATE bookings SET capacity = capacity + 1
-     WHERE id = ? AND chat_id = ? AND ends_at > ? AND capacity < ?`
-  ).bind(bookingId, dataChatId(env, chatId), Date.now(), MAX_CAPACITY).run();
-  if (!result.meta.changes) return null;
-  const booking = await env.DB.prepare('SELECT capacity FROM bookings WHERE id = ?')
-    .bind(bookingId).first();
-  return booking ? booking.capacity : null;
+     WHERE id = ? AND chat_id = ? AND ends_at > ? AND capacity < ?${guard}
+     RETURNING capacity`
+  ).bind(bookingId, dataChatId(env, chatId), Date.now(), MAX_CAPACITY,
+    ...(guard ? [expected] : [])).first();
+  return raised ? raised.capacity : null;
 }
 
 export async function clearRoster(env, bookingId) {
