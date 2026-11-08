@@ -1079,7 +1079,7 @@ async function notifyRosterDirectly(env, chatId, roster, html, deleteAfter, excl
 
 // The person taken off is told privately. Deliberately narrower than the
 // join/leave notices: the rest of the court is not told a kick freed a slot —
-// an asymmetry recorded under Known gaps in the README, not an oversight.
+// an asymmetry recorded in docs/known-gaps.md, not an oversight.
 export async function notifyRemovedPlayer(env, chatId, player, booking) {
   if (!player.user_id) return;
   const tz = await getTimezone(env, chatId);
