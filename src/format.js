@@ -1,5 +1,5 @@
 import { escapeHtml, mentionHtml } from './telegram.js';
-import { localParts } from './time.js';
+import { dateFormatter, localParts } from './time.js';
 
 // How a court is named everywhere a person reads it. These live apart from
 // the modules that render with them so the tab never has to reach back into
@@ -48,7 +48,7 @@ export function compactTimeRange(startsAt, endsAt, tz) {
 }
 
 export function shortDate(epochMs, tz) {
-  return new Intl.DateTimeFormat('en-SG', {
+  return dateFormatter('en-SG', {
     timeZone: tz, weekday: 'short', day: 'numeric', month: 'short',
   }).format(new Date(epochMs)).replace(',', '');
 }

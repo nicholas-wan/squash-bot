@@ -627,8 +627,8 @@ async function openTheirTab(env, callback, match) {
 // list from before this change, Done puts the tab's buttons back.
 const SETTLE_HEADER = '💵 <b>Settle the tab</b>\n\nTap whoever has paid you. Only you can see this.';
 
-async function settlePanel(env, chatId) {
-  return { html: SETTLE_HEADER, replyMarkup: await settleMarkup(env, chatId) };
+async function settlePanel(env, chatId, balances = null) {
+  return { html: SETTLE_HEADER, replyMarkup: await settleMarkup(env, chatId, balances) };
 }
 
 async function closeSettlePicker(env, callback) {
@@ -675,8 +675,10 @@ async function settleTapped(env, callback, match) {
           `✅ <b>Payment received</b> — your ${formatMoney(settled.balance)} `
           + 'squash tab is settled. Thank you!', { replyMarkup: OK_MARKUP });
       }
+      // Back to the list, for whoever paid next, drawn from the balances the
+      // settlement already read.
       if (callback.message.ephemeral_message_id) {
-        await showPanel(env, callback, await settlePanel(env, chatId));
+        await showPanel(env, callback, await settlePanel(env, chatId, settled && settled.remaining));
       }
     }, later.defer);
     await later.drain();
@@ -714,8 +716,19 @@ async function confirmSettle(env, callback, match) {
 // admin typed moments ago, and getting it back is retyping that line. The
 // player was sent a receipt for the entry, so they hear that it has gone.
 async function undoTapped(env, callback, match) {
+  // The pinned tab is redrawn once the admin has their answer: the entry is
+  // gone, and the tab is only a drawing of it.
+  const later = afterAnswer();
+  try {
+    await undoAndAnswer(env, callback, match, later.defer);
+  } finally {
+    await later.drain();
+  }
+}
+
+async function undoAndAnswer(env, callback, match, defer) {
   const chatId = callback.message.chat.id;
-  const undone = await undoAdjustment(env, chatId, match[1]);
+  const undone = await undoAdjustment(env, chatId, match[1], { defer });
   if (!undone) {
     await answerCallback(env, callback.id,
       'That entry has already been undone, or is too old to undo.', true);
@@ -775,6 +788,17 @@ function debtPreviewHtml(env, reader, name, cents, reason, balance) {
 }
 
 async function confirmDebtTapped(env, callback, match) {
+  // As with undo: the entry is written before the answer, the pinned tab
+  // redrawn after it.
+  const later = afterAnswer();
+  try {
+    await confirmDebtAndAnswer(env, callback, match, later.defer);
+  } finally {
+    await later.drain();
+  }
+}
+
+async function confirmDebtAndAnswer(env, callback, match, defer) {
   const chatId = callback.message.chat.id;
   const draft = await takeDraft(env, chatId, match[1], callback.from);
   if (!draft) {
@@ -785,7 +809,7 @@ async function confirmDebtTapped(env, callback, match) {
   }
   const entry = await adjustBalance(env, chatId,
     { slug: draft.slug, user_id: draft.user_id, name: draft.name },
-    draft.amount_cents, draft.reason, callback.from);
+    draft.amount_cents, draft.reason, callback.from, { defer });
   const moved = `${formatMoney(Math.abs(entry.cents))} `
     + `${entry.cents > 0 ? 'added to' : 'taken off'}`;
   // The ledger just moved for somebody who was not in the conversation, so

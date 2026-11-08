@@ -9,6 +9,10 @@ export async function nextMaintenanceDue(env, now) {
   const chats = allowedChats(env);
   const scope = chats.length ? [...new Set([...chats, ...(sharingData(env) ? [sharingData(env)] : [])])] : [];
   const ids = scope.length ? scope.map(() => '?').join(',') : 'NULL';
+  // Queued refreshes are drawn only for the chats that show a board, so only
+  // those count: a row under DATA_CHAT_ID alone would never be flushed, and
+  // would have kept a full sweep running every minute.
+  const refreshIds = chats.length ? chats.map(() => '?').join(',') : 'NULL';
   const deadlines = [];
   const monthlyScopes = [];
   const monthlyArgs = [];
@@ -48,14 +52,14 @@ export async function nextMaintenanceDue(env, now) {
             AND p.created_at <= b.pre_reminder_at))) AS pre_due,
       (SELECT MIN(delete_after) FROM sent_messages WHERE chat_id IN (${ids})) AS cleanup_due,
       (SELECT MIN(created_at) + 86400000 FROM booking_drafts) AS draft_due,
-      (SELECT MIN(?) FROM pending_refreshes WHERE chat_id IN (${ids})) AS refresh_due,
+      (SELECT MIN(?) FROM pending_refreshes WHERE chat_id IN (${refreshIds})) AS refresh_due,
       (SELECT MIN(last_attempt_at) + 300000 FROM monthly_notice_deliveries
         WHERE (${monthlyScopes.join(' OR ') || '0'})
           AND (status = 'sending'
             OR (status = 'pending' AND last_error LIKE 'Telegram delivery%'))) AS monthly_due,
       (SELECT MIN(lease_until) FROM availability_notices
         WHERE chat_id IN (${ids}) AND lease_until > ?) AS lease_due`)
-    .bind(...scope, now, now, now, ...scope, nextTick(now), ...scope,
+    .bind(...scope, now, now, now, ...scope, nextTick(now), ...chats,
       ...monthlyArgs, ...scope, now).first();
   deadlines.push(...Object.values(row || {}).filter(value => value != null));
   // Preserve future deadlines even if less than a minute away. Only overdue

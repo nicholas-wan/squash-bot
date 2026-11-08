@@ -224,9 +224,24 @@ export async function isChatAdmin(env, chatId, from) {
 // and keeps that id pointing at one player. Without the id that player can never
 // be sent a reminder.
 export async function rememberPlayer(env, from) {
+  const statements = rememberPlayerStatements(env, from);
+  if (!statements.length) return;
+  // These statements depend on their order, but D1 can execute the batch in
+  // one trip. The fallback keeps lightweight test doubles and local adapters
+  // useful without weakening the production path.
+  if (typeof env.DB.batch === 'function') {
+    await env.DB.batch(statements);
+    return;
+  }
+  for (const statement of statements) await statement.run();
+}
+
+// rememberPlayer's statements, in order, for a caller that sends them inside
+// a batch of its own: the webhook folds them into the one it sends anyway.
+export function rememberPlayerStatements(env, from) {
   const who = identity(from);
-  if (!who.userId || !who.username) return;
-  const statements = [env.DB.prepare(
+  if (!who.userId || !who.username) return [];
+  return [env.DB.prepare(
     'UPDATE booking_players SET user_id = ? WHERE slug = ? AND user_id IS NULL'
   ).bind(who.userId, who.slug),
   // Someone can set or change their username long after they were first seated,
@@ -257,14 +272,6 @@ export async function rememberPlayer(env, from) {
       WHERE user_id = ? AND slug != ?
         AND booking_id NOT IN (SELECT booking_id FROM booking_players WHERE slug = ?)`
   ).bind(who.slug, who.name, who.userId, who.slug, who.slug)];
-  // These statements depend on their order, but D1 can execute the batch in
-  // one trip. The fallback keeps lightweight test doubles and local adapters
-  // useful without weakening the production path.
-  if (typeof env.DB.batch === 'function') {
-    await env.DB.batch(statements);
-    return;
-  }
-  for (const statement of statements) await statement.run();
 }
 
 function addPlayerStatement(env, chatId, bookingId, player, addedByUserId) {
@@ -382,31 +389,42 @@ export async function joinBooking(env, chatId, bookingId, from, known = null) {
   if (typeof env.DB.batch === 'function') {
     return ownSlotBatch(env, chatId, bookingId, from, 'join');
   }
-  const booking = known || await openBooking(env, chatId, bookingId);
-  if (!booking) return { status: 'gone' };
-  if (booking.starts_at <= Date.now()) return { status: 'started', booking };
-
+  // Test doubles without batch(): the same checks, read and write side by side.
+  const now = Date.now();
+  if (known && known.starts_at <= now) return { status: 'started', booking: known };
   const who = identity(from);
-  const capacity = booking.capacity || DEFAULT_CAPACITY;
-  // The count check lives inside the insert, so two people racing for the last
-  // slot cannot both win. OR IGNORE covers someone already on the roster.
-  // Heads rather than rows, because a row an admin seated with a friend on it
-  // holds two of the court's slots. Joining yourself only ever takes one.
-  const joined = await env.DB.prepare(
-    `INSERT OR IGNORE INTO booking_players
-      (booking_id, chat_id, user_id, slug, name, added_by_user_id, heads, created_at)
-     SELECT ?, ?, ?, ?, ?, ?, ?, ?
-     WHERE (
-       SELECT COALESCE(SUM(heads), 0) FROM booking_players WHERE booking_id = ?
-     ) < ?`
-  ).bind(
-    bookingId, chatId, who.userId, who.slug, who.name, who.userId, 1, Date.now(),
-    bookingId, capacity
-  ).run();
+  const dataChat = dataChatId(env, chatId);
+  // The insert carries every check itself — the court is still to come, and
+  // it has room — so it goes out alongside the booking read instead of after
+  // it: one round trip for the tap rather than two. The count check living
+  // inside the insert is also what stops two people racing for the last slot
+  // from both winning. OR IGNORE covers someone already on the roster. Heads
+  // rather than rows, because a row an admin seated with a friend on it holds
+  // two of the court's slots. Joining yourself only ever takes one. The
+  // existing-row read rides along too: it only matters when nothing was
+  // inserted, and then the row it finds was there before the insert ran.
+  const [booking, joined, existing] = await Promise.all([
+    known || openBooking(env, chatId, bookingId),
+    env.DB.prepare(
+      `INSERT OR IGNORE INTO booking_players
+        (booking_id, chat_id, user_id, slug, name, added_by_user_id, heads, created_at)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?
+       WHERE EXISTS (
+         SELECT 1 FROM bookings WHERE id = ? AND chat_id = ? AND starts_at > ?
+       ) AND (
+         SELECT COALESCE(SUM(heads), 0) FROM booking_players WHERE booking_id = ?
+       ) < COALESCE((SELECT NULLIF(capacity, 0) FROM bookings WHERE id = ?), ?)`
+    ).bind(
+      bookingId, chatId, who.userId, who.slug, who.name, who.userId, 1, now,
+      bookingId, dataChat, now, bookingId, bookingId, DEFAULT_CAPACITY
+    ).run(),
+    env.DB.prepare(
+      'SELECT id, slug, user_id FROM booking_players WHERE booking_id = ? AND slug = ?'
+    ).bind(bookingId, who.slug).first(),
+  ]);
+  if (!booking) return { status: 'gone' };
+  if (booking.starts_at <= now) return { status: 'started', booking };
   if (joined.meta.changes) return { status: 'joined', booking };
-  const existing = await env.DB.prepare(
-    'SELECT id, slug, user_id FROM booking_players WHERE booking_id = ? AND slug = ?'
-  ).bind(bookingId, who.slug).first();
   return {
     status: existing
       ? (matchesPlayer(existing, from) ? 'already' : 'identity-conflict')
@@ -432,15 +450,26 @@ export async function leaveBooking(env, chatId, bookingId, from, known = null) {
   if (typeof env.DB.batch === 'function') {
     return ownSlotBatch(env, chatId, bookingId, from, 'leave');
   }
-  const booking = known || await openBooking(env, chatId, bookingId);
+  const now = Date.now();
+  if (known && known.starts_at <= now) return { status: 'started', booking: known };
+  // As joining: the delete checks the court is still to come itself, so it
+  // and the booking read go out together.
+  const [booking, removed] = await Promise.all([
+    known || openBooking(env, chatId, bookingId),
+    env.DB.prepare(
+      `DELETE FROM booking_players
+       WHERE booking_id = ? AND (
+         (user_id IS NULL AND slug = ?) OR user_id = ?
+       ) AND EXISTS (
+         SELECT 1 FROM bookings WHERE id = ? AND chat_id = ? AND starts_at > ?
+       )`
+    ).bind(
+      bookingId, identity(from).slug, from && from.id || 0,
+      bookingId, dataChatId(env, chatId), now
+    ).run(),
+  ]);
   if (!booking) return { status: 'gone' };
-  if (booking.starts_at <= Date.now()) return { status: 'started', booking };
-  const removed = await env.DB.prepare(
-    `DELETE FROM booking_players
-     WHERE booking_id = ? AND (
-       (user_id IS NULL AND slug = ?) OR user_id = ?
-     )`
-  ).bind(bookingId, identity(from).slug, from && from.id || 0).run();
+  if (booking.starts_at <= now) return { status: 'started', booking };
   return { status: removed.meta.changes ? 'left' : 'absent', booking };
 }
 

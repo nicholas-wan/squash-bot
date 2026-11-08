@@ -55,13 +55,20 @@ export async function getTimezone(env, chatId) {
   return chosen || env.DEFAULT_TIMEZONE || DEFAULT_TZ;
 }
 
-// Keeps one pinned message per column in sync. A null html removes the pin
-// entirely, so an empty board or a settled tab leaves no clutter behind.
-export async function updatePinnedMessage(env, chatId, column, html, replyMarkup, label) {
-  if (!PINNED_COLUMNS.has(column)) throw new Error(`Unknown pinned column: ${column}`);
-  const setting = await env.DB.prepare(
+// The ids of the chat's pinned board and tab: the settings row, or null.
+export async function pinnedIds(env, chatId) {
+  return env.DB.prepare(
     'SELECT board_message_id, tab_message_id FROM settings WHERE chat_id = ?'
   ).bind(chatId).first();
+}
+
+// Keeps one pinned message per column in sync. A null html removes the pin
+// entirely, so an empty board or a settled tab leaves no clutter behind.
+// `existing` is the chat's settings row when the caller has just read it with
+// pinnedIds (null for no row), which spares this a read of its own.
+export async function updatePinnedMessage(env, chatId, column, html, replyMarkup, label, options = {}) {
+  if (!PINNED_COLUMNS.has(column)) throw new Error(`Unknown pinned column: ${column}`);
+  const setting = 'existing' in options ? options.existing : await pinnedIds(env, chatId);
   const existingId = setting && setting[column];
 
   if (!html) {

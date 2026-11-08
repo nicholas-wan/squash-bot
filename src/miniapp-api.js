@@ -244,10 +244,10 @@ const routes = [
   // The tab. Everyone reads their own; an admin also reads everybody's,
   // records payments of any size, and takes back a /debt entry or a payment
   // recorded by mistake. Slugs travel URL-encoded: a handle starts with @.
-  ['GET', /^tab$/, async ({ env, chatId, user, admin }) => {
-    const tz = await getTimezone(env, chatId);
-    const [mine, people] = await Promise.all([
-      ledgerRowsFor(env, chatId, user), admin ? adminTabEntries(env, chatId) : [],
+  ['GET', /^tab$/, async ({ env, chatId, user, admin: role }) => {
+    const [tz, mine, admin, people] = await Promise.all([
+      getTimezone(env, chatId), ledgerRowsFor(env, chatId, user), role,
+      Promise.resolve(role).then((yes) => (yes ? adminTabEntries(env, chatId) : [])),
     ]);
     return json({
       ok: true, admin, owner: ownerName(env),
@@ -307,17 +307,14 @@ const routes = [
 // the wrong person, who had never played — and that is a success, so given
 // the name it is answered as an empty, settled tab rather than as a refusal.
 async function personReply(env, chatId, slug, extra = { ok: true }, emptyName = null) {
-  const rows = await accountRows(env, chatId, slug);
+  const [rows, tz] = await Promise.all([accountRows(env, chatId, slug), getTimezone(env, chatId)]);
   if (!rows.length && emptyName) {
     return json({ ...extra, person: { slug, name: emptyName, balance: 0, earlier: null, lines: [] } });
   }
   if (!rows.length) return json({ ok: false, message: 'Nothing on that tab any more.' });
   return json({
     ...extra,
-    person: {
-      slug, name: rows[rows.length - 1].name,
-      ...tabStory(rows, await getTimezone(env, chatId)),
-    },
+    person: { slug, name: rows[rows.length - 1].name, ...tabStory(rows, tz) },
   });
 }
 

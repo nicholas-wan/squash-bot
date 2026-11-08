@@ -1,3 +1,20 @@
+// Building an Intl.DateTimeFormat is far slower than using one: a board or a
+// tab formats dozens of dates, and each call used to build its own. One
+// formatter per locale and option set is kept for the isolate's life. A bad
+// timezone throws in the constructor, before anything is cached.
+const formatters = new Map();
+
+export function dateFormatter(locale, options) {
+  const key = `${locale}|${JSON.stringify(options)}`;
+  let formatter = formatters.get(key);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat(locale, options);
+    if (formatters.size > 256) formatters.clear();
+    formatters.set(key, formatter);
+  }
+  return formatter;
+}
+
 const MONTHS = new Map([
   ['jan', 1], ['january', 1], ['feb', 2], ['february', 2],
   ['mar', 3], ['march', 3], ['apr', 4], ['april', 4],
@@ -16,7 +33,7 @@ export function monthNumber(value) {
   return MONTHS.get(raw) || null;
 }
 export function localParts(epochMs, tz) {
-  const formatter = new Intl.DateTimeFormat('en-US', {
+  const formatter = dateFormatter('en-US', {
     timeZone: tz,
     year: 'numeric', month: 'numeric', day: 'numeric',
     hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: false,
@@ -50,13 +67,13 @@ export function validLocalDate(epochMs, expected, tz) {
 }
 
 export function formatDate(epochMs, tz) {
-  return new Intl.DateTimeFormat('en-SG', {
+  return dateFormatter('en-SG', {
     timeZone: tz, weekday: 'short', day: 'numeric', month: 'short', year: 'numeric',
   }).format(new Date(epochMs));
 }
 
 export function formatTime(epochMs, tz) {
-  return new Intl.DateTimeFormat('en-SG', {
+  return dateFormatter('en-SG', {
     timeZone: tz, hour: 'numeric', minute: '2-digit', hour12: true,
   }).format(new Date(epochMs));
 }

@@ -1073,7 +1073,10 @@ describe('public booking announcements', () => {
     );
     const reset = db.ran.find((query) => query.sql.includes('SET pre_reminder_sent = 0'));
     expect(reset).toBeTruthy();
-    expect(reset.sql).toContain('WHERE id = ?');
+    // By player row, never the whole booking: the rest of the court's
+    // reminders went out and must stay spent.
+    expect(reset.sql).toMatch(/WHERE id (= \?|IN \()/);
+    expect(reset.sql).not.toContain('booking_id');
   });
 
   // One row waiting to be cleaned up, and every write recorded, so a test can

@@ -3,13 +3,15 @@ import { courtName, shortClock } from './format.js';
 import { courtCostCents, formatMoney, publicHolidays, shareCents } from './pricing.js';
 import { identity, isHouseholdPlayer, ownerName } from './players.js';
 import { boardChats, dataChatId } from './scope.js';
-import { getTimezone, updatePinnedMessage } from './settings.js';
+import { getTimezone, pinnedIds, updatePinnedMessage } from './settings.js';
+import { serializedRedraw } from './redraw-queue.js';
 import { deleteMessage, escapeHtml, OK_MARKUP, sendMessage } from './telegram.js';
 import { queuePinnedRefresh } from './refresh-queue.js';
 import { miniAppLink } from './miniapp-link.js';
+import { dateFormatter } from './time.js';
 
 function shortDay(epochMs, tz) {
-  return new Intl.DateTimeFormat('en-SG', {
+  return dateFormatter('en-SG', {
     timeZone: tz, day: 'numeric', month: 'short',
   }).format(new Date(epochMs));
 }
@@ -379,25 +381,45 @@ export function tabHtml(env, balances) {
 // Every group sharing the ledger gets the same pinned tab. As with the board,
 // a sibling chat's failure is logged and skipped rather than thrown — only the
 // chat the request came from may fail loudly.
-export async function updateTab(env, chatId) {
-  const balances = await tabBalances(env, chatId);
+// Redraws run one at a time per ledger, and a request while one is waiting
+// shares it, exactly as the board's do: see serializedRedraw.
+export function updateTab(env, chatId) {
+  return serializedRedraw(env.DB, `tab:${dataChatId(env, chatId)}`, chatId,
+    () => drawTab(env, chatId));
+}
+
+async function drawTab(env, chatId) {
+  const chats = boardChats(env, chatId);
+  // The pinned ids are read with the balances rather than after them.
+  const [balances, settings] = await Promise.all([
+    tabBalances(env, chatId), Promise.all(chats.map((chat) => pinnedIds(env, chat))),
+  ]);
   const html = tabHtml(env, balances);
   // Shared tabs are independent Telegram calls, just like shared boards. A
   // slow or kicked sibling should not add its full round trip to every /tab.
-  const outcomes = await Promise.all(boardChats(env, chatId).map(async (chat) => {
+  const outcomes = await Promise.all(chats.map(async (chat, index) => {
+    const setting = settings[index];
     let outcome;
     try {
       const markup = html ? tabMarkup(balances, miniAppLink(env, chat, 'tab')) : null;
-      const id = await updatePinnedMessage(env, chat, 'tab_message_id', html, markup, 'squash tab');
+      const id = await updatePinnedMessage(env, chat, 'tab_message_id', html, markup, 'squash tab',
+        setting === undefined ? {} : { existing: setting });
       outcome = { chat, id };
     } catch (error) {
       outcome = { chat, error };
     }
     // A tab posted afresh lands below the announcement; the sync sees that
     // and moves the announcement back to the bottom. Its errors are retried
-    // by maintenance and never fail the tab.
-    try { await syncAnnouncements(env, chat); }
-    catch (error) { console.log(`Announcement refresh failed: ${error.message || error}`); }
+    // by maintenance and never fail the tab. A tab edited in place, or taken
+    // down, moves nothing, so only a fresh post costs the sync's round trips.
+    const before = setting ? setting.tab_message_id : null;
+    if (!outcome.error && outcome.id && outcome.id !== before) {
+      try {
+        await syncAnnouncements(env, chat, Date.now(), {
+          pinned: { board_message_id: setting?.board_message_id ?? null, tab_message_id: outcome.id },
+        });
+      } catch (error) { console.log(`Announcement refresh failed: ${error.message || error}`); }
+    }
     return outcome;
   }));
   for (const outcome of outcomes.filter((item) => item.error)) {
@@ -419,8 +441,9 @@ export async function updateTab(env, chatId) {
   return acting ? acting.id : null;
 }
 
-export async function settleMarkup(env, chatId) {
-  const balances = await tabBalances(env, chatId);
+// `known` is the balances when the caller has just read them.
+export async function settleMarkup(env, chatId, known = null) {
+  const balances = known || await tabBalances(env, chatId);
   const rows = settleable(balances).map((entry) => [{
     // 💵 rather than ✅: a tick next to a name read as "already paid".
     text: `💵 ${entry.name} · ${formatMoney(entry.balance)}`,
@@ -455,9 +478,14 @@ export async function confirmSettleMarkup(env, chatId, slug) {
 // nobody confirmed — so a balance that has moved since is not settled: it comes
 // back marked stale, with the amount it stands at now, for a fresh confirmation.
 // Null means there is nothing left to clear.
+//
+// With `defer` the pinned tab is redrawn after the caller has answered, and
+// `remaining` carries the balances left once this one is cleared, so a settle
+// panel can be drawn again without reading them a second time.
 export async function settleUser(env, chatId, slug, actor, expectedCents = null, { defer } = {}) {
   const dataChat = dataChatId(env, chatId);
-  const entry = findOwing(await tabBalances(env, chatId), slug);
+  const balances = await tabBalances(env, chatId);
+  const entry = findOwing(balances, slug);
   if (!entry) return null;
   if (expectedCents !== null && entry.balance !== expectedCents) {
     return { ...entry, stale: true };
@@ -490,7 +518,7 @@ export async function settleUser(env, chatId, slug, actor, expectedCents = null,
   // rule as adjustBalance: a throw here would report a failure after the money
   // moved, and skip the debtor's receipt.
   await followUp(() => refreshTabQuietly(env, chatId, 'a settlement'), defer);
-  return entry;
+  return { ...entry, remaining: balances.filter((row) => row.slug !== entry.slug) };
 }
 
 // A payment of any size, for the Mini App's amount box. Cash rarely matches a
@@ -650,7 +678,7 @@ export function matchAccount(players, target) {
 // written at all. The breakdown stamps a date on payments only — a court
 // charge already carries its own in the reason — so a charge written here
 // carries one too, and both kinds of row end up reading the same way.
-export async function adjustBalance(env, chatId, player, cents, reason, actor) {
+export async function adjustBalance(env, chatId, player, cents, reason, actor, { defer } = {}) {
   const dataChat = dataChatId(env, chatId);
   const [account, tz] = await Promise.all([
     ledgerAccount(env, dataChat, player), getTimezone(env, chatId),
@@ -682,7 +710,7 @@ export async function adjustBalance(env, chatId, player, cents, reason, actor) {
   // reach, so the failure is logged and the reply still says what happened.
   const [total] = await Promise.all([
     balanceOf(env, dataChat, landed?.slug || account.slug),
-    refreshTabQuietly(env, chatId, 'a /debt entry'),
+    followUp(() => refreshTabQuietly(env, chatId, 'a /debt entry'), defer),
   ]);
   return {
     id: landed?.id || null,
@@ -824,7 +852,7 @@ export async function recentAdjustments(env, chatId, limit = 5) {
 // One statement, so two admins tapping the same Undo remove one row between
 // them and the second is told it has already gone. Null means nothing was
 // removed: undone already, out of the window, or never a /debt row.
-export async function undoAdjustment(env, chatId, id) {
+export async function undoAdjustment(env, chatId, id, { defer } = {}) {
   const dataChat = dataChatId(env, chatId);
   const row = await env.DB.prepare(
     `DELETE FROM ledger WHERE id = ? AND chat_id = ? AND ${ADJUSTMENT_ROW} AND created_at > ?
@@ -834,7 +862,7 @@ export async function undoAdjustment(env, chatId, id) {
   // Same rule as adjustBalance: the row is gone, so a refresh failure is
   // logged rather than reported as though the undo had not happened.
   const [total] = await Promise.all([
-    balanceOf(env, dataChat, row.slug), refreshTabQuietly(env, chatId, 'a /debt undo'),
+    balanceOf(env, dataChat, row.slug), followUp(() => refreshTabQuietly(env, chatId, 'a /debt undo'), defer),
   ]);
   return {
     name: row.name,

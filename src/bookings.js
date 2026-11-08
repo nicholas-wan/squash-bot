@@ -10,11 +10,12 @@ import {
 export { formatCountdown } from './format.js';
 import { allowedChats, boardChats, dataChatId, reachableChat, sharingData } from './scope.js';
 import {
-  getTimezone, tabNoticeFallbackDay, tabNoticeThresholdCents, updatePinnedMessage,
+  getTimezone, pinnedIds, tabNoticeFallbackDay, tabNoticeThresholdCents, updatePinnedMessage,
 } from './settings.js';
 import { breakdownLines, chargeBooking, tabBalances, updateTab } from './tab.js';
-import { formatDate, formatTime, localParts, zonedEpoch } from './time.js';
+import { dateFormatter, formatDate, formatTime, localParts, zonedEpoch } from './time.js';
 import { queuePinnedRefresh } from './refresh-queue.js';
+import { serializedRedraw } from './redraw-queue.js';
 import { miniAppLink } from './miniapp-link.js';
 import { maintainAnnouncements, syncAnnouncements } from './announcements.js';
 import {
@@ -196,8 +197,15 @@ export async function addBooking(
   }
   const bookingId = result.meta.last_row_id;
   try {
-    await recordAudit(env, bookingId, chatId, 'added', from, sourceText, null, parsed);
-    await seedRoster(env, chatId, bookingId, from, capacity, bookedFor, companions);
+    // Independent rows, so one round trip for both. Both are let finish
+    // before a failure is acted on, so the compensation below never runs
+    // while the other insert is still on its way.
+    const written = await Promise.allSettled([
+      recordAudit(env, bookingId, chatId, 'added', from, sourceText, null, parsed),
+      seedRoster(env, chatId, bookingId, from, capacity, bookedFor, companions),
+    ]);
+    const failed = written.find((outcome) => outcome.status === 'rejected');
+    if (failed) throw failed.reason;
   } catch (error) {
     // The booking insert has already committed. Compensate all of its internal
     // rows so a transient audit/roster failure cannot leave a half-booking.
@@ -242,8 +250,9 @@ export async function addBooking(
 }
 
 // What follows a committed change: the board, notices and receipts. With
-// `defer` the caller answers the person first and runs it after; without, it
-// is awaited here. It never rejects: each piece logs its own failure.
+// `defer` the work starts at once and the caller answers without waiting for
+// it; without, it is awaited here. It never rejects: each piece logs its own
+// failure.
 async function afterCommit(work, defer) {
   const task = () => Promise.resolve().then(work).catch((error) => {
     console.log(`Post-commit work failed: ${error.stack || error}`);
@@ -628,11 +637,14 @@ export async function joinPickerView(env, chatId, from, isAdmin = false, now = D
   };
 }
 
-async function renderBoard(env, chatId, now) {
-  const [tz, bookings, rosters] = await Promise.all([
+// `pinned` also reads each showing chat's pinned ids alongside, so the redraw
+// that follows edits straight away instead of reading them first.
+async function renderBoard(env, chatId, now, { pinned = false } = {}) {
+  const [tz, bookings, rosters, settings] = await Promise.all([
     getTimezone(env, chatId), activeBookings(env, chatId, now), chatRosters(env, chatId),
+    pinned ? Promise.all(boardChats(env, chatId).map((chat) => pinnedIds(env, chat))) : null,
   ]);
-  if (!bookings.length) return { html: null, bookings };
+  if (!bookings.length) return { html: null, bookings, settings };
 
   // A schedule: one line per court, and nothing to act on. It sat beside the
   // "next available court" message looking like a copy of it — same emoji,
@@ -658,7 +670,7 @@ async function renderBoard(env, chatId, now) {
     const bookedBy = bookedByLine(owner, booking);
     if (bookedBy) lines.push(bookedBy);
   }
-  return { html: lines.join('\n'), bookings };
+  return { html: lines.join('\n'), bookings, settings };
 }
 
 // "Today" and "Tomorrow" where they apply, the date otherwise. The board is
@@ -679,49 +691,49 @@ export async function boardHtml(env, chatId, now = Date.now()) {
 // which once turned one kicked group into every command failing everywhere.
 // Only the acting chat's own failure still surfaces, because there it is the
 // answer the person is waiting on.
-// Board redraws for one group run one at a time within the isolate. Tap
+// Board redraws for one group run one at a time within the isolate, and a
+// request while one is already waiting shares it (see serializedRedraw). Tap
 // replies no longer wait for the board, so a second tap's redraw could start
 // while the first was mid-edit and an older rendering could land last, or,
 // with no board pinned yet, both could post and pin one. Each queued redraw
 // reads the database when its turn comes, so the last one always shows the
 // latest state. Keyed by the shared data chat, since every redraw edits all
 // of its groups' boards.
-const boardQueues = new WeakMap();
-
 export function updateBoard(env, chatId, now) {
-  let queues = boardQueues.get(env.DB);
-  if (!queues) boardQueues.set(env.DB, (queues = new Map()));
-  const key = dataChatId(env, chatId);
-  const run = (queues.get(key) || Promise.resolve())
-    .catch(() => {})
-    .then(() => drawBoard(env, chatId, now ?? Date.now()));
-  queues.set(key, run);
-  const forget = () => { if (queues.get(key) === run) queues.delete(key); };
-  run.then(forget, forget);
-  return run;
+  return serializedRedraw(env.DB, `board:${dataChatId(env, chatId)}`, chatId,
+    () => drawBoard(env, chatId, now ?? Date.now()));
 }
 
 async function drawBoard(env, chatId, now) {
-  const board = await renderBoard(env, chatId, now);
+  const board = await renderBoard(env, chatId, now, { pinned: true });
   // Shared chats are independent Telegram calls. Running them together keeps a
   // dead sibling from adding one full network round trip per group, while the
   // acting chat still decides whether the operation itself succeeds.
-  const outcomes = await Promise.all(boardChats(env, chatId).map(async (chat) => {
+  const outcomes = await Promise.all(boardChats(env, chatId).map(async (chat, index) => {
     // The board goes first so that a board posted afresh — the first booking
     // after an empty spell — lands above the announcement rather than below
     // it. Announcement errors are retried by maintenance and do not block the
     // board, and a failed board still lets the announcement move on.
+    const setting = board.settings ? board.settings[index] : undefined;
     let outcome;
     try {
       const id = await updatePinnedMessage(
         env, chat, 'board_message_id', board.html,
-        board.html ? boardButtons(env, chat, board.bookings) : null, 'court board'
+        board.html ? boardButtons(env, chat, board.bookings) : null, 'court board',
+        setting === undefined ? {} : { existing: setting }
       );
       outcome = { chat, id };
     } catch (error) {
       outcome = { chat, error };
     }
-    try { await syncAnnouncements(env, chat, now); }
+    // The pinned ids as they stand now, so the announcement need not read
+    // them again: the board's is whatever was just drawn, or still the old
+    // one when the redraw failed.
+    const known = setting === undefined ? undefined : {
+      board_message_id: outcome.error ? setting?.board_message_id ?? null : outcome.id,
+      tab_message_id: setting?.tab_message_id ?? null,
+    };
+    try { await syncAnnouncements(env, chat, now, { pinned: known }); }
     catch (error) { console.log(`Announcement refresh failed: ${error.message || error}`); }
     return outcome;
   }));
@@ -1095,7 +1107,9 @@ async function notifyRosterDirectly(env, chatId, roster, html, deleteAfter, excl
     told.add(player.user_id);
     const outcome = await sendPrivately(env, chatId, html, player.user_id, deleteAfter,
       { replyMarkup: OK_MARKUP, cleanups });
-    if (outcome !== 'private') missed.push(player);
+    // A timed-out copy may well have landed; tagging them in the group as
+    // well would tell them twice, once in front of everybody.
+    if (outcome !== 'private' && outcome !== 'uncertain') missed.push(player);
   }));
   await saveCleanups(env, cleanups);
   if (!missed.length) return;
@@ -1336,10 +1350,12 @@ const CHAT_GONE = /forbidden|chat not found|bot was kicked|bot is not a member|g
 // A refusal is told apart from a failure: 'failed' is worth retrying — a
 // timeout, a 429, a Telegram hiccup — while 'refused' is Telegram saying this
 // person cannot be reached at all, and retrying that is a request per minute
-// that will never land.
+// that will never land. 'uncertain' is a send cut off by the timeout: it may
+// have arrived, so it is neither sent again nor repeated in the group.
 async function sendPrivately(env, chatId, html, userId, deleteAfter, options = {}) {
   const { cleanups, ...sendOptions } = options;
   const sent = await sendMessage(env, chatId, html, { ...sendOptions, receiverUserId: userId });
+  if (!sent.ok && sent.timedOut) return 'uncertain';
   if (!sent.ok) {
     return PERMANENT_REFUSAL.test(String(sent.description || '')) ? 'refused' : 'failed';
   }
@@ -1409,27 +1425,43 @@ async function purgeFinishedMessages(env, now) {
     `SELECT * FROM sent_messages WHERE delete_after <= ?${scope.sql}
      ORDER BY delete_after LIMIT 100`
   ).bind(now, ...scope.args).all();
-  for (const row of results) {
-    try {
-      // Forgetting the row on a timeout or a 429 leaves the message in the chat
-      // forever, so the row is only dropped once the message is actually gone.
-      const outcome = row.is_ephemeral
-        ? await deleteEphemeralMessage(env, row.chat_id, row.receiver_user_id, row.message_id)
-        : await deleteMessage(env, row.chat_id, row.message_id);
-      const gone = outcome.ok
-        || ALREADY_DELETED.test(String(outcome.description || ''));
-      if (gone || row.delete_after <= now - PURGE_GIVE_UP_MS) {
-        await env.DB.prepare('DELETE FROM sent_messages WHERE id = ?').bind(row.id).run();
-      } else {
+  // Six deletes at a time, which is as many connections as a Worker holds
+  // open at once, and the rows that went in one statement at the end. One
+  // delete and one row write after another made a full window two hundred
+  // round trips.
+  const gone = [];
+  for (let start = 0; start < results.length; start += PURGE_PARALLEL) {
+    await Promise.all(results.slice(start, start + PURGE_PARALLEL).map(async (row) => {
+      try {
+        // Forgetting the row on a timeout or a 429 leaves the message in the
+        // chat forever, so the row is only dropped once the message is gone.
+        const outcome = row.is_ephemeral
+          ? await deleteEphemeralMessage(env, row.chat_id, row.receiver_user_id, row.message_id)
+          : await deleteMessage(env, row.chat_id, row.message_id);
+        const deleted = outcome.ok
+          || ALREADY_DELETED.test(String(outcome.description || ''));
+        if (deleted || row.delete_after <= now - PURGE_GIVE_UP_MS) gone.push(row.id);
+        else failures += 1;
+      } catch (error) {
         failures += 1;
+        console.log(`Reminder cleanup ${row.id} failed: ${error.stack || error}`);
       }
+    }));
+  }
+  if (gone.length) {
+    try {
+      await env.DB.prepare(
+        `DELETE FROM sent_messages WHERE id IN (${gone.map(() => '?').join(', ')})`
+      ).bind(...gone).run();
     } catch (error) {
       failures += 1;
-      console.log(`Reminder cleanup ${row.id} failed: ${error.stack || error}`);
+      console.log(`Reminder cleanup rows ${gone.join(', ')} failed: ${error.stack || error}`);
     }
   }
   return failures;
 }
+
+const PURGE_PARALLEL = 6;
 
 // One claim per player, so someone who joins after the first reminder has gone
 // out still gets their own, and a failed send is retried only for that person.
@@ -1451,65 +1483,166 @@ async function sendClaimedReminders(env, now, column, headline) {
      ORDER BY b.${column}_at, p.id LIMIT 200`
   ).bind(now, now, ...scope.args).all();
 
-  const rosters = new Map();
-  let failures = 0;
+  // One court at a time, its players together. The claims go out at once,
+  // then the first player's reminder alone: a chat that cannot take private
+  // messages says so on that first send, and the court gets one public
+  // reminder rather than a public copy, posted and deleted, for every player.
+  // The rest of the court is sent to side by side, with their cleanup rows in
+  // one batch. A full court used to be four round trips a player, in a row.
+  const courts = new Map();
   for (const row of results) {
+    if (!courts.has(row.id)) courts.set(row.id, []);
+    courts.get(row.id).push(row);
+  }
+  let failures = 0;
+  for (const rows of courts.values()) {
     try {
-      const claim = await env.DB.prepare(
-        `UPDATE booking_players SET ${column}_sent = 1 WHERE id = ? AND ${column}_sent = 0`
-      ).bind(row.player_row_id).run();
-      if (!claim.meta.changes) continue;
-      if (!row.player_user_id) continue;
-
-      if (!rosters.has(row.id)) rosters.set(row.id, await rosterFor(env, row.id));
-      const tz = await getTimezone(env, row.player_chat_id || row.chat_id);
-      const roster = rosters.get(row.id);
-      const chatId = reachableChat(env, { chat_id: row.player_chat_id }, row.chat_id);
-      const html = reminderHtml(row, roster, headline, tz);
-      const outcome = await sendPrivately(
-        env, chatId, html, row.player_user_id, endOfLocalDay(row.starts_at, tz),
-        { replyMarkup: OK_MARKUP }
-      );
-
-      if (outcome === 'private') continue;
-      // Telegram will refuse this player every minute until the court starts,
-      // and a claim handed back sorts straight to the front of the next
-      // window's LIMIT. The claim stays spent: one line in the log is the whole
-      // record, and the rest of the roster still gets reminded.
-      if (outcome === 'refused') {
-        console.log(
-          `${column} reminder for player ${row.player_row_id} refused by Telegram; not retried`
-        );
-        continue;
-      }
-      if (outcome === 'not-ephemeral') {
-        // Claim the rest of this roster so the public fallback is sent once.
-        // Only the claims taken here are handed back if it fails: a player
-        // whose private reminder already went out earlier in this pass would
-        // otherwise be reminded a second time on the next tick.
-        const { results: unclaimed } = await env.DB.prepare(
-          `SELECT id FROM booking_players WHERE booking_id = ? AND ${column}_sent = 0`
-        ).bind(row.id).all();
-        await env.DB.prepare(
-          `UPDATE booking_players SET ${column}_sent = 1 WHERE booking_id = ? AND ${column}_sent = 0`
-        ).bind(row.id).run();
-        if (!(await remindPublicly(env, row, roster, headline, tz))) {
-          const ids = [row.player_row_id, ...unclaimed.map((player) => player.id)];
-          await env.DB.prepare(
-            `UPDATE booking_players SET ${column}_sent = 0
-             WHERE id IN (${ids.map(() => '?').join(', ')})`
-          ).bind(...ids).run();
-          failures += 1;
-        }
-        continue;
-      }
-      await env.DB.prepare(
-        `UPDATE booking_players SET ${column}_sent = 0 WHERE id = ?`
-      ).bind(row.player_row_id).run();
-      failures += 1;
+      failures += await remindCourt(env, rows, column, headline);
     } catch (error) {
       failures += 1;
-      console.log(`${column} reminder for player ${row.player_row_id} failed: ${error.stack || error}`);
+      console.log(`${column} reminders for booking ${rows[0].id} failed: ${error.stack || error}`);
+    }
+  }
+  return failures;
+}
+
+async function remindCourt(env, rows, column, headline) {
+  // The roster and the timezones are read beside the claims, so a read that
+  // fails cannot strand a claim taken alongside it: every claim this pass
+  // took is handed back if anything after the claims throws.
+  const [claims, roster, zones] = await Promise.all([
+    Promise.allSettled(rows.map((row) => env.DB.prepare(
+      `UPDATE booking_players SET ${column}_sent = 1 WHERE id = ? AND ${column}_sent = 0`
+    ).bind(row.player_row_id).run())),
+    rosterFor(env, rows[0].id).catch((error) => ({ error })),
+    Promise.all(rows.map((row) => getTimezone(env, row.player_chat_id || row.chat_id)))
+      .catch((error) => ({ error })),
+  ]);
+  const taken = rows.filter((row, index) =>
+    claims[index].status === 'fulfilled' && claims[index].value.meta.changes);
+  const claimFailures = claims.filter((claim) => claim.status === 'rejected').length;
+  for (const claim of claims) {
+    if (claim.status === 'rejected') {
+      console.log(`${column} reminder claim failed: ${claim.reason.stack || claim.reason}`);
+    }
+  }
+  try {
+    if (roster.error) throw roster.error;
+    if (zones.error) throw zones.error;
+    return claimFailures + await remindClaimed(env, rows, taken, roster, zones, column, headline);
+  } catch (error) {
+    const ids = taken.map((row) => row.player_row_id);
+    if (ids.length) {
+      await env.DB.prepare(
+        `UPDATE booking_players SET ${column}_sent = 0
+         WHERE id IN (${ids.map(() => '?').join(', ')})`
+      ).bind(...ids).run().catch(() => {});
+    }
+    throw error;
+  }
+}
+
+// `taken` are the rows whose claim this pass won; only those with an account
+// can be written to. Anything thrown from here hands every one of them back,
+// so nothing here may throw once a reminder has gone out.
+async function remindClaimed(env, rows, taken, roster, zones, column, headline) {
+  const mine = taken.filter((row) => row.player_user_id);
+  if (!mine.length) return 0;
+  const zoneOf = (row) => zones[rows.indexOf(row)];
+  const booking = mine[0];
+  const cleanups = [];
+  const send = (row) => {
+    const tz = zoneOf(row);
+    const chatId = reachableChat(env, { chat_id: row.player_chat_id }, row.chat_id);
+    return sendPrivately(env, chatId, reminderHtml(row, roster, headline, tz), row.player_user_id,
+      endOfLocalDay(row.starts_at, tz), { replyMarkup: OK_MARKUP, cleanups })
+      .catch((error) => {
+        console.log(`${column} reminder for player ${row.player_row_id} failed: ${error.stack || error}`);
+        return 'failed';
+      });
+  };
+  const first = await send(mine[0]);
+  const outcomes = first === 'not-ephemeral'
+    ? [first]
+    : [first, ...await Promise.all(mine.slice(1).map(send))];
+  // The messages are out; their cleanup rows failing must not hand the
+  // claims back and send them all again.
+  try {
+    if (cleanups.length) {
+      if (typeof env.DB.batch === 'function') await env.DB.batch(cleanups);
+      else for (const statement of cleanups) await statement.run();
+    }
+  } catch (error) {
+    console.log(`${column} reminder cleanup rows failed: ${error.stack || error}`);
+  }
+  let failures = 0;
+  const failed = [];
+  const publicly = [];
+  outcomes.forEach((outcome, index) => {
+    const row = mine[index];
+    if (outcome === 'private') return;
+    // Cut off by the timeout, it may have arrived: handing the claim back
+    // used to send it again next minute, a second reminder for one court.
+    if (outcome === 'uncertain') {
+      console.log(`${column} reminder for player ${row.player_row_id} timed out; not resent`);
+      return;
+    }
+    // Telegram will refuse this player every minute until the court starts,
+    // and a claim handed back sorts straight to the front of the next
+    // window's LIMIT. The claim stays spent: one line in the log is the whole
+    // record, and the rest of the roster still gets reminded.
+    if (outcome === 'refused') {
+      console.log(
+        `${column} reminder for player ${row.player_row_id} refused by Telegram; not retried`
+      );
+      return;
+    }
+    if (outcome === 'not-ephemeral') {
+      publicly.push(row);
+      return;
+    }
+    failed.push(row.player_row_id);
+  });
+  let handBack = failed;
+  if (publicly.length) {
+    // Claim the rest of this roster so the public fallback is sent once.
+    // Only the claims taken here are handed back if it fails: a player whose
+    // private reminder already went out earlier in this pass would otherwise
+    // be reminded a second time on the next tick. Anyone claimed above but
+    // not yet sent to is covered by the public copy, and handed back with it,
+    // as is anyone whose private copy failed: the public one tags them too.
+    try {
+      const unsent = mine.slice(outcomes.length).map((row) => row.player_row_id);
+      const { results: unclaimed } = await env.DB.prepare(
+        `SELECT id FROM booking_players WHERE booking_id = ? AND ${column}_sent = 0`
+      ).bind(booking.id).all();
+      await env.DB.prepare(
+        `UPDATE booking_players SET ${column}_sent = 1 WHERE booking_id = ? AND ${column}_sent = 0`
+      ).bind(booking.id).run();
+      if (await remindPublicly(env, booking, roster, headline, zoneOf(booking))) {
+        handBack = [];
+      } else {
+        handBack = [...failed, ...publicly.map((row) => row.player_row_id), ...unsent,
+          ...unclaimed.map((player) => player.id)];
+        failures += 1;
+      }
+    } catch (error) {
+      console.log(`${column} public reminder for booking ${booking.id} failed: ${error.stack || error}`);
+      handBack = [...failed, ...publicly.map((row) => row.player_row_id),
+        ...mine.slice(outcomes.length).map((row) => row.player_row_id)];
+      failures += 1;
+    }
+  }
+  failures += failed.length && handBack.length ? failed.length : 0;
+  if (handBack.length) {
+    try {
+      await env.DB.prepare(
+        `UPDATE booking_players SET ${column}_sent = 0
+         WHERE id IN (${handBack.map(() => '?').join(', ')})`
+      ).bind(...handBack).run();
+    } catch (error) {
+      console.log(`${column} reminder hand-back failed: ${error.stack || error}`);
+      failures += 1;
     }
   }
   return failures;
@@ -1556,8 +1689,9 @@ async function remindRosterlessBookings(env, now, column, headline) {
         await env.DB.prepare(`UPDATE bookings SET ${column}_sent = 0 WHERE id = ?`)
           .bind(booking.id).run();
         failures += 1;
-      } else if (outcome === 'refused') {
-        console.log(`${column} reminder ${booking.id} refused by Telegram; not retried`);
+      } else if (outcome === 'refused' || outcome === 'uncertain') {
+        console.log(`${column} reminder ${booking.id} ${outcome === 'refused'
+          ? 'refused by Telegram' : 'timed out, may have arrived'}; not retried`);
       }
     } catch (error) {
       failures += 1;
@@ -1842,7 +1976,7 @@ const NOTICE_CLAIM_GRACE_MS = 5 * 60 * 1000;
 // The ask arrives with its reasons: the same line-by-line story 🧾 My tab
 // tells, minus the rate card, so paying needs no second tap to trust.
 async function tabNoticeHtml(env, dataChat, slug, tz, now) {
-  const monthName = new Intl.DateTimeFormat('en-SG', {
+  const monthName = dateFormatter('en-SG', {
     timeZone: tz, month: 'long', year: 'numeric',
   }).format(new Date(now));
   const { results: rows } = await env.DB.prepare(
@@ -1936,6 +2070,12 @@ async function sendOverdueTabNoticesFor(env, now, chatId, fallbackChat) {
       await settle(outcome === 'private' ? 'delivered' : 'refused');
       continue;
     }
+    // Sent blind closes the row whatever happened, and a timed-out copy may
+    // have landed: asking again would nag whoever did read it.
+    if (outcome === 'uncertain') {
+      await settle('delivered', 'Telegram timed out; may have arrived');
+      continue;
+    }
     failures += 1;
     await settle('pending', `Telegram delivery ${outcome}`);
   }
@@ -1993,8 +2133,11 @@ export async function deliverSightedTabNotice(env, chatId, from, now = Date.now(
   // message is certain to be looked at — and cleared with the day's receipts.
   const outcome = await sendPrivately(env, chatId, html, from.id, endOfLocalDay(now, tz),
     { replyMarkup: OK_MARKUP });
-  if (outcome === 'private' || outcome === 'refused') {
-    await settle(outcome === 'private' ? 'delivered' : 'refused');
+  if (outcome === 'private' || outcome === 'refused' || outcome === 'uncertain') {
+    // A timed-out copy may have landed, and a second ask for one balance is
+    // the thing this notice must never be.
+    await settle(outcome === 'refused' ? 'refused' : 'delivered',
+      outcome === 'uncertain' ? 'Telegram timed out; may have arrived' : null);
     // Older months still queued for the same person would be a second ask on
     // their next post, for a balance this notice already covers.
     await env.DB.prepare(

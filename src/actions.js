@@ -31,10 +31,12 @@ function plusOneCost(env, player) {
 // happened, and trying again undid a +1. updateBoard has queued its own retry
 // by then, so the failure is only logged. With `defer` (the Mini App's
 // waitUntil, or a list the chat handler drains after answering) the caller
-// replies first and the board, and any notice behind it, follows.
-// Work an action hands back to run once the tap is answered: the board, and
-// for a member's own move the roster's notices. Chat updates already run
-// inside waitUntil, so draining this at the end keeps the worker alive for it.
+// does not wait for the board, or any notice behind it: that work starts at
+// once and runs alongside the reply, and is only collected afterwards.
+// Work an action hands back so the tap can be answered without waiting on
+// it: the board, and for a member's own move the roster's notices. Chat
+// updates already run inside waitUntil, so draining this at the end keeps the
+// worker alive for it.
 export function afterAnswer() {
   const jobs = [];
   return {
@@ -216,14 +218,18 @@ export async function moveOwnSlot(env, chatId, bookingId, from, action) {
   };
 }
 
-// Telling the court comes before the board: updateBoard throws when the pinned
-// message cannot be edited or re-pinned, and that must not swallow the one
-// notice the people on the court are waiting on.
+// updateBoard throws when the pinned message cannot be edited or re-pinned,
+// and that must not swallow the one notice the people on the court are
+// waiting on. Each has its own catch, so the two run side by side: they are
+// private messages and a pinned edit, and neither reads what the other wrote.
 export async function settleSlotMove(env, chatId, result, from, options = {}) {
   const { defer, ...notice } = options;
   await afterwards(async () => {
-    await notifyRosterOfChange(env, chatId, result.booking, from, result.status, 1, notice)
-      .catch(noticeFailed);
-    await updateBoard(env, chatId);
+    const [, board] = await Promise.allSettled([
+      notifyRosterOfChange(env, chatId, result.booking, from, result.status, 1, notice)
+        .catch(noticeFailed),
+      updateBoard(env, chatId),
+    ]);
+    if (board.status === 'rejected') throw board.reason;
   }, defer);
 }
