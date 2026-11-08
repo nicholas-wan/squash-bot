@@ -8,16 +8,20 @@ export const OK_MARKUP = { inline_keyboard: [[{ text: '👍 OK', callback_data: 
 // it dies with the isolate's grace period, past every catch — no log, no
 // error reply, half-written state, and a person staring at a bot that said
 // nothing. Fifteen seconds is far beyond any healthy Telegram round trip.
+// A call somebody is waiting on before anything else can happen — the
+// membership check in front of a Mini App screen — passes a shorter
+// `timeoutMs`, so a stalled lookup turns into "try again" while they still
+// have the screen in front of them.
 const TELEGRAM_TIMEOUT_MS = 15 * 1000;
 
-export async function telegram(env, method, body) {
+export async function telegram(env, method, body, { timeoutMs = TELEGRAM_TIMEOUT_MS } = {}) {
   if (!env.BOT_TOKEN) return { ok: false, description: 'BOT_TOKEN is missing' };
   try {
     const response = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN.trim()}/${method}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     const data = await response.json();
     if (!data.ok) console.log(`Telegram ${method} failed: ${JSON.stringify(data)}`);

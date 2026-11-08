@@ -16,6 +16,23 @@ export function clearAdminCache() {
   adminCache.clear();
 }
 
+// Somebody left, joined, was kicked, promoted or demoted: whatever this
+// isolate remembered about them is wrong now. Only this isolate hears it,
+// which is why a write also re-asks an answer older than ROLE_FRESH_MS.
+export function forgetRole(chatId, userId) {
+  adminCache.delete(`${chatId}:${userId}`);
+}
+
+// How old a remembered role may be before a write asks Telegram again. A
+// leave lands on whichever isolate Telegram's webhook reached, so another
+// one can still hold "member" for up to the full cache life; a write is
+// where that matters, and half a minute bounds it.
+export const ROLE_FRESH_MS = 30 * 1000;
+
+// getChatMember sits in front of every Mini App screen, so it is bounded far
+// tighter than other Telegram calls: past this the page is told to retry.
+const ROLE_TIMEOUT_MS = 4 * 1000;
+
 // A player's stable key. Telegram usernames are how this group refers to each
 // other and are the only identity a config file can name, so they win; a numeric
 // id is the fallback for anyone without one. Keying on the id instead would
@@ -163,17 +180,19 @@ export function isOwner(env, from) {
 // What the person is in the group: 'admin', 'member', 'none' (left, kicked,
 // or never joined) or 'unknown' when Telegram could not be asked. Only real
 // answers are cached; an unknown is retried on the next tap rather than
-// remembered, so a Telegram hiccup never sticks.
-export async function chatRole(env, chatId, from) {
+// remembered, so a Telegram hiccup never sticks. `maxAgeMs` asks again when
+// the remembered answer is older than that, as a write does (ROLE_FRESH_MS).
+export async function chatRole(env, chatId, from, { maxAgeMs = ADMIN_CACHE_TTL_MS } = {}) {
   if (!from || !from.id) return 'none';
   if (isOwner(env, from)) return 'admin';
   const key = `${chatId}:${from.id}`;
   const now = Date.now();
   const cached = adminCache.get(key);
-  if (cached && cached.expiresAt > now) return cached.role;
+  if (cached && cached.expiresAt > now && now - cached.askedAt <= maxAgeMs) return cached.role;
   if (cached) adminCache.delete(key);
   // telegram() never rejects; a network failure comes back as ok: false.
-  const member = await telegram(env, 'getChatMember', { chat_id: chatId, user_id: from.id });
+  const member = await telegram(env, 'getChatMember', { chat_id: chatId, user_id: from.id },
+    { timeoutMs: ROLE_TIMEOUT_MS });
   // A 400 (no such member) or a 403 (the bot itself is no longer in the
   // group) is Telegram's own answer; a rate limit, a 5xx or a timeout says
   // nothing about the person, and is retried rather than remembered.
@@ -182,7 +201,7 @@ export async function chatRole(env, chatId, from) {
   const role = status === 'creator' || status === 'administrator' ? 'admin'
     : status === 'member' || (status === 'restricted' && isMember) ? 'member'
       : 'none';
-  adminCache.set(key, { role, expiresAt: now + ADMIN_CACHE_TTL_MS });
+  adminCache.set(key, { role, askedAt: now, expiresAt: now + ADMIN_CACHE_TTL_MS });
   // The bot serves a bounded set of groups, but pruning keeps a busy public
   // group from turning an optimisation into unbounded isolate memory.
   if (adminCache.size > MAX_ADMIN_CACHE_ENTRIES) {

@@ -263,22 +263,34 @@ function takeEarlyFetch(method, path) {
   return early.response.catch(() => null);
 }
 
+// A 503 marked retry means Telegram did not answer the membership check in
+// time. The server sends it before touching anything, so asking again is safe
+// even for a write, and a second or third try nearly always lands: the person
+// only sees "try again" when Telegram is properly down.
+const ROLE_RETRIES = [400, 1200];
+
 async function api(method, path, body) {
   if (preview) return previewApi(method, path, body);
   const early = takeEarlyFetch(method, path);
   let response = early && await early;
-  if (!response || response.status === 401) {
-    response = await fetch(`/api/app/${path}`, {
-      method,
-      headers: {
-        Authorization: `tma ${inTelegram ? tg.initData : ''}`,
-        ...(body ? { 'Content-Type': 'application/json' } : {}),
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-  }
+  const send = () => fetch(`/api/app/${path}`, {
+    method,
+    headers: {
+      Authorization: `tma ${inTelegram ? tg.initData : ''}`,
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!response || response.status === 401) response = await send();
   let data = {};
   try { data = await response.json(); } catch { /* an empty body reads as a failure */ }
+  for (const wait of ROLE_RETRIES) {
+    if (response.status !== 503 || !data.retry) break;
+    await new Promise((resolve) => setTimeout(resolve, wait));
+    response = await send();
+    data = {};
+    try { data = await response.json(); } catch { /* as above */ }
+  }
   return { status: response.status, ...data };
 }
 

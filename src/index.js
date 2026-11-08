@@ -11,7 +11,7 @@ import {
   removePlayerView, restoreBoardButtons, runMaintenance, joinPickerView, updateBoard,
 } from './bookings.js';
 import {
-  defaultCapacity, isChatAdmin, isHouseholdPlayer, isOwner, knownPlayers, ownerName,
+  defaultCapacity, forgetRole, isChatAdmin, isHouseholdPlayer, isOwner, knownPlayers, ownerName,
   rememberPlayer,
 } from './players.js';
 import { looksLikeBooking } from './parser.js';
@@ -827,6 +827,9 @@ async function noticeSighting(env, update) {
     ? { chat: update.callback_query.message.chat, from: update.callback_query.from }
     : (update.message ? { chat: update.message.chat, from: update.message.from } : null);
   if (!source || !source.chat || !source.from) return;
+  // Somebody leaving is the one message that proves they are no longer
+  // there, so it is not a moment to hand them their tab.
+  if (update.message && update.message.left_chat_member) return;
   // Quietly: chatAllowed has already logged an ignored chat once for this update.
   if (!allowedChats(env).includes(Number(source.chat.id))) return;
   try {
@@ -861,7 +864,26 @@ async function dispatchUpdate(env, update) {
     return;
   }
 
+  // A membership change makes whatever this isolate remembered about that
+  // person wrong — a leave most of all, since the Mini App would otherwise
+  // keep letting them in for the rest of the cache's life. Any status change
+  // counts: a demoted admin must not keep admin either. chat_member is the
+  // full story (kicks and promotions included, once /setup asks for it);
+  // the join and leave service messages cover a webhook that has not.
+  // Forgetting is harmless anywhere, so it is done quietly in any chat.
+  const change = update.chat_member;
+  if (change) {
+    const user = change.new_chat_member && change.new_chat_member.user;
+    if (change.chat && user) forgetRole(change.chat.id, user.id);
+    return;
+  }
   const msg = update.message;
+  if (msg && msg.chat && (msg.left_chat_member || msg.new_chat_members)) {
+    for (const user of [msg.left_chat_member, ...(msg.new_chat_members || [])]) {
+      if (user && user.id) forgetRole(msg.chat.id, user.id);
+    }
+    return;
+  }
   // Pinning a freshly posted board or tab makes Telegram add a "SquashBot
   // pinned …" notice, which lands below the announcement and says nothing the
   // pin itself does not. The bot's own notices go; a person's pins are theirs.
@@ -1248,7 +1270,10 @@ export default {
       }
       const webhook = await telegram(env, 'setWebhook', {
         url: `${url.origin}/webhook`, secret_token: env.WEBHOOK_SECRET,
-        allowed_updates: ['message', 'callback_query'],
+        // chat_member tells the bot when somebody leaves, is kicked, or
+        // changes role, so their cached membership is dropped at once.
+        // Telegram only sends it when asked for by name.
+        allowed_updates: ['message', 'callback_query', 'chat_member'],
       });
       // is_ephemeral, so a command is never a group message even for the moment
       // before it would be deleted. The cost is that it cannot be cleared at

@@ -11,7 +11,7 @@ import { verifyInitData } from './miniapp-auth.js';
 import { BookingParseError, bookingFromDraft, extractCourt } from './parser.js';
 import { rememberLedgerIdentity } from './ledger-identity.js';
 import {
-  chatRole, knownPlayers, ownerName, rememberPlayer, RosterCapacityError,
+  chatRole, knownPlayers, ownerName, rememberPlayer, ROLE_FRESH_MS, RosterCapacityError,
 } from './players.js';
 import { formatMoney } from './pricing.js';
 import {
@@ -333,8 +333,12 @@ export async function handleMiniAppApi(request, env, path, now = Date.now(), ctx
     // Membership is checked, not assumed: the launch link is signed, but
     // anybody who has seen it, somebody since removed from the group say,
     // could open it. The same cached getChatMember that answers "admin"
-    // answers this, so it costs nothing extra.
-    const role = await chatRole(env, chatId, user);
+    // answers this, so it costs nothing extra. A write asks again once the
+    // remembered answer is half a minute old — a leave may have reached
+    // another isolate — and that lookup runs beside the body read.
+    const bodyRead = method === 'POST' ? readBody(request) : null;
+    const role = await chatRole(env, chatId, user,
+      method === 'POST' ? { maxAgeMs: ROLE_FRESH_MS } : {});
     if (role === 'unknown') return json({ ok: false, retry: true, message: ROLE_UNKNOWN }, 503);
     if (role === 'none') return json({ ok: false, admin: false, message: NOT_A_MEMBER }, 403);
     const admin = role === 'admin';
@@ -346,7 +350,7 @@ export async function handleMiniAppApi(request, env, path, now = Date.now(), ctx
         // to the handle it was seeded under, so a write keys them as one person.
         // Separate tables, so the two writes and the body read run together.
         [body] = await Promise.all([
-          readBody(request), rememberPlayer(env, user), rememberLedgerIdentity(env, chatId, user),
+          bodyRead, rememberPlayer(env, user), rememberLedgerIdentity(env, chatId, user),
         ]);
       }
       return await handler({ env, chatId, match, body, user, admin, now, defer });
