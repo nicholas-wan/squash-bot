@@ -1465,33 +1465,76 @@ async function sendClaimedReminders(env, now, column, headline) {
 }
 
 async function remindCourt(env, rows, column, headline) {
-  const claims = await Promise.all(rows.map((row) => env.DB.prepare(
-    `UPDATE booking_players SET ${column}_sent = 1 WHERE id = ? AND ${column}_sent = 0`
-  ).bind(row.player_row_id).run()));
-  const mine = rows.filter((row, index) => claims[index].meta.changes && row.player_user_id);
-  if (!mine.length) return 0;
-  const booking = mine[0];
-  const [roster, zones] = await Promise.all([
-    rosterFor(env, booking.id),
-    Promise.all(mine.map((row) => getTimezone(env, row.player_chat_id || row.chat_id))),
+  // The roster and the timezones are read beside the claims, so a read that
+  // fails cannot strand a claim taken alongside it: every claim this pass
+  // took is handed back if anything after the claims throws.
+  const [claims, roster, zones] = await Promise.all([
+    Promise.allSettled(rows.map((row) => env.DB.prepare(
+      `UPDATE booking_players SET ${column}_sent = 1 WHERE id = ? AND ${column}_sent = 0`
+    ).bind(row.player_row_id).run())),
+    rosterFor(env, rows[0].id).catch((error) => ({ error })),
+    Promise.all(rows.map((row) => getTimezone(env, row.player_chat_id || row.chat_id)))
+      .catch((error) => ({ error })),
   ]);
+  const taken = rows.filter((row, index) =>
+    claims[index].status === 'fulfilled' && claims[index].value.meta.changes);
+  const claimFailures = claims.filter((claim) => claim.status === 'rejected').length;
+  for (const claim of claims) {
+    if (claim.status === 'rejected') {
+      console.log(`${column} reminder claim failed: ${claim.reason.stack || claim.reason}`);
+    }
+  }
+  try {
+    if (roster.error) throw roster.error;
+    if (zones.error) throw zones.error;
+    return claimFailures + await remindClaimed(env, rows, taken, roster, zones, column, headline);
+  } catch (error) {
+    const ids = taken.map((row) => row.player_row_id);
+    if (ids.length) {
+      await env.DB.prepare(
+        `UPDATE booking_players SET ${column}_sent = 0
+         WHERE id IN (${ids.map(() => '?').join(', ')})`
+      ).bind(...ids).run().catch(() => {});
+    }
+    throw error;
+  }
+}
+
+// `taken` are the rows whose claim this pass won; only those with an account
+// can be written to. Anything thrown from here hands every one of them back,
+// so nothing here may throw once a reminder has gone out.
+async function remindClaimed(env, rows, taken, roster, zones, column, headline) {
+  const mine = taken.filter((row) => row.player_user_id);
+  if (!mine.length) return 0;
+  const zoneOf = (row) => zones[rows.indexOf(row)];
+  const booking = mine[0];
   const cleanups = [];
-  const send = (row, index) => {
-    const tz = zones[index];
+  const send = (row) => {
+    const tz = zoneOf(row);
     const chatId = reachableChat(env, { chat_id: row.player_chat_id }, row.chat_id);
     return sendPrivately(env, chatId, reminderHtml(row, roster, headline, tz), row.player_user_id,
-      endOfLocalDay(row.starts_at, tz), { replyMarkup: OK_MARKUP, cleanups });
+      endOfLocalDay(row.starts_at, tz), { replyMarkup: OK_MARKUP, cleanups })
+      .catch((error) => {
+        console.log(`${column} reminder for player ${row.player_row_id} failed: ${error.stack || error}`);
+        return 'failed';
+      });
   };
-  const first = await send(mine[0], 0);
+  const first = await send(mine[0]);
   const outcomes = first === 'not-ephemeral'
     ? [first]
-    : [first, ...await Promise.all(mine.slice(1).map((row, index) => send(row, index + 1)))];
-  if (cleanups.length) {
-    if (typeof env.DB.batch === 'function') await env.DB.batch(cleanups);
-    else for (const statement of cleanups) await statement.run();
+    : [first, ...await Promise.all(mine.slice(1).map(send))];
+  // The messages are out; their cleanup rows failing must not hand the
+  // claims back and send them all again.
+  try {
+    if (cleanups.length) {
+      if (typeof env.DB.batch === 'function') await env.DB.batch(cleanups);
+      else for (const statement of cleanups) await statement.run();
+    }
+  } catch (error) {
+    console.log(`${column} reminder cleanup rows failed: ${error.stack || error}`);
   }
   let failures = 0;
-  const handBack = [];
+  const failed = [];
   const publicly = [];
   outcomes.forEach((outcome, index) => {
     const row = mine[index];
@@ -1516,33 +1559,49 @@ async function remindCourt(env, rows, column, headline) {
       publicly.push(row);
       return;
     }
-    handBack.push(row.player_row_id);
-    failures += 1;
+    failed.push(row.player_row_id);
   });
+  let handBack = failed;
   if (publicly.length) {
     // Claim the rest of this roster so the public fallback is sent once.
     // Only the claims taken here are handed back if it fails: a player whose
     // private reminder already went out earlier in this pass would otherwise
     // be reminded a second time on the next tick. Anyone claimed above but
-    // not yet sent to is covered by the public copy, and handed back with it.
-    const unsent = mine.slice(outcomes.length).map((row) => row.player_row_id);
-    const { results: unclaimed } = await env.DB.prepare(
-      `SELECT id FROM booking_players WHERE booking_id = ? AND ${column}_sent = 0`
-    ).bind(booking.id).all();
-    await env.DB.prepare(
-      `UPDATE booking_players SET ${column}_sent = 1 WHERE booking_id = ? AND ${column}_sent = 0`
-    ).bind(booking.id).run();
-    if (!(await remindPublicly(env, booking, roster, headline, zones[0]))) {
-      handBack.push(...publicly.map((row) => row.player_row_id), ...unsent,
-        ...unclaimed.map((player) => player.id));
+    // not yet sent to is covered by the public copy, and handed back with it,
+    // as is anyone whose private copy failed: the public one tags them too.
+    try {
+      const unsent = mine.slice(outcomes.length).map((row) => row.player_row_id);
+      const { results: unclaimed } = await env.DB.prepare(
+        `SELECT id FROM booking_players WHERE booking_id = ? AND ${column}_sent = 0`
+      ).bind(booking.id).all();
+      await env.DB.prepare(
+        `UPDATE booking_players SET ${column}_sent = 1 WHERE booking_id = ? AND ${column}_sent = 0`
+      ).bind(booking.id).run();
+      if (await remindPublicly(env, booking, roster, headline, zoneOf(booking))) {
+        handBack = [];
+      } else {
+        handBack = [...failed, ...publicly.map((row) => row.player_row_id), ...unsent,
+          ...unclaimed.map((player) => player.id)];
+        failures += 1;
+      }
+    } catch (error) {
+      console.log(`${column} public reminder for booking ${booking.id} failed: ${error.stack || error}`);
+      handBack = [...failed, ...publicly.map((row) => row.player_row_id),
+        ...mine.slice(outcomes.length).map((row) => row.player_row_id)];
       failures += 1;
     }
   }
+  failures += failed.length && handBack.length ? failed.length : 0;
   if (handBack.length) {
-    await env.DB.prepare(
-      `UPDATE booking_players SET ${column}_sent = 0
-       WHERE id IN (${handBack.map(() => '?').join(', ')})`
-    ).bind(...handBack).run();
+    try {
+      await env.DB.prepare(
+        `UPDATE booking_players SET ${column}_sent = 0
+         WHERE id IN (${handBack.map(() => '?').join(', ')})`
+      ).bind(...handBack).run();
+    } catch (error) {
+      console.log(`${column} reminder hand-back failed: ${error.stack || error}`);
+      failures += 1;
+    }
   }
   return failures;
 }

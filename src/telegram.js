@@ -43,7 +43,10 @@ export async function telegram(env, method, body) {
       await new Promise((resolve) => setTimeout(resolve, wait * 1000));
       continue;
     }
-    if (!data.ok) console.log(`Telegram ${method} failed: ${JSON.stringify(data)}`);
+    if (!data || !data.ok) {
+      console.log(`Telegram ${method} failed: ${JSON.stringify(data)}`);
+      return data || { ok: false, description: 'Empty answer from Telegram' };
+    }
     return data;
   }
 }

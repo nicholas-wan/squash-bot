@@ -297,3 +297,37 @@ describe('a send cut off by the timeout', () => {
     expect(sends().length).toBe(first);
   });
 });
+
+describe('the review of the speed pass', () => {
+  it('still handles an update whose first batch committed but answered with an error', async () => {
+    const batch = env.DB.batch;
+    let failOnce = true;
+    env.DB.batch = async (statements) => {
+      const results = await batch(statements);
+      if (failOnce && statements.length > 2) {
+        failOnce = false;
+        throw new Error('D1 connection lost after commit');
+      }
+      return results;
+    };
+    const { toast } = await tap(MEMBER, 'sb:join:7');
+    expect(toast.text).toContain('You are in');
+  });
+
+  it('keeps reminders that went out spent when their cleanup rows fail', async () => {
+    const now = Date.now();
+    sql.prepare('UPDATE bookings SET reminder_at = ? WHERE id = 7').run(now - 1000);
+    sql.exec('UPDATE maintenance_schedule SET next_due = 0');
+    const batch = env.DB.batch;
+    env.DB.batch = async (statements) => {
+      if (statements.some((statement) => /INSERT INTO sent_messages/.test(statement.query))) {
+        throw new Error('D1 write failed');
+      }
+      return batch(statements);
+    };
+    await worker.scheduled({}, env, ctx());
+    await settle();
+    expect(sql.prepare('SELECT SUM(reminder_sent) AS n FROM booking_players WHERE booking_id = 7').get().n)
+      .toBe(2);
+  });
+});

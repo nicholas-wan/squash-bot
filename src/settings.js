@@ -80,7 +80,7 @@ export function timezonePrimer(env, chatId) {
 }
 
 // The ids of the chat's pinned board and tab: the settings row, or null.
-export function pinnedIds(env, chatId) {
+export async function pinnedIds(env, chatId) {
   return env.DB.prepare(
     'SELECT board_message_id, tab_message_id FROM settings WHERE chat_id = ?'
   ).bind(chatId).first();

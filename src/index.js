@@ -1250,7 +1250,11 @@ async function firstSighting(env, update) {
   }
   try {
     const [inserted] = await env.DB.batch([record, prune]);
-    return { fresh: isFresh(inserted), entry: {} };
+    // After a failed entry batch, the batch may have committed before its
+    // answer was lost, in which case this insert finds the id already there.
+    // That says nothing about whether the update was handled, so it is: the
+    // only safe misreading is the one that handles an update.
+    return { fresh: extra.statements.length ? true : isFresh(inserted), entry: {} };
   } catch (error) {
     console.log(`Update dedup failed: ${error.stack || error}`);
     return { fresh: true, entry: {} };

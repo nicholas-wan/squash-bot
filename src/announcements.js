@@ -49,15 +49,20 @@ async function nextOpenBooking(env, chatId, now) {
   const dataChat = dataChatId(env, chatId);
   const [booking, players] = await Promise.all([
     env.DB.prepare(NEXT_OPEN).bind(dataChat, now).first(),
-    env.DB.prepare(`SELECT * FROM booking_players
-      WHERE booking_id = (SELECT id FROM (${NEXT_OPEN})) ORDER BY id`).bind(dataChat, now).all(),
+    // Says which court it chose: one row with no player for a court nobody
+    // is on, and no rows at all when it found no court.
+    env.DB.prepare(`SELECT n.id AS next_id, p.* FROM (${NEXT_OPEN}) AS n
+      LEFT JOIN booking_players AS p ON p.booking_id = n.id ORDER BY p.id`)
+      .bind(dataChat, now).all(),
   ]);
   if (!booking) return null;
-  // Both reads name the same court unless one landed between them; then the
-  // roster is read again for the court that was found.
+  // Both reads name the same court unless a change landed between them; then
+  // the roster is read again for the court that was found.
   const rows = (players && players.results) || [];
-  const roster = rows.every((player) => player.booking_id === booking.id)
-    ? rows : await rosterFor(env, booking.id);
+  const same = rows.length > 0 && rows.every((row) => row.next_id === booking.id);
+  const roster = same
+    ? rows.filter((row) => row.booking_id != null).map(({ next_id: _, ...player }) => player)
+    : await rosterFor(env, booking.id);
   const capacity = booking.capacity || DEFAULT_CAPACITY;
   const free = capacity - roster.reduce((sum, player) => sum + (player.heads || 1), 0);
   // The roster can fill between the two reads; the next sync sees the change.
@@ -75,7 +80,7 @@ export async function syncAnnouncements(env, chatId, now = Date.now(), known = {
   // what to send, and are dropped unread when the lease is somebody else's.
   // The timezone is only needed when there is a court to announce, but it is
   // usually cached, and fetching it alongside costs no extra wall clock.
-  const [current, next, pinned, tz] = await Promise.all([
+  const [claimed, ...reads] = await Promise.allSettled([
     env.DB.prepare(`INSERT INTO availability_notices (chat_id, lease_until)
       VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET lease_until = excluded.lease_until
       WHERE availability_notices.lease_until <= ? RETURNING *`)
@@ -84,12 +89,19 @@ export async function syncAnnouncements(env, chatId, now = Date.now(), known = {
     known.pinned !== undefined ? known.pinned : pinnedIds(env, chatId),
     getTimezone(env, chatId),
   ]);
+  if (claimed.status === 'rejected') throw claimed.reason;
+  const current = claimed.value;
   if (!current) return 0;
   // The last write of a pass gives the lease back in the same statement, so
   // the finally below has nothing left to do.
   let released = false;
   const RELEASE = 'lease_until = CASE WHEN lease_until = ? THEN 0 ELSE lease_until END';
   try {
+    // A read that failed beside a claim that held: thrown inside the try, so
+    // the lease is still given back.
+    const failed = reads.find((read) => read.status === 'rejected');
+    if (failed) throw failed.reason;
+    const [next, pinned, tz] = reads.map((read) => read.value);
     // Message ids only grow within a chat, so a pinned board or tab with a
     // higher id was posted after this message and sits below it. The bot's
     // last word is meant to be the next open court; one buried under a freshly
