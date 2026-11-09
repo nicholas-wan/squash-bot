@@ -12,43 +12,29 @@ const seenByDb = new WeakMap();
 // Only call with Telegram's authenticated message/callback sender. Display names
 // and admin-entered free text must never establish ownership of financial history.
 export async function rememberLedgerIdentity(env, chatId, from) {
-  const plan = ledgerIdentityPlan(env, chatId, from);
-  if (plan) await plan.settle(await plan.statement.run());
-}
-
-// The same write, split so the webhook can put the insert in the batch it
-// already sends for every update and settle the result afterwards. Null when
-// there is nothing to write: no handle, or this isolate has written it before.
-export function ledgerIdentityPlan(env, chatId, from) {
-  if (!from?.id || !from.username) return null;
+  if (!from?.id || !from.username) return;
   const slug = `@${String(from.username).replace(/^@/, '').toLowerCase()}`;
   const dataChat = dataChatId(env, chatId);
   let seen = seenByDb.get(env.DB);
   if (!seen) seenByDb.set(env.DB, (seen = new Set()));
   const key = `${dataChat}:${slug}:${from.id}`;
-  if (seen.has(key)) return null;
-  const statement = env.DB.prepare(`INSERT OR IGNORE INTO ledger_identity_aliases
+  if (seen.has(key)) return;
+  const linked = await env.DB.prepare(`INSERT OR IGNORE INTO ledger_identity_aliases
     (chat_id, slug, user_id) VALUES (?, ?, ?)`)
-    .bind(dataChat, slug, from.id);
-  return {
-    statement,
-    async settle(linked) {
-      // The database links provisional history in the same transaction.
-      // Existing aliases cannot be stolen by a new account taking the same
-      // username.
-      if (seen.size >= MAX_SEEN) seen.clear();
-      seen.add(key);
-      if (!linked?.meta?.changes) return;
-      try {
-        const history = await env.DB.prepare('SELECT id FROM ledger WHERE chat_id = ? AND user_id = ? LIMIT 1')
-          .bind(dataChat, from.id).first();
-        if (history) {
-          for (const chat of boardChats(env, chatId)) await queuePinnedRefresh(env, chat, 'tab');
-        }
-      } catch (error) {
-        // The alias is already committed; this only refreshes its drawing.
-        console.log(`Tab refresh after linking an identity failed: ${error.stack || error}`);
-      }
-    },
-  };
+    .bind(dataChat, slug, from.id).run();
+  // The database links provisional history in the same transaction. Existing
+  // aliases cannot be stolen by a new account taking the same username.
+  if (seen.size >= MAX_SEEN) seen.clear();
+  seen.add(key);
+  if (!linked.meta.changes) return;
+  try {
+    const history = await env.DB.prepare('SELECT id FROM ledger WHERE chat_id = ? AND user_id = ? LIMIT 1')
+      .bind(dataChat, from.id).first();
+    if (history) {
+      for (const chat of boardChats(env, chatId)) await queuePinnedRefresh(env, chat, 'tab');
+    }
+  } catch (error) {
+    // The alias is already committed; this only refreshes its drawing.
+    console.log(`Tab refresh after linking an identity failed: ${error.stack || error}`);
+  }
 }

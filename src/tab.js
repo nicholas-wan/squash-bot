@@ -392,7 +392,9 @@ async function drawTab(env, chatId) {
   const chats = boardChats(env, chatId);
   // The pinned ids are read with the balances rather than after them.
   const [balances, settings] = await Promise.all([
-    tabBalances(env, chatId), Promise.all(chats.map((chat) => pinnedIds(env, chat))),
+    tabBalances(env, chatId),
+    // As on the board: a failed read is left for that chat to repeat itself.
+    Promise.all(chats.map((chat) => pinnedIds(env, chat).catch(() => undefined))),
   ]);
   const html = tabHtml(env, balances);
   // Shared tabs are independent Telegram calls, just like shared boards. A

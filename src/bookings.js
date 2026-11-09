@@ -642,7 +642,9 @@ export async function joinPickerView(env, chatId, from, isAdmin = false, now = D
 async function renderBoard(env, chatId, now, { pinned = false } = {}) {
   const [tz, bookings, rosters, settings] = await Promise.all([
     getTimezone(env, chatId), activeBookings(env, chatId, now), chatRosters(env, chatId),
-    pinned ? Promise.all(boardChats(env, chatId).map((chat) => pinnedIds(env, chat))) : null,
+    // A failed read is left undefined, so that chat reads its own inside its
+    // own try: one sibling's blip must not fail every board.
+    pinned ? Promise.all(boardChats(env, chatId).map((chat) => pinnedIds(env, chat).catch(() => undefined))) : null,
   ]);
   if (!bookings.length) return { html: null, bookings, settings };
 
@@ -1551,16 +1553,18 @@ async function remindClaimed(env, rows, taken, roster, zones, column, headline) 
   const zoneOf = (row) => zones[rows.indexOf(row)];
   const booking = mine[0];
   const cleanups = [];
-  const send = (row) => {
+  // Built inside the promise, so even a throw while drawing the message (a bad
+  // timezone, say) becomes this player's 'failed' rather than escaping after
+  // earlier players were sent to.
+  const send = (row) => Promise.resolve().then(() => {
     const tz = zoneOf(row);
     const chatId = reachableChat(env, { chat_id: row.player_chat_id }, row.chat_id);
     return sendPrivately(env, chatId, reminderHtml(row, roster, headline, tz), row.player_user_id,
-      endOfLocalDay(row.starts_at, tz), { replyMarkup: OK_MARKUP, cleanups })
-      .catch((error) => {
-        console.log(`${column} reminder for player ${row.player_row_id} failed: ${error.stack || error}`);
-        return 'failed';
-      });
-  };
+      endOfLocalDay(row.starts_at, tz), { replyMarkup: OK_MARKUP, cleanups });
+  }).catch((error) => {
+    console.log(`${column} reminder for player ${row.player_row_id} failed: ${error.stack || error}`);
+    return 'failed';
+  });
   const first = await send(mine[0]);
   const outcomes = first === 'not-ephemeral'
     ? [first]

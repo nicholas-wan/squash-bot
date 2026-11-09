@@ -1409,6 +1409,36 @@ describe('public booking announcements', () => {
     expect(maxInFlight).toBe(2);
   });
 
+  it("keeps drawing every board when one chat's pinned-id read fails", async () => {
+    const requests = captureTelegram();
+    const db = maintenanceDb({});
+    const prepare = db.prepare.bind(db);
+    let failed = 0;
+    // The first pinned-id read for the sibling chat blips; its own retry inside
+    // its own try then succeeds, and the acting chat is never held up by it.
+    db.prepare = (sql) => {
+      const statement = prepare(sql);
+      if (!sql.includes('SELECT board_message_id, tab_message_id FROM settings')) return statement;
+      const bind = statement.bind.bind(statement);
+      statement.bind = (...args) => {
+        const bound = bind(...args);
+        if (args[0] === -999 && !failed) {
+          failed += 1;
+          bound.first = async () => { throw new Error('D1 blip'); };
+        }
+        return bound;
+      };
+      return statement;
+    };
+    await updateBoard({
+      BOT_TOKEN: 'test', ALLOWED_CHATS: '-123,-999', DATA_CHAT_ID: '-999', DB: db,
+    }, -123);
+    expect(failed).toBe(1);
+    const drawn = requests.filter((request) => /\/(editMessageText|sendMessage)$/.test(request.url));
+    expect(drawn.some((request) => request.body.chat_id === -123)).toBe(true);
+    expect(drawn.some((request) => request.body.chat_id === -999)).toBe(true);
+  });
+
   it('reads the threshold in dollars, and never as zero when it is unset', () => {
     expect(tabNoticeFallbackDay({})).toBe(7);
     expect(tabNoticeFallbackDay({ TAB_NOTICE_FALLBACK_DAY: '0' })).toBe(0);

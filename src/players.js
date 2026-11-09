@@ -224,24 +224,9 @@ export async function isChatAdmin(env, chatId, from) {
 // and keeps that id pointing at one player. Without the id that player can never
 // be sent a reminder.
 export async function rememberPlayer(env, from) {
-  const statements = rememberPlayerStatements(env, from);
-  if (!statements.length) return;
-  // These statements depend on their order, but D1 can execute the batch in
-  // one trip. The fallback keeps lightweight test doubles and local adapters
-  // useful without weakening the production path.
-  if (typeof env.DB.batch === 'function') {
-    await env.DB.batch(statements);
-    return;
-  }
-  for (const statement of statements) await statement.run();
-}
-
-// rememberPlayer's statements, in order, for a caller that sends them inside
-// a batch of its own: the webhook folds them into the one it sends anyway.
-export function rememberPlayerStatements(env, from) {
   const who = identity(from);
-  if (!who.userId || !who.username) return [];
-  return [env.DB.prepare(
+  if (!who.userId || !who.username) return;
+  const statements = [env.DB.prepare(
     'UPDATE booking_players SET user_id = ? WHERE slug = ? AND user_id IS NULL'
   ).bind(who.userId, who.slug),
   // Someone can set or change their username long after they were first seated,
@@ -272,6 +257,14 @@ export function rememberPlayerStatements(env, from) {
       WHERE user_id = ? AND slug != ?
         AND booking_id NOT IN (SELECT booking_id FROM booking_players WHERE slug = ?)`
   ).bind(who.slug, who.name, who.userId, who.slug, who.slug)];
+  // These statements depend on their order, but D1 can execute the batch in
+  // one trip. The fallback keeps lightweight test doubles and local adapters
+  // useful without weakening the production path.
+  if (typeof env.DB.batch === 'function') {
+    await env.DB.batch(statements);
+    return;
+  }
+  for (const statement of statements) await statement.run();
 }
 
 function addPlayerStatement(env, chatId, bookingId, player, addedByUserId) {

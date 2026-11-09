@@ -22,12 +22,14 @@ const isTimeout = (error) => Boolean(error
 
 // A 429 that says how long to wait is waited out once, when the wait is short
 // enough to fit inside a request. A longer one, or one without retry_after,
-// is returned as before and left to the caller's own retry. A call with a
-// short bound of its own never waits longer than that bound.
+// is returned as before and left to the caller's own retry. The bound covers
+// the whole call, wait and retry included, so a call with a short bound of its
+// own never takes longer than that bound.
 const MAX_RATE_LIMIT_WAIT_S = 3;
 
 export async function telegram(env, method, body, { timeoutMs = TELEGRAM_TIMEOUT_MS } = {}) {
   if (!env.BOT_TOKEN) return { ok: false, description: 'BOT_TOKEN is missing' };
+  const deadline = Date.now() + timeoutMs;
   for (let attempt = 0; ; attempt += 1) {
     let data;
     try {
@@ -35,7 +37,7 @@ export async function telegram(env, method, body, { timeoutMs = TELEGRAM_TIMEOUT
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
       });
       data = await response.json();
     } catch (error) {
@@ -44,7 +46,7 @@ export async function telegram(env, method, body, { timeoutMs = TELEGRAM_TIMEOUT
     }
     const wait = Number(data && data.parameters && data.parameters.retry_after);
     if (data && data.error_code === 429 && attempt === 0
-      && wait > 0 && wait <= MAX_RATE_LIMIT_WAIT_S && wait * 1000 < timeoutMs) {
+      && wait > 0 && wait <= MAX_RATE_LIMIT_WAIT_S && Date.now() + wait * 1000 < deadline) {
       await new Promise((resolve) => setTimeout(resolve, wait * 1000));
       continue;
     }
