@@ -205,7 +205,7 @@ describe('round trips before the answer', () => {
     // redrawn list. The tab redraw used to add about nine hops before this.
     expect(answeredAfter).toBeLessThanOrEqual(4);
     // And the tab is still redrawn, once the toast has gone.
-    expect(calls.some((call) => call.what === 'unpinChatMessage' || call.what === 'editMessageText'))
+    expect(calls.some((call) => ['deleteMessage', 'editMessageText'].includes(call.what)))
       .toBe(true);
   });
 

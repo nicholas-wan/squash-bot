@@ -8,7 +8,7 @@ const PINNED_COLUMNS = new Set(['board_message_id', 'tab_message_id']);
 // Telegram's way of saying the pinned message is beyond editing: somebody
 // deleted it, or the bot was kicked and re-added and no longer owns it. Only
 // those answers justify sending a replacement, because a supergroup allows many
-// pins and nothing here unpins the old one — so a fresh send after a failure
+// pins and the old one is still live — so a fresh send after a failure
 // that was merely transient (a 429, a 5xx, the fifteen-second timeout in
 // telegram(), which comes back as a description too) leaves a second board
 // pinned while the first stays up forever as a stale zombie nobody edits again.
@@ -25,6 +25,40 @@ const GONE_DESCRIPTIONS = [
 function editTargetIsGone(description) {
   const text = String(description || '').toLowerCase();
   return GONE_DESCRIPTIONS.some((phrase) => text.includes(phrase));
+}
+
+// What a pinned message says when there is nothing to show but Telegram will
+// not let the bot delete it.
+const EMPTY_HTML = {
+  board_message_id: '📌 <b>Court schedule</b>\n\nNo courts booked.',
+  tab_message_id: '💰 <b>Squash tab</b>\n\nEveryone is settled.',
+};
+
+// Takes an empty board or settled tab down. True when the message is gone and
+// its id can be forgotten. The id used to be forgotten whatever Telegram said,
+// so a message it refused to delete — older than 48 hours, in a group where
+// the bot lacks the Delete Messages right — stayed in the chat showing its
+// last courts, and the next booking pinned a second board beside it. Such a
+// message is now kept pinned, rewritten to say there is nothing to show, and
+// edited in place when there is again, as the availability message is. A
+// failure that is merely transient is thrown, keeping the id, so the queued
+// refresh tries again rather than leaving a stale board behind.
+async function removePinned(env, chatId, column, messageId, label) {
+  const removed = await deleteMessage(env, chatId, messageId);
+  const description = String(removed.description || '');
+  if (removed.ok || /message to delete not found/i.test(description)) return true;
+  if (!/message can.t be deleted/i.test(description)) {
+    throw new Error(`Could not remove ${label}: ${description || 'unknown Telegram error'}`);
+  }
+  const edited = await editMessage(env, chatId, messageId, EMPTY_HTML[column]);
+  if (edited.ok || /message is not modified/i.test(edited.description || '')) return false;
+  if (editTargetIsGone(edited.description)) {
+    // Gone after all, or kept but beyond editing: unpinned, so that whatever
+    // is left cannot pass for the current one.
+    await unpinMessage(env, chatId, messageId);
+    return true;
+  }
+  throw new Error(`Could not clear ${label}: ${edited.description || 'unknown Telegram error'}`);
 }
 
 // The timezone is a D1 query on nearly every code path, often several times per
@@ -72,14 +106,12 @@ export async function updatePinnedMessage(env, chatId, column, html, replyMarkup
   const existingId = setting && setting[column];
 
   if (!html) {
-    if (existingId) {
-      // Independent calls: the unpin covers a message the bot cannot delete.
-      await Promise.all([
-        unpinMessage(env, chatId, existingId), deleteMessage(env, chatId, existingId),
-      ]);
+    if (existingId && await removePinned(env, chatId, column, existingId, label)) {
       await env.DB.prepare(`UPDATE settings SET ${column} = NULL WHERE chat_id = ?`)
         .bind(chatId).run();
     }
+    // Null either way: there is nothing to show, even when an old message is
+    // kept pinned saying so.
     return null;
   }
 
@@ -93,6 +125,10 @@ export async function updatePinnedMessage(env, chatId, column, html, replyMarkup
         `Could not update ${label}: ${edited.description || 'unknown Telegram error'}`
       );
     }
+    // One that still exists but cannot be edited (the bot was kicked and
+    // re-added) would otherwise stay pinned beside its replacement. Best
+    // effort: for a deleted message there is nothing to unpin.
+    await unpinMessage(env, chatId, existingId);
   }
 
   const sent = await sendMessage(env, chatId, html, { silent: true, replyMarkup });

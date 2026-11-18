@@ -186,6 +186,10 @@ A second pinned message lists who owes the organiser. Group admins clear a
 balance from it, which appends a payment to the ledger rather than erasing
 anything. It unpins itself once everyone is settled — `/tab` then answers with
 your own private breakdown instead, so history stays readable between rounds.
+The court board likewise goes once nothing is booked. Either one that Telegram
+will not delete (older than 48 hours, without the Delete Messages right) stays
+pinned, rewritten to "No courts booked" or "Everyone is settled", and is edited
+in place next time, so a stale one never sits beside a fresh one.
 Its 🧾 **My tab** button
 sends anyone their own private breakdown — every charge and payment since
 they last settled, and never less than the last two weeks, so settling up
