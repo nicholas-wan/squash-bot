@@ -28,8 +28,8 @@ import {
   sendMessage, setBotProfilePhoto, telegram,
 } from './telegram.js';
 import {
-  beginBooking, beginEditBooking, bookingIntent, handleBookingCallback, handleBookingReply,
-  pruneBookingDrafts,
+  beginBooking, beginEditBooking, bookingIntent, dismissKeptSource, handleBookingCallback,
+  handleBookingReply, pruneBookingDrafts,
 } from './wizard.js';
 
 function chatAllowed(env, chat) {
@@ -114,7 +114,7 @@ const boardRoutes = [
   { pattern: /^sb:cancel:(\d+)$/, handler: cancelFromPanel },
   { pattern: /^sb:keep:(\d+)$/, handler: keepFromReceipt },
   { pattern: /^sb:join$/, handler: openJoinPicker },
-  { pattern: /^sb:(?:close|ok)$/, handler: dismissTapped },
+  { pattern: /^sb:(?:close|ok)(?::(\d+))?$/, handler: dismissTapped },
   { pattern: /^sb:full:(\d+)$/, handler: fullCourtToast },
   { pattern: /^sb:(join|leave|tap):(\d+)$/, handler: moveSlot },
   // The head count comes before the slug and is a bare 1 or 2, which is what
@@ -317,9 +317,16 @@ async function openJoinPicker(env, callback) {
   await answerCallback(env, callback.id, '🎾 Your court list is below ⬇️');
 }
 
-async function dismissTapped(env, callback) {
-  await dismissMessage(env, callback);
+// sb:ok:<id> is the OK on a cancelled booking form, carrying the message the
+// booking was typed in; dismissKeptSource only removes one the tapper typed.
+async function dismissTapped(env, callback, match) {
   await answerCallback(env, callback.id);
+  await Promise.all([
+    dismissMessage(env, callback),
+    match && match[1]
+      ? dismissKeptSource(env, callback.message.chat.id, callback.from.id, Number(match[1]))
+      : null,
+  ]);
 }
 
 async function fullCourtToast(env, callback) {
@@ -898,6 +905,12 @@ const DEBT_ERRORS = {
 // Clearing the message needs the Delete Messages admin right. Failing quietly
 // would leave the booking in the group while the bot behaves as though it had
 // been cleared, so whoever sent it is told to fix the permission.
+// Only a public copy can be cleared or kept: one Telegram delivered
+// ephemerally carries message_id 0 and is the sender's alone already.
+function isPublicMessage(msg) {
+  return Boolean(msg && msg.message_id && !msg.ephemeral_message_id);
+}
+
 async function clearSentMessage(env, msg, kind = 'booking message') {
   const deleted = await deleteMessage(env, msg.chat.id, msg.message_id);
   if (deleted.ok) return;
@@ -1032,10 +1045,10 @@ async function dispatchUpdate(env, update, identities = null) {
     await settleIdentities(env, msg.chat, msg.from, identities);
     if (await handleBookingReply(env, msg)) return;
     if (!text.startsWith('/')) {
-      // The booking form repeats the text back, and the pinned board is the
-      // record, so the original message is cleared out of the group. The intent
-      // is read up front and the delete runs in a finally, because a form that
-      // fails to open would otherwise leave the booking sitting in the chat.
+      // The original message stays while its form is open and goes when the
+      // form is confirmed (dismissKeptSource), so a misread booking can be
+      // checked against what was typed. A form that fails to open clears it
+      // here instead, in a finally, and hands the wording back below.
       const isBooking = bookingIntent(text, msg);
       // The gate is deliberately loose — "I booked 2 tickets" reads as a
       // booking — and it is the delete that makes that expensive: ordinary
@@ -1046,14 +1059,14 @@ async function dispatchUpdate(env, update, identities = null) {
       // round trip, which is why it hangs off isBooking rather than running
       // on every message in the chat. /book stays open to everyone.
       if (isBooking && !(await isChatAdmin(env, msg.chat.id, msg.from))) return;
-      // The message only goes once the form is on its way, or it failed on
-      // the way and the text is handed back below. A form that declined to
-      // open must not take the message with it.
-      let opened = true;
+      // A form that declined to open must not take the message with it.
+      let opened = null;
       try {
-        opened = await beginBooking(env, msg, text);
+        opened = await beginBooking(env, msg, text, {
+          sourceMessageId: isPublicMessage(msg) ? msg.message_id : null,
+        });
       } finally {
-        if (isBooking && opened !== false && msg.message_id) {
+        if (isBooking && opened === null && isPublicMessage(msg)) {
           clearedText = text;
           await clearSentMessage(env, msg);
         }
@@ -1104,7 +1117,9 @@ async function dispatchUpdate(env, update, identities = null) {
     // messages. Aimed at an incoming command it answers MESSAGE_NOT_FOUND.
     // clearSentMessage reports Telegram failures itself and resolves, so it is
     // safe to start here and await alongside the command's useful work.
-    const clearCommand = knownCommands.has(command) && msg.message_id && !msg.ephemeral_message_id
+    // /book is the exception: like a typed booking, it stays until its form
+    // is confirmed, and is cleared here only when no form opened.
+    const clearCommand = command !== 'book' && isPublicMessage(msg)
       ? clearSentMessage(env, msg, 'command')
       : Promise.resolve();
 
@@ -1120,9 +1135,17 @@ async function dispatchUpdate(env, update, identities = null) {
       return;
     }
     if (command === 'book') {
-      await Promise.all([
-        beginBooking(env, msg, args, { forceIntent: true }), clearCommand,
-      ]);
+      let opened = null;
+      try {
+        opened = await beginBooking(env, msg, args, {
+          forceIntent: true, sourceMessageId: isPublicMessage(msg) ? msg.message_id : null,
+        });
+      } finally {
+        if (opened !== true && isPublicMessage(msg)) {
+          if (opened === null && args) clearedText = text;
+          await clearSentMessage(env, msg, 'command');
+        }
+      }
       return;
     }
     // Both refresh commands answer even when nothing changed: a command whose

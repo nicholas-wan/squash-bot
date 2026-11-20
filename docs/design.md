@@ -241,8 +241,13 @@ its own ephemeral messages, so an incoming command stays in the sender's own
 chat, seen by nobody else. Booking as ordinary text has the opposite shape: it
 is a real group message, delivered and notified before the bot is told it
 exists, and can only be deleted afterwards — which needs the **Delete Messages**
-admin right, and without it the bot says so privately rather than failing
-quietly. That delete is why free text is only read as a booking from group
+admin right. As with a `/chore` in nag-bot, it stays while its form is open, so
+the form can be checked against what was typed, and goes when the form is
+confirmed. Cancel leaves it, with an **OK** on the cancelled notice that clears
+both; typing the booking again clears the old one; an abandoned form takes it
+with the day's sweep. Only the typer's own message can be cleared that way. A
+form that fails to open clears it at once and hands the wording back, and
+without the right the bot says so privately rather than failing quietly. That delete is why free text is only read as a booking from group
 admins: the intent gate is loose on purpose, and applied to everyone it cleared
 ordinary chat out of the group for looking like a court. Anybody else's
 booking-shaped message is ignored where it stands — no form, nothing removed —

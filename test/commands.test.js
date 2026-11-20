@@ -384,9 +384,8 @@ describe('Telegram commands', () => {
     // the form is at its confirm step.
     const labels = send.body.reply_markup.inline_keyboard.flat().map((button) => button.text);
     expect(labels).toContain('✅ Add booking');
-    // The command itself is still cleared out of the group.
-    const removed = requests.find((request) => request.url.endsWith('/deleteMessage'));
-    expect(removed.body.message_id).toBe(5);
+    // Like a typed booking, the command stays until the form is confirmed.
+    expect(requests.some((request) => request.url.endsWith('/deleteMessage'))).toBe(false);
   });
 
   it('opens a blank form for a bare command with trailing punctuation', async () => {
@@ -469,9 +468,8 @@ describe('Telegram commands', () => {
     const labels = send.body.reply_markup.inline_keyboard.flat().map((button) => button.text);
     expect(labels).toContain('✅ Add booking');
     expect(sqlSeen.some((sql) => sql.includes('INSERT INTO bookings'))).toBe(false);
-    // The booking text itself is cleared out of the group.
-    const removed = requests.find((request) => request.url.endsWith('/deleteMessage'));
-    expect(removed.body.message_id).toBe(5);
+    // The booking text stays in the group until the form is confirmed.
+    expect(requests.some((request) => request.url.endsWith('/deleteMessage'))).toBe(false);
   });
 
   it('clears the booking message even when the form fails to open', async () => {
@@ -521,7 +519,7 @@ describe('Telegram commands', () => {
     expect(removed.body.message_id).toBe(5);
   });
 
-  it('says so when it lacks the right to delete the booking message', async () => {
+  it('says so when it cannot clear a booking whose form failed to open', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
       requests.push({ url: String(url), body: JSON.parse(init.body) });
@@ -530,7 +528,9 @@ describe('Telegram commands', () => {
           headers: { 'Content-Type': 'application/json' },
         });
       }
-      return new Response(JSON.stringify(String(url).endsWith('/deleteMessage')
+      // The form fails to open, so the message is cleared rather than kept.
+      const form = String(init.body).includes('Confirm this squash booking');
+      return new Response(JSON.stringify(String(url).endsWith('/deleteMessage') || form
         ? { ok: false, description: 'not enough rights' }
         : { ok: true, result: { ephemeral_message_id: 12 } }), {
         headers: { 'Content-Type': 'application/json' },
@@ -617,13 +617,12 @@ describe('Telegram commands', () => {
     expect(member.some((request) => request.url.endsWith('/deleteMessage'))).toBe(false);
     expect(member.some((request) => request.url.endsWith('/sendMessage'))).toBe(false);
 
-    // An admin books exactly as before, and the group message the form repeats
-    // back is still cleared.
+    // An admin books exactly as before; the group message stays until the
+    // form is confirmed.
     const admin = await run('administrator');
     const form = admin.find((request) => request.url.endsWith('/sendMessage'));
     expect(form.body.text).toContain('Confirm this squash booking');
-    expect(admin.find((request) => request.url.endsWith('/deleteMessage')).body.message_id)
-      .toBe(5);
+    expect(admin.some((request) => request.url.endsWith('/deleteMessage'))).toBe(false);
   });
 
   // Telegram never checks callback data against the keyboard it drew, and the

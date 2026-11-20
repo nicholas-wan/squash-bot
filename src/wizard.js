@@ -220,14 +220,40 @@ function wizardView(id, payload, now, tz) {
   return { html: lines.join('\n'), replyMarkup: { inline_keyboard: keyboard }, payload };
 }
 
-async function startWizard(env, msg, text, payload, callbackQueryId, bookingId = null) {
+// The message a booking was typed in stays in the group while its form is
+// open, the same as a /chore in nag-bot: whoever typed it can check the form
+// against what they actually wrote, and copy it back if the parse was wrong.
+// Confirm takes it down with the form; Cancel leaves it, with an OK beside
+// the notice that clears both. It is on the sweep from the start, so a form
+// nobody finishes still takes it with the day. Only the typer's own message is
+// ever recorded here, and this reads that back before deleting: the id
+// rides in callback data, which Telegram never checks against the keyboard.
+export async function dismissKeptSource(env, chatId, userId, messageId) {
+  if (!messageId) return;
+  const kept = await env.DB.prepare(
+    `SELECT id FROM sent_messages
+     WHERE chat_id = ? AND message_id = ? AND is_ephemeral = 0 AND receiver_user_id = ?`
+  ).bind(chatId, messageId, userId).first();
+  if (!kept) return;
+  const removed = await deleteMessage(env, chatId, messageId);
+  if (removed.ok) {
+    await env.DB.prepare('DELETE FROM sent_messages WHERE id = ?').bind(kept.id).run();
+  }
+}
+
+const okForSource = (messageId) => ({ inline_keyboard: [[{
+  text: '👍 OK', callback_data: messageId ? `sb:ok:${messageId}` : 'sb:ok',
+}]] });
+
+async function startWizard(env, msg, text, payload, callbackQueryId, bookingId = null,
+  sourceMessageId = null) {
   const now = Date.now();
   const tz = await getTimezone(env, msg.chat.id);
   // A replaced draft used to leave its form behind: the row went, the message
   // stayed, and every tap on it answered "expired" forever. The old form is
   // read before the row is cleared so it can be taken down with it.
   const stale = await env.DB.prepare(
-    `SELECT wizard_message_id, wizard_ephemeral FROM booking_drafts
+    `SELECT wizard_message_id, wizard_ephemeral, source_message_id FROM booking_drafts
      WHERE chat_id = ? AND user_id = ?`
   ).bind(msg.chat.id, msg.from.id).first();
   const clearDraft = env.DB.prepare(
@@ -240,7 +266,7 @@ async function startWizard(env, msg, text, payload, callbackQueryId, bookingId =
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     msg.chat.id, msg.from.id, userName(msg.from), String(text), bookingId,
-    JSON.stringify(payload), msg.message_id || null, now
+    JSON.stringify(payload), sourceMessageId, now
   );
   // Order matters, but D1 can run the pair in one round trip. The fallback
   // keeps lightweight test doubles useful without weakening production.
@@ -259,6 +285,10 @@ async function startWizard(env, msg, text, payload, callbackQueryId, bookingId =
     } else {
       await deleteMessage(env, msg.chat.id, stale.wizard_message_id);
     }
+  }
+  // The booking it was typed in has been typed again, so the old copy goes too.
+  if (stale && stale.source_message_id) {
+    await dismissKeptSource(env, msg.chat.id, msg.from.id, stale.source_message_id);
   }
   const view = wizardView(id, payload, now, tz);
   const sent = await sendMessage(env, msg.chat.id, view.html, {
@@ -293,14 +323,16 @@ async function startWizard(env, msg, text, payload, callbackQueryId, bookingId =
   // finished form deletes itself, so the sweep only ever finds abandoned ones
   // — which used to linger forever. Deleting an already-gone message is the
   // same outcome, so the double booking is harmless.
-  await env.DB.prepare(
+  const sweep = (id, ephemeral, receiver) => env.DB.prepare(
     `INSERT INTO sent_messages
       (chat_id, receiver_user_id, message_id, is_ephemeral, delete_after, created_at)
      VALUES (?, ?, ?, ?, ?, ?)`
-  ).bind(
-    msg.chat.id, ephemeralId ? msg.from.id : null, messageId,
-    ephemeralId ? 1 : 0, now + DRAFT_LIFETIME_MS, now
-  ).run();
+  ).bind(msg.chat.id, receiver, id, ephemeral ? 1 : 0, now + DRAFT_LIFETIME_MS, now);
+  const sweeps = [sweep(messageId, ephemeralId, ephemeralId ? msg.from.id : null)];
+  // The typed booking, kept until Confirm (dismissKeptSource).
+  if (sourceMessageId) sweeps.push(sweep(sourceMessageId, false, msg.from.id));
+  if (typeof env.DB.batch === 'function') await env.DB.batch(sweeps);
+  else for (const statement of sweeps) await statement.run();
   return true;
 }
 
@@ -346,7 +378,7 @@ export function bookingIntent(text, msg) {
 }
 
 export async function beginBooking(env, msg, text, {
-  forceIntent = false, callbackQueryId = null,
+  forceIntent = false, callbackQueryId = null, sourceMessageId = null,
 } = {}) {
   if (!forceIntent && !bookingIntent(text, msg)) return false;
   const now = Date.now();
@@ -360,7 +392,7 @@ export async function beginBooking(env, msg, text, {
   payload.operation = 'add';
   payload.bookingId = null;
   payload.conflicts = [];
-  return startWizard(env, msg, text, payload, callbackQueryId);
+  return startWizard(env, msg, text, payload, callbackQueryId, null, sourceMessageId);
 }
 
 export async function beginEditBooking(env, callback, bookingId, field) {
@@ -450,11 +482,11 @@ export async function handleBookingCallback(env, callback) {
     if (row.wizard_ephemeral) {
       await editEphemeralMessage(
         env, chatId, row.user_id, row.wizard_message_id,
-        '✕ <i>Booking cancelled.</i>', { inline_keyboard: [] }
+        '✕ <i>Booking cancelled.</i>', okForSource(row.source_message_id)
       );
     } else {
       await editMessage(env, chatId, row.wizard_message_id,
-        '✕ <i>Booking cancelled.</i>', { inline_keyboard: [] });
+        '✕ <i>Booking cancelled.</i>', okForSource(row.source_message_id));
     }
     await answerCallback(env, callback.id);
     return true;
@@ -647,7 +679,8 @@ export async function handleBookingCallback(env, callback) {
       return true;
     }
     // The form has done its job: the tap confirmation says it worked and the
-    // pinned board carries the result, so the form itself goes away.
+    // pinned board carries the result, so the form itself goes away, and the
+    // message the booking was typed in goes with it.
     const editing = payload.operation === 'edit';
     try {
       await Promise.all([
@@ -655,6 +688,7 @@ export async function handleBookingCallback(env, callback) {
         row.wizard_ephemeral
           ? deleteEphemeralMessage(env, chatId, row.user_id, row.wizard_message_id)
           : deleteMessage(env, chatId, row.wizard_message_id),
+        dismissKeptSource(env, chatId, row.user_id, row.source_message_id),
       ]);
     } finally {
       await later.drain();
