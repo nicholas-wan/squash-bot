@@ -118,6 +118,105 @@ describe('A command sent as a group message', () => {
     expect(texts).toContain('Nothing is booked right now');
   });
 
+  it('puts a delete that failed for now on the sweep, without blaming the admin rights', async () => {
+    const real = globalThis.fetch;
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      if (String(url).endsWith('/deleteMessage')) {
+        requests.push({ method: 'deleteMessage', body: JSON.parse(init.body) });
+        return new Response(JSON.stringify({
+          ok: false, error_code: 500, description: 'Internal Server Error',
+        }), { headers: { 'Content-Type': 'application/json' } });
+      }
+      return real(url, init);
+    }));
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    await post('/courts');
+    expect(sql.prepare(
+      'SELECT is_ephemeral FROM sent_messages WHERE message_id = 5'
+    ).get()).toEqual({ is_ephemeral: 0 });
+    expect(sends().map((s) => s.body.text).join('\n')).not.toContain('Delete Messages');
+  });
+
+  it('says nothing when the command was already gone', async () => {
+    const real = globalThis.fetch;
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      if (String(url).endsWith('/deleteMessage')) {
+        return new Response(JSON.stringify({
+          ok: false, error_code: 400, description: 'Bad Request: message to delete not found',
+        }), { headers: { 'Content-Type': 'application/json' } });
+      }
+      return real(url, init);
+    }));
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    await post('/courts');
+    expect(sends().map((s) => s.body.text).join('\n')).not.toContain('Delete Messages');
+    expect(sql.prepare('SELECT COUNT(*) AS n FROM sent_messages WHERE message_id = 5').get().n)
+      .toBe(0);
+  });
+
+  it('hands a deleted /debt back privately when handling fails', async () => {
+    const prepare = env.DB.prepare.bind(env.DB);
+    env.DB.prepare = (query) => {
+      if (deletes().length && !/sent_messages/.test(query)) throw new Error('database down');
+      return prepare(query);
+    };
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    await post('/debt +2 jared ice cream');
+    expect(deletes()).toEqual([[CHAT, 5]]);
+    const handedBack = sends().at(-1);
+    expect(handedBack.body.text).toContain('/debt +2 jared ice cream');
+    expect(handedBack.body.ephemeral_message_parameters).toEqual({ receiver_user_id: 7 });
+  });
+
+  it('removes a public copy of a /debt handed back after a failure', async () => {
+    const prepare = env.DB.prepare.bind(env.DB);
+    env.DB.prepare = (query) => {
+      if (deletes().length && !/sent_messages/.test(query)) throw new Error('database down');
+      return prepare(query);
+    };
+    const real = globalThis.fetch;
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      const body = JSON.parse(init.body);
+      if (String(url).endsWith('/sendMessage') && String(body.text).includes('/debt +2')) {
+        requests.push({ method: 'sendMessage', body });
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 777 } }),
+          { headers: { 'Content-Type': 'application/json' } });
+      }
+      return real(url, init);
+    }));
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    await post('/debt +2 jared ice cream');
+    expect(deletes()).toContainEqual([CHAT, 777]);
+  });
+
+  it('waits for the delete when the command fails', async () => {
+    let finishDelete;
+    const real = globalThis.fetch;
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      if (String(url).endsWith('/deleteMessage')) {
+        await new Promise((resolve) => { finishDelete = resolve; });
+        requests.push({ method: 'deleteMessage', body: JSON.parse(init.body) });
+        return new Response(JSON.stringify({ ok: true, result: true }),
+          { headers: { 'Content-Type': 'application/json' } });
+      }
+      return real(url, init);
+    }));
+    const prepare = env.DB.prepare.bind(env.DB);
+    env.DB.prepare = (query) => {
+      if (finishDelete && !/sent_messages/.test(query)) throw new Error('database down');
+      return prepare(query);
+    };
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    let done = false;
+    const handling = post('/cancel 42').then(() => { done = true; });
+    await vi.waitFor(() => expect(finishDelete).toBeTypeOf('function'));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(done).toBe(false);
+    finishDelete();
+    await handling;
+    expect(deletes()).toEqual([[CHAT, 5]]);
+  });
+
   it('leaves alone a command meant for another bot', async () => {
     await post('/cancel@other_bot 3');
     await post('/help@other_bot', 6);
@@ -139,6 +238,16 @@ describe('A command sent as a group message', () => {
   });
 
   describe('/book', () => {
+    it('with no details goes at once and still opens the form', async () => {
+      await post('/book@squash_book_bot');
+      expect(deletes()).toEqual([[CHAT, 5]]);
+      expectAnsweredPrivately();
+      expect(sql.prepare('SELECT source_message_id FROM booking_drafts').get())
+        .toEqual({ source_message_id: null });
+      expect(sql.prepare('SELECT COUNT(*) AS n FROM sent_messages WHERE message_id = 5').get().n)
+        .toBe(0);
+    });
+
     it('stays while its form is open, on the sweep, and goes on Confirm', async () => {
       await post('/book 20 Aug 2027 c4 9pm');
       expect(deletes()).toEqual([]);

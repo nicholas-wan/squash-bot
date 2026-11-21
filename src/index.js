@@ -957,8 +957,14 @@ function isPublicMessage(msg) {
 }
 
 async function clearSentMessage(env, msg, kind = 'booking message') {
-  const deleted = await deleteMessage(env, msg.chat.id, msg.message_id);
+  // A delete that fails for now goes on the sweep, so a command cannot stay in
+  // the group because of one bad moment.
+  const deleted = await removePublicCopy(env, msg.chat.id, msg.message_id);
   if (deleted.ok) return;
+  const description = String(deleted.description || '');
+  if (/message.*not found|MESSAGE_NOT_FOUND|MESSAGE_ID_INVALID/i.test(description)) return;
+  const code = deleted.error_code;
+  if (!Number.isInteger(code) || code === 429 || code >= 500) return;
   await sendCommandNote(env, msg,
     `⚠️ Your ${kind} is still in the group — I need the ` +
     '<b>Delete Messages</b> admin right to clear it.',
@@ -1085,6 +1091,8 @@ async function dispatchUpdate(env, update, identities = null) {
   // Set once the original has been cleared, so a failure further down can hand
   // the wording back rather than leaving the sender with nothing to retype from.
   let clearedText = null;
+  // Held out here so a failure still waits for the delete it started.
+  let clearCommand = Promise.resolve();
 
   try {
     await settleIdentities(env, msg.chat, msg.from, identities);
@@ -1159,9 +1167,10 @@ async function dispatchUpdate(env, update, identities = null) {
     // safe to start here and await alongside the command's useful work.
     // /book is the exception: like a typed booking, it stays until its form
     // is confirmed, and is cleared here only when no form opened.
-    const clearCommand = command !== 'book' && isPublicMessage(msg)
-      ? clearSentMessage(env, msg, 'command')
-      : Promise.resolve();
+    if (command !== 'book' && isPublicMessage(msg)) {
+      if (args) clearedText = text;
+      clearCommand = clearSentMessage(env, msg, 'command');
+    }
 
     if (command === 'start' || command === 'help') {
       const [replyMarkup] = await Promise.all([
@@ -1172,12 +1181,15 @@ async function dispatchUpdate(env, update, identities = null) {
     }
     if (command === 'book') {
       let opened = null;
+      // A bare /book, as the menu sends it, has no wording to check the form
+      // against, so it goes at once whether or not the form opens.
+      const keepSource = isPublicMessage(msg) && Boolean(args);
       try {
         opened = await beginBooking(env, msg, args, {
-          forceIntent: true, sourceMessageId: isPublicMessage(msg) ? msg.message_id : null,
+          forceIntent: true, sourceMessageId: keepSource ? msg.message_id : null,
         });
       } finally {
-        if (opened !== true && isPublicMessage(msg)) {
+        if (isPublicMessage(msg) && (opened !== true || !keepSource)) {
           if (opened === null && args) clearedText = text;
           await clearSentMessage(env, msg, 'command');
         }
@@ -1324,15 +1336,22 @@ async function dispatchUpdate(env, update, identities = null) {
     // anything the person can actually act on before it throws.
     console.log(`Update failed: ${error.stack || error}`);
     const note = (error && error.userMessage) || '⚠️ Something went wrong. Please try again.';
+    await clearCommand;
     if (clearedText) {
       // Their message was deleted before this failed, so it only exists here:
       // it never expires, and a public fallback stays, showing only what they
-      // had already posted to the group.
-      await sendMessage(env, msg.chat.id, `${note}\n\n<code>${escapeHtml(clearedText)}</code>`, {
-        receiverUserId: msg.from.id,
+      // had already posted to the group. A /debt is the exception: it names
+      // somebody's money, so it is never put back where the group can read it.
+      const handBack = `${note}\n\n<code>${escapeHtml(clearedText)}</code>`;
+      const options = {
         replyToEphemeral: msg.ephemeral_message_id || null,
         replyMarkup: OK_MARKUP,
-      });
+      };
+      if (/^\/debt\b/i.test(clearedText)) {
+        await deliverPrivately(env, msg.chat.id, msg.from.id, handBack, options);
+      } else {
+        await sendMessage(env, msg.chat.id, handBack, { ...options, receiverUserId: msg.from.id });
+      }
     } else {
       await sendCommandNote(env, msg, note);
     }
@@ -1474,6 +1493,8 @@ export default {
       // confirmed). The cost: the group sees it, and may be notified, until
       // then. Replies stay private either way — that comes from
       // receiver_user_id on the send, not from how the command was registered.
+      // /debt alone stays ephemeral: it names a player, an amount and a reason,
+      // which the group must never see or be notified of, even for a moment.
       // The menu is scoped: members see the everyday commands, group admins
       // additionally see /cancel — parameterised and rarely theirs to run, so
       // it only earns menu space for the people managing bookings. Typing a
@@ -1488,7 +1509,7 @@ export default {
       const adminCommands = [
         ...memberCommands,
         { command: 'cancel', description: 'Cancel a booking by ID' },
-        { command: 'debt', description: "Add to or take off a player's tab" },
+        { command: 'debt', description: "Add to or take off a player's tab", is_ephemeral: true },
       ];
       const commands = await telegram(env, 'setMyCommands', { commands: adminCommands });
       const groupMenu = await telegram(env, 'setMyCommands', {

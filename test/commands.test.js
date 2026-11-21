@@ -530,7 +530,7 @@ describe('Telegram commands', () => {
       // The form fails to open, so the message is cleared rather than kept.
       const form = String(init.body).includes('Confirm this squash booking');
       return new Response(JSON.stringify(String(url).endsWith('/deleteMessage') || form
-        ? { ok: false, description: 'not enough rights' }
+        ? { ok: false, error_code: 400, description: 'not enough rights' }
         : { ok: true, result: { ephemeral_message_id: 12 } }), {
         headers: { 'Content-Type': 'application/json' },
       });
@@ -1531,10 +1531,12 @@ describe('Telegram commands', () => {
     expect(byScope.get('all_chat_administrators'))
       .toEqual(['book', 'courts', 'tab', 'help', 'cancel', 'debt']);
     // An ephemeral command has no public copy the bot may delete, so it sat in
-    // the sender's chat for good. Registered plainly, it is cleared.
+    // the sender's chat for good. Registered plainly, it is cleared. /debt alone
+    // stays ephemeral: it names a player, an amount and a reason.
     for (const menu of menus) {
       for (const command of menu.body.commands) {
-        expect(command).not.toHaveProperty('is_ephemeral');
+        if (command.command === 'debt') expect(command.is_ephemeral).toBe(true);
+        else expect(command).not.toHaveProperty('is_ephemeral');
       }
     }
   });

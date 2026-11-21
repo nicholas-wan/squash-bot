@@ -237,17 +237,20 @@ below are addressed to the group. Everything else it sends — forms,
 receipts, reminders, errors, and every reply to a command — is ephemeral: only
 the recipient and the bot see them.
 
-What you send is a different matter. Commands are registered without
-`is_ephemeral`, so a command, like a booking typed as ordinary text, is a real
-group message: delivered, and possibly notified, before the bot is told it
-exists, and deleted once it is handled — which needs the **Delete Messages**
-admin right. Until 21 Nov 2026 commands were ephemeral: never public, but never
-clearable either — a bot may only delete its own ephemeral messages — so each
-one stayed in the sender's chat for good. A client still holding that old menu
-sends ephemeral commands for a while; they are answered and left where they
-are. Every command but `/book` goes at once. `/book`, like a typed booking,
-stays while its form is open, as with a `/chore` in nag-bot, so the form can be
-checked against what was typed, and goes when the form is confirmed. Cancel leaves it, with an **OK** on the cancelled notice that clears
+What you send is a different matter. Commands other than `/debt` are registered
+without `is_ephemeral`, so a command, like a booking typed as ordinary text, is
+a real group message: delivered, and possibly notified, before the bot is told
+it exists, and deleted once it is handled — which needs the **Delete Messages**
+admin right. A delete that fails for now is retried by the sweep. Until 21 Nov
+2026 commands were ephemeral: never public, but never clearable either — a bot
+may only delete its own ephemeral messages — so each one stayed in the sender's
+chat for good. A client still holding that old menu sends ephemeral commands for
+a while; they are answered and left where they are. `/debt` keeps that trade on
+purpose: it names a player, an amount and a reason, so it stays out of the group
+and remains in the admin's own chat. Every other command goes at once, except a
+`/book` with details. That, like a typed booking, stays while its form is open,
+as with a `/chore` in nag-bot, so the form can be checked against what was
+typed, and goes when the form is confirmed. Cancel leaves it, with an **OK** on the cancelled notice that clears
 both; typing the booking again clears the old one; an abandoned form takes it
 with the day's sweep. Only the typer's own message can be cleared that way. A
 form that fails to open clears it at once and hands the wording back, and
