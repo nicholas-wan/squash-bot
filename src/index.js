@@ -1150,11 +1150,11 @@ async function dispatchUpdate(env, update, identities = null) {
         'Try /book, /courts, /tab, /cancel, or /help.');
       return;
     }
-    // Only a public copy can be cleared. A command Telegram delivered
-    // ephemerally is already private to whoever sent it, and the bot cannot
-    // remove it: deleteEphemeralMessage takes the id of a user who *received* a
-    // message from the bot, so it only reaches the bot's own ephemeral
-    // messages. Aimed at an incoming command it answers MESSAGE_NOT_FOUND.
+    // Commands are registered plainly (see /setup), so each arrives as a
+    // group message and is cleared here. Only a public copy can be: a client
+    // still holding the old ephemeral menu delivers one already private to its
+    // sender, which the bot cannot remove — deleteEphemeralMessage reaches
+    // only the bot's own messages — and so leaves alone.
     // clearSentMessage reports Telegram failures itself and resolves, so it is
     // safe to start here and await alongside the command's useful work.
     // /book is the exception: like a typed booking, it stays until its form
@@ -1466,27 +1466,29 @@ export default {
         // Telegram only sends it when asked for by name.
         allowed_updates: ['message', 'callback_query', 'chat_member'],
       });
-      // is_ephemeral, so a command is never a group message even for the moment
-      // before it would be deleted. The cost is that it cannot be cleared at
-      // all: deleteEphemeralMessage reaches only messages the bot itself sent,
-      // and answers MESSAGE_NOT_FOUND for an incoming command, which therefore
-      // stays in the sender's own chat. Nobody else ever sees it, and that is
-      // the trade this bot makes — it exists to keep booking out of the group.
+      // Deliberately not is_ephemeral. An ephemeral command arrives with no
+      // public copy and no id the bot may delete — deleteEphemeralMessage only
+      // reaches the bot's own messages — so it sat in the sender's chat for
+      // good. Registered plainly, a command is an ordinary group message that
+      // is deleted the moment it is handled (/book once its form is
+      // confirmed). The cost: the group sees it, and may be notified, until
+      // then. Replies stay private either way — that comes from
+      // receiver_user_id on the send, not from how the command was registered.
       // The menu is scoped: members see the everyday commands, group admins
       // additionally see /cancel — parameterised and rarely theirs to run, so
       // it only earns menu space for the people managing bookings. Typing a
       // command still works for anyone the handler allows; scope only changes
       // the menu.
       const memberCommands = [
-        { command: 'book', description: 'Add a court booking', is_ephemeral: true },
-        { command: 'courts', description: 'Show or refresh the pinned court board', is_ephemeral: true },
-        { command: 'tab', description: 'Show or refresh the pinned money tab', is_ephemeral: true },
-        { command: 'help', description: 'Show examples', is_ephemeral: true },
+        { command: 'book', description: 'Add a court booking' },
+        { command: 'courts', description: 'Show or refresh the pinned court board' },
+        { command: 'tab', description: 'Show or refresh the pinned money tab' },
+        { command: 'help', description: 'Show examples' },
       ];
       const adminCommands = [
         ...memberCommands,
-        { command: 'cancel', description: 'Cancel a booking by ID', is_ephemeral: true },
-        { command: 'debt', description: "Add to or take off a player's tab", is_ephemeral: true },
+        { command: 'cancel', description: 'Cancel a booking by ID' },
+        { command: 'debt', description: "Add to or take off a player's tab" },
       ];
       const commands = await telegram(env, 'setMyCommands', { commands: adminCommands });
       const groupMenu = await telegram(env, 'setMyCommands', {

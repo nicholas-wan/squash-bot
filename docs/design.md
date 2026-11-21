@@ -237,16 +237,17 @@ below are addressed to the group. Everything else it sends — forms,
 receipts, reminders, errors, and every reply to a command — is ephemeral: only
 the recipient and the bot see them.
 
-What you send is a different matter. Commands are registered with
-`is_ephemeral`, so a command is never a group message at all — not even for the
-moment before a delete. It cannot then be cleared either: a bot may only delete
-its own ephemeral messages, so an incoming command stays in the sender's own
-chat, seen by nobody else. Booking as ordinary text has the opposite shape: it
-is a real group message, delivered and notified before the bot is told it
-exists, and can only be deleted afterwards — which needs the **Delete Messages**
-admin right. As with a `/chore` in nag-bot, it stays while its form is open, so
-the form can be checked against what was typed, and goes when the form is
-confirmed. Cancel leaves it, with an **OK** on the cancelled notice that clears
+What you send is a different matter. Commands are registered without
+`is_ephemeral`, so a command, like a booking typed as ordinary text, is a real
+group message: delivered, and possibly notified, before the bot is told it
+exists, and deleted once it is handled — which needs the **Delete Messages**
+admin right. Until 21 Nov 2026 commands were ephemeral: never public, but never
+clearable either — a bot may only delete its own ephemeral messages — so each
+one stayed in the sender's chat for good. A client still holding that old menu
+sends ephemeral commands for a while; they are answered and left where they
+are. Every command but `/book` goes at once. `/book`, like a typed booking,
+stays while its form is open, as with a `/chore` in nag-bot, so the form can be
+checked against what was typed, and goes when the form is confirmed. Cancel leaves it, with an **OK** on the cancelled notice that clears
 both; typing the booking again clears the old one; an abandoned form takes it
 with the day's sweep. Only the typer's own message can be cleared that way. A
 form that fails to open clears it at once and hands the wording back, and
@@ -254,7 +255,7 @@ without the right the bot says so privately rather than failing quietly. That de
 admins: the intent gate is loose on purpose, and applied to everyone it cleared
 ordinary chat out of the group for looking like a court. Anybody else's
 booking-shaped message is ignored where it stands — no form, nothing removed —
-so members book with `/book`, which is never public at any point. Whether a
+so members book with `/book`. Whether a
 message reads as a booking is decided once, on the text with its @handles and
 `+1` taken out, so the delete and the form never disagree: an admin's "+1 for
 squash" stays where it is. A booking form Telegram would only deliver as a

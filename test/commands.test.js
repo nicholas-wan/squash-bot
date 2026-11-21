@@ -235,7 +235,7 @@ describe('Telegram commands', () => {
     await handling;
   });
 
-  it('leaves an ephemeral command alone, having nothing it can delete', async () => {
+  it('leaves an ephemeral command from a stale menu alone, having nothing it can delete', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
       requests.push({ url: String(url), body: JSON.parse(init.body) });
@@ -254,10 +254,9 @@ describe('Telegram commands', () => {
         text: '/courts@squash_book_bot',
       },
     });
-    // Telegram leaves an ephemeral command in the chat until the app closes,
-    // so it is cleared through the ephemeral API rather than deleteMessage.
-    // Telegram answers MESSAGE_NOT_FOUND for a message the bot did not write,
-    // so attempting either delete only costs a request and logs a failure.
+    // A client still holding the old ephemeral menu sends one of these. It is
+    // already private to its sender, and Telegram answers MESSAGE_NOT_FOUND
+    // to either delete for a message the bot did not write, so neither is tried.
     expect(requests.some((request) => request.url.endsWith('/deleteEphemeralMessage')))
       .toBe(false);
     expect(requests.some((request) => request.url.endsWith('/deleteMessage'))).toBe(false);
@@ -1502,7 +1501,7 @@ describe('Telegram commands', () => {
     vi.restoreAllMocks();
   });
 
-  it('registers every command as ephemeral', async () => {
+  it('registers every command plainly, so it can be deleted', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
       requests.push({ url: String(url), body: JSON.parse(init.body) });
@@ -1531,11 +1530,11 @@ describe('Telegram commands', () => {
     expect(byScope.get('all_group_chats')).toEqual(['book', 'courts', 'tab', 'help']);
     expect(byScope.get('all_chat_administrators'))
       .toEqual(['book', 'courts', 'tab', 'help', 'cancel', 'debt']);
-    // Never a group message, not even for the moment before a delete. The cost
-    // is that it cannot be cleared from the sender's own chat afterwards.
+    // An ephemeral command has no public copy the bot may delete, so it sat in
+    // the sender's chat for good. Registered plainly, it is cleared.
     for (const menu of menus) {
       for (const command of menu.body.commands) {
-        expect(command.is_ephemeral).toBe(true);
+        expect(command).not.toHaveProperty('is_ephemeral');
       }
     }
   });
