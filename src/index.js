@@ -24,7 +24,7 @@ import {
 } from './tab.js';
 import {
   answerCallback, armWebhookAnswer, botId, botUsername, deleteEphemeralMessage,
-  deleteMessage, editEphemeralMessage, editReplyMarkup, escapeHtml, OK_MARKUP,
+  deleteMessage, editEphemeralMessage, editReplyMarkup, escapeHtml, OK_MARKUP, removePublicCopy,
   sendMessage, setBotProfilePhoto, telegram,
 } from './telegram.js';
 import {
@@ -454,7 +454,7 @@ async function deliverPrivately(env, chatId, userId, html, options = {}) {
   if (!sent.ok || !sent.result) return { status: 'failed', sent };
   if (sent.result.ephemeral_message_id) return { status: 'private', sent };
   if (sent.result.message_id) {
-    const removed = await deleteMessage(env, chatId, sent.result.message_id);
+    const removed = await removePublicCopy(env, chatId, sent.result.message_id);
     return { status: 'public-fallback', sent, removed };
   }
   return { status: 'failed', sent };

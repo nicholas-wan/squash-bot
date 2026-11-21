@@ -32,11 +32,15 @@ async function deleteAnnouncement(env, chatId, messageId) {
 // and is rewritten in place for the next court that opens.
 export const NO_COURTS_HTML = '🎾 <b>No courts available</b>';
 
+// Gone, or kept but no longer the bot's to edit (kicked and re-added). Either
+// way it is forgotten; retrying it failed maintenance every minute for good.
+const BEYOND_EDITING = /message to edit not found|message can.t be edited/i;
+
 // False when the message is already gone, so the caller can stop tracking it.
 async function closeAnnouncement(env, chatId, messageId, text) {
   const closed = await editMessage(env, chatId, messageId, text, { inline_keyboard: [] });
   if (closed.ok || /message is not modified/i.test(closed.description || '')) return true;
-  if (/message to edit not found/i.test(closed.description || '')) return false;
+  if (BEYOND_EDITING.test(closed.description || '')) return false;
   throw new Error(closed.description || 'Announcement retirement failed');
 }
 
@@ -56,6 +60,14 @@ async function swapWithNewestPinned(env, chatId, noticeId, pinned, drawn) {
     console.log(`Could not pin ${chatId}/${noticeId} to reorder: ${pin.description || 'unknown error'}`);
     return null;
   }
+  // Before anything is saved, so a failed unpin moves nothing and maintenance
+  // retries, rather than leaving the announcement pinned for good.
+  const unpinned = await unpinMessage(env, chatId, newestId);
+  if (!unpinned.ok && !/not found|not pinned|not modified/i.test(unpinned.description || '')) {
+    await unpinMessage(env, chatId, noticeId);
+    throw new Error(`Could not unpin ${chatId}/${newestId}: ${unpinned.description || 'unknown error'}`);
+  }
+  let saved = false;
   try {
     // The second write depends on the first, so a board replaced in the
     // meantime leaves both rows as they were.
@@ -70,17 +82,22 @@ async function swapWithNewestPinned(env, chatId, noticeId, pinned, drawn) {
     const [moved] = typeof env.DB.batch === 'function'
       ? await env.DB.batch(writes)
       : [await writes[0].run(), await writes[1].run()];
-    if (!moved?.meta?.changes) {
-      await unpinMessage(env, chatId, noticeId);
-      return null;
-    }
+    saved = Boolean(moved?.meta?.changes);
   } catch (error) {
-    await unpinMessage(env, chatId, noticeId);
-    throw error;
+    // The write may have landed with only its answer lost.
+    const now = await env.DB.prepare(`SELECT ${column} AS id FROM settings WHERE chat_id = ?`)
+      .bind(chatId).first().catch(() => null);
+    if (Number(now?.id) !== noticeId) {
+      await pinMessage(env, chatId, newestId);
+      await unpinMessage(env, chatId, noticeId);
+      throw error;
+    }
+    saved = true;
   }
-  const unpinned = await unpinMessage(env, chatId, newestId);
-  if (!unpinned.ok) {
-    console.log(`Could not unpin ${chatId}/${newestId} after reorder: ${unpinned.description || 'unknown error'}`);
+  if (!saved) {
+    // Somebody else replaced that pinned message, so the old one stays unpinned.
+    await unpinMessage(env, chatId, noticeId);
+    return null;
   }
   const redrawn = drawn?.column === column
     ? await editMessage(env, chatId, noticeId, drawn.html, drawn.replyMarkup)
@@ -161,6 +178,21 @@ export async function syncAnnouncements(env, chatId, now = Date.now(), known = {
     const failed = reads.find((read) => read.status === 'rejected');
     if (failed) throw failed.reason;
     const [next, pinned, tz] = reads.map((read) => read.value);
+    // A redraw that read its ids before a swap has just edited this message
+    // as the board or tab. Its stored rendering is no longer what is on screen,
+    // and the pinned message still needs that redraw.
+    const overdrawn = current.message_id && known.pinned
+      ? ['board_message_id', 'tab_message_id']
+        .find((column) => Number(known.pinned[column]) === Number(current.message_id))
+      : null;
+    if (overdrawn) {
+      current.html = null;
+      try {
+        await queuePinnedRefresh(env, chatId, overdrawn === 'board_message_id' ? 'board' : 'tab');
+      } catch (error) {
+        console.log(`Could not queue redraw for ${chatId}: ${error.message || error}`);
+      }
+    }
     // Message ids only grow within a chat, so a pinned board or tab with a
     // higher id was posted after this message and sits below it. The bot's
     // last word is meant to be the next open court; one buried under a freshly
@@ -249,7 +281,7 @@ export async function syncAnnouncements(env, chatId, now = Date.now(), known = {
         released = true;
         return 0;
       }
-      if (!/message to edit not found/i.test(edited.description || '')) {
+      if (!BEYOND_EDITING.test(edited.description || '')) {
         throw new Error(edited.description || 'Announcement edit failed');
       }
     }

@@ -138,6 +138,31 @@ export function deleteMessage(env, chatId, messageId) {
   return telegram(env, 'deleteMessage', { chat_id: chatId, message_id: messageId });
 }
 
+// Telegram saying a delete is finished with: the message is gone, can never be
+// deleted, or the bot can no longer reach the chat. Anything else (a timeout, a
+// 429, a 5xx) is worth another try.
+export const DELETE_SETTLED =
+  /message.*not found|MESSAGE_NOT_FOUND|MESSAGE_ID_INVALID|can.t be deleted|chat not found|forbidden|upgraded to a supergroup/i;
+
+// Takes down the public copy of a message meant for one person. A delete that
+// fails for now goes on the cleanup sweep, so private content cannot stay in
+// the group because of one bad moment.
+export async function removePublicCopy(env, chatId, messageId) {
+  const removed = await deleteMessage(env, chatId, messageId);
+  if (removed.ok || DELETE_SETTLED.test(String(removed.description || ''))) return removed;
+  const now = Date.now();
+  try {
+    await env.DB.prepare(
+      `INSERT INTO sent_messages
+        (chat_id, receiver_user_id, message_id, is_ephemeral, delete_after, created_at)
+       VALUES (?, NULL, ?, 0, ?, ?)`
+    ).bind(chatId, messageId, now, now).run();
+  } catch (error) {
+    console.log(`Could not queue public copy ${chatId}/${messageId} for removal: ${error.stack || error}`);
+  }
+  return removed;
+}
+
 export function pinMessage(env, chatId, messageId) {
   return telegram(env, 'pinChatMessage', {
     chat_id: chatId, message_id: messageId, disable_notification: true,

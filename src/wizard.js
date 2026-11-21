@@ -11,7 +11,7 @@ import {
 import { dateFormatter, formatDate, formatTime, localParts, zonedEpoch } from './time.js';
 import {
   answerCallback, deleteEphemeralMessage, deleteMessage, editEphemeralMessage,
-  editMessage, escapeHtml, mentionHtml, sendMessage,
+  editMessage, escapeHtml, mentionHtml, removePublicCopy, sendMessage,
 } from './telegram.js';
 
 const DRAFT_LIFETIME_MS = 24 * 60 * 60 * 1000;
@@ -307,7 +307,7 @@ async function startWizard(env, msg, text, payload, callbackQueryId, bookingId =
   // to try again.
   if (!sent.result.ephemeral_message_id && sent.result.message_id) {
     await Promise.all([
-      deleteMessage(env, msg.chat.id, sent.result.message_id),
+      removePublicCopy(env, msg.chat.id, sent.result.message_id),
       env.DB.prepare('DELETE FROM booking_drafts WHERE id = ?').bind(id).run(),
     ]);
     const error = new Error('Booking form came back as a public message; removed');
@@ -447,13 +447,17 @@ async function requestTypedField(env, row, field, callbackId) {
       callbackQueryId: callbackId,
     }
   );
-  if (prompt.ok) {
+  // A prompt that came back public is taken down: cleanup for a private form
+  // could never remove it, and it would sit in the group.
+  const delivered = prompt.ok && Boolean(prompt.result.ephemeral_message_id || !row.wizard_ephemeral);
+  if (prompt.ok && !delivered) await removePublicCopy(env, row.chat_id, prompt.result.message_id);
+  if (delivered) {
     const promptId = prompt.result.ephemeral_message_id || prompt.result.message_id;
     await env.DB.prepare(
       'UPDATE booking_drafts SET pending_field = ?, reply_prompt_message_id = ? WHERE id = ?'
     ).bind(field, promptId, row.id).run();
   }
-  await answerCallback(env, callbackId, prompt.ok ? '' : 'Could not open the input box.', !prompt.ok);
+  await answerCallback(env, callbackId, delivered ? '' : 'Could not open the input box.', !delivered);
 }
 
 export async function handleBookingCallback(env, callback) {
@@ -769,7 +773,10 @@ export async function handleBookingReply(env, msg) {
         replyToEphemeral: msg.ephemeral_message_id || null,
       }
     );
-    if (prompt.ok) {
+    if (prompt.ok && !prompt.result.ephemeral_message_id && row.wizard_ephemeral) {
+      // The earlier private prompt stays the one to reply to.
+      await removePublicCopy(env, msg.chat.id, prompt.result.message_id);
+    } else if (prompt.ok) {
       const promptId = prompt.result.ephemeral_message_id || prompt.result.message_id;
       await env.DB.prepare('UPDATE booking_drafts SET reply_prompt_message_id = ? WHERE id = ?')
         .bind(promptId, row.id).run();

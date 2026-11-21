@@ -5,7 +5,7 @@ import { identity, isHouseholdPlayer, ownerName } from './players.js';
 import { boardChats, dataChatId } from './scope.js';
 import { getTimezone, pinnedIds, updatePinnedMessage } from './settings.js';
 import { serializedRedraw } from './redraw-queue.js';
-import { deleteMessage, escapeHtml, OK_MARKUP, sendMessage } from './telegram.js';
+import { escapeHtml, OK_MARKUP, removePublicCopy, sendMessage } from './telegram.js';
 import { queuePinnedRefresh } from './refresh-queue.js';
 import { miniAppLink } from './miniapp-link.js';
 import { dateFormatter } from './time.js';
@@ -595,7 +595,7 @@ export async function sendPrivateNote(env, chatId, userId, html) {
   });
   if (sent.ok && sent.result && sent.result.ephemeral_message_id) return 'private';
   if (sent.ok && sent.result && sent.result.message_id) {
-    await deleteMessage(env, chatId, sent.result.message_id);
+    await removePublicCopy(env, chatId, sent.result.message_id);
   }
   return 'failed';
 }

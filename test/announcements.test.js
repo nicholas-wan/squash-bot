@@ -3,6 +3,8 @@ import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, expect, it, onTestFinished, vi } from 'vitest';
 import { NO_COURTS_HTML, syncAnnouncements } from '../src/announcements.js';
 import { addBooking, runMaintenance, updateBoard } from '../src/bookings.js';
+import { sendPrivateNote } from '../src/tab.js';
+import { handleBookingCallback } from '../src/wizard.js';
 
 let db, env, requests, failure, failWrite;
 const now = Date.UTC(2026, 8, 10);
@@ -459,10 +461,109 @@ it('takes the pin back when the swap cannot be saved', async () => {
   requests = [];
   expect(await syncAnnouncements(env, -123, now)).toBe(1);
   expect(requests.map(r => [r.method, r.message_id])).toEqual([
-    ['deleteMessage', 101], ['pinChatMessage', 101], ['unpinChatMessage', 101],
+    ['deleteMessage', 101], ['pinChatMessage', 101], ['unpinChatMessage', 150],
+    ['pinChatMessage', 150], ['unpinChatMessage', 101],
   ]);
   expect(notice().message_id).toBe(101);
   expect(pinnedRow().board_message_id).toBe(150);
+});
+
+it('moves nothing when the old pin cannot be taken off, so maintenance retries', async () => {
+  seat(1);
+  await syncAnnouncements(env, -123, now);
+  db.prepare('INSERT INTO settings (chat_id, board_message_id) VALUES (-123, 150)').run();
+  failure = method => undeletable(method)
+    || (method === 'unpinChatMessage' ? { ok: false, error_code: 500, description: 'Internal Server Error' } : null);
+  requests = [];
+  expect(await syncAnnouncements(env, -123, now)).toBe(1);
+  expect(requests.map(r => [r.method, r.message_id])).toEqual([
+    ['deleteMessage', 101], ['pinChatMessage', 101], ['unpinChatMessage', 150], ['unpinChatMessage', 101],
+  ]);
+  expect(notice().message_id).toBe(101);
+  expect(pinnedRow().board_message_id).toBe(150);
+});
+
+it('finishes the swap when the save landed but its answer was lost', async () => {
+  seat(1);
+  await syncAnnouncements(env, -123, now);
+  db.prepare('INSERT INTO settings (chat_id, board_message_id) VALUES (-123, 150)').run();
+  failure = undeletable;
+  const batch = env.DB.batch;
+  env.DB.batch = async (statements) => {
+    await batch(statements);
+    env.DB.batch = batch;
+    throw new Error('D1 connection lost');
+  };
+  requests = [];
+  expect(await syncAnnouncements(env, -123, now)).toBe(0);
+  expect(requests.filter(r => r.method === 'pinChatMessage').map(r => r.message_id)).toEqual([101]);
+  expect(requests.filter(r => r.method === 'unpinChatMessage').map(r => r.message_id)).toEqual([150]);
+  expect(pinnedRow().board_message_id).toBe(101);
+  expect(notice().message_id).toBe(150);
+});
+
+it('posts afresh instead of failing forever on a message it can no longer edit', async () => {
+  seat(1);
+  await syncAnnouncements(env, -123, now);
+  db.prepare("UPDATE availability_notices SET html = 'stale' WHERE chat_id = -123").run();
+  failure = method => (method === 'editMessageText'
+    ? { ok: false, description: "Bad Request: message can't be edited" } : null);
+  requests = [];
+  expect(await syncAnnouncements(env, -123, now)).toBe(0);
+  expect(requests.map(r => r.method)).toEqual(['editMessageText', 'sendMessage']);
+  expect(notice().message_id).not.toBe(101);
+});
+
+it('forgets a kept message it can neither delete nor edit once no court is open', async () => {
+  seat(1);
+  await syncAnnouncements(env, -123, now);
+  db.prepare('DELETE FROM bookings').run();
+  failure = method => undeletable(method) || (method === 'editMessageText'
+    ? { ok: false, description: "Bad Request: message can't be edited" } : null);
+  expect(await syncAnnouncements(env, -123, now)).toBe(0);
+  expect(notice().message_id).toBe(null);
+});
+
+it('repairs the announcement when a redraw from before a swap lands on it', async () => {
+  seat(1);
+  await syncAnnouncements(env, -123, now);
+  requests = [];
+  // The caller read 101 as its board, and has just drawn the board there.
+  expect(await syncAnnouncements(env, -123, now, {
+    pinned: { board_message_id: 101, tab_message_id: null },
+  })).toBe(0);
+  expect(requests.map(r => [r.method, r.message_id])).toEqual([['editMessageText', 101]]);
+  expect(requests[0].text).toContain('left on Court');
+  expect(db.prepare('SELECT board, tab FROM pending_refreshes WHERE chat_id = -123').get())
+    .toEqual({ board: 1, tab: 0 });
+});
+
+it('takes down a typed-field prompt that came back public', async () => {
+  db.prepare(`INSERT INTO booking_drafts (id, chat_id, user_id, user_name, payload, wizard_message_id,
+    wizard_ephemeral, created_at) VALUES (9, -123, 7, 'Player', '{}', 55, 1, ?)`).run(now);
+  requests = [];
+  await handleBookingCallback(env, {
+    id: 'tap', data: 'bw:9:u:d', from: { id: 7 }, message: { chat: { id: -123 }, message_id: 55 },
+  });
+  const prompt = requests.find(r => r.method === 'sendMessage');
+  expect(prompt.ephemeral_message_parameters).toEqual({ receiver_user_id: 7, callback_query_id: 'tap' });
+  expect(requests.some(r => r.method === 'deleteMessage')).toBe(true);
+  expect(requests.find(r => r.method === 'answerCallbackQuery').text).toBe('Could not open the input box.');
+  expect(db.prepare('SELECT pending_field, reply_prompt_message_id AS id FROM booking_drafts WHERE id = 9').get())
+    .toEqual({ pending_field: null, id: null });
+});
+
+it('puts a private note on the sweep when its public copy will not delete yet', async () => {
+  failure = method => (method === 'deleteMessage'
+    ? { ok: false, error_code: 500, description: 'Internal Server Error' } : null);
+  expect(await sendPrivateNote(env, -123, 7, 'Your balance')).toBe('failed');
+  expect(db.prepare('SELECT is_ephemeral, receiver_user_id FROM sent_messages').all())
+    .toEqual([{ is_ephemeral: 0, receiver_user_id: null }]);
+  db.prepare('DELETE FROM sent_messages').run();
+  failure = method => (method === 'deleteMessage'
+    ? { ok: false, description: 'Bad Request: message to delete not found' } : null);
+  await sendPrivateNote(env, -123, 7, 'Your balance');
+  expect(db.prepare('SELECT count(*) AS n FROM sent_messages').get().n).toBe(0);
 });
 
 it('clears a court reminder when the court ends, and retries a public copy it could not delete', async () => {

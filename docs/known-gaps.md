@@ -31,6 +31,8 @@ Found by review, none of them load-bearing enough to hold a release:
 - Telegram does not guarantee that a private reminder's deletion reaches a phone
   that is offline at that moment. The bot's delete succeeds, but that one phone
   can keep showing the reminder until Telegram expires it or the app restarts.
+- A reminder's removal time is set when it is sent. A court moved or cancelled
+  afterwards keeps that reminder until the original court's end.
 - A message the cleanup sweep cannot delete is retried on the next tick, but
   given up on a day past its due time so one wedged row cannot starve the queue behind
   it. That message then stays in the chat for good.

@@ -19,8 +19,8 @@ import { serializedRedraw } from './redraw-queue.js';
 import { miniAppLink } from './miniapp-link.js';
 import { maintainAnnouncements, syncAnnouncements } from './announcements.js';
 import {
-  deleteEphemeralMessage, deleteMessage, editReplyMarkup, escapeHtml,
-  OK_MARKUP, sendMessage,
+  DELETE_SETTLED, deleteEphemeralMessage, deleteMessage, editReplyMarkup, escapeHtml,
+  OK_MARKUP, removePublicCopy, sendMessage,
 } from './telegram.js';
 
 export { getTimezone, tabNoticeThresholdCents };
@@ -1379,12 +1379,7 @@ async function sendPrivately(env, chatId, html, userId, deleteAfter, options = {
     return 'private';
   }
   if (sent.result && sent.result.message_id) {
-    // A public copy whose delete failed had no record, so it stayed for good.
-    // It goes on the sweep, which keeps trying.
-    const removed = await deleteMessage(env, chatId, sent.result.message_id);
-    if (!removed.ok && !ALREADY_DELETED.test(String(removed.description || ''))) {
-      await scheduleCleanup(env, chatId, sent.result, null, Date.now());
-    }
+    await removePublicCopy(env, chatId, sent.result.message_id);
   }
   return 'not-ephemeral';
 }
@@ -1422,11 +1417,6 @@ function chatScope(env, column) {
   return { sql: ` AND ${column} IN (${chats.map(() => '?').join(', ')})`, args: chats };
 }
 
-// Telegram refuses to delete a message that is already gone, which is the same
-// outcome as deleting it, so the row goes on either of these.
-const ALREADY_DELETED =
-  /not found|MESSAGE_NOT_FOUND|can't be deleted|MESSAGE_ID_INVALID|message to delete not found/i;
-
 // A row Telegram keeps failing on is kept and retried, but not forever: a day
 // past its due time it is dropped anyway. These messages are about one day,
 // so a call a minute for longer than that is not worth the message — and one
@@ -1455,7 +1445,7 @@ async function purgeFinishedMessages(env, now) {
           ? await deleteEphemeralMessage(env, row.chat_id, row.receiver_user_id, row.message_id)
           : await deleteMessage(env, row.chat_id, row.message_id);
         const deleted = outcome.ok
-          || ALREADY_DELETED.test(String(outcome.description || ''));
+          || DELETE_SETTLED.test(String(outcome.description || ''));
         // Dropped either way, but a message that is still in the chat should
         // leave a trace for whoever asks why it was never cleared.
         if (!outcome.ok && /can.t be deleted/i.test(String(outcome.description || ''))) {
