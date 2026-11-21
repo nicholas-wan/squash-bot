@@ -477,19 +477,39 @@ async function sendPrivatePanel(env, callback, view) {
 const PANEL_LIFETIME_MS = 24 * 60 * 60 * 1000;
 
 async function expirePanel(env, chatId, userId, delivery) {
-  const messageId = delivery.status === 'private' && delivery.sent.result.ephemeral_message_id;
+  if (delivery.status === 'private') await expireSent(env, chatId, userId, delivery.sent);
+}
+
+// Hands a sent message to the sweep, in whichever id space it landed.
+async function expireSent(env, chatId, userId, sent) {
+  const ephemeralId = sent && sent.ok && sent.result && sent.result.ephemeral_message_id;
+  const messageId = ephemeralId || (sent && sent.ok && sent.result && sent.result.message_id);
   if (!messageId) return;
   const now = Date.now();
   try {
     await env.DB.prepare(
       `INSERT INTO sent_messages
         (chat_id, receiver_user_id, message_id, is_ephemeral, delete_after, created_at)
-       VALUES (?, ?, ?, 1, ?, ?)`
-    ).bind(chatId, userId, messageId, now + PANEL_LIFETIME_MS, now).run();
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(chatId, ephemeralId ? userId : null, messageId, ephemeralId ? 1 : 0,
+      now + PANEL_LIFETIME_MS, now).run();
   } catch (error) {
     // The panel is already in front of them; only its tidying is lost.
     console.log(`Panel cleanup record failed: ${error.stack || error}`);
   }
+}
+
+// A command's status or error note: useful for a moment and no record of
+// anything, so it clears like a panel instead of staying until somebody taps OK.
+async function sendCommandNote(env, msg, html, options = {}) {
+  const sent = await sendMessage(env, msg.chat.id, html, {
+    receiverUserId: msg.from.id,
+    replyToEphemeral: msg.ephemeral_message_id || null,
+    replyMarkup: OK_MARKUP,
+    ...options,
+  });
+  await expireSent(env, msg.chat.id, msg.from.id, sent);
+  return sent;
 }
 
 function editSucceeded(result) {
@@ -879,6 +899,14 @@ function privateReply(env, msg, html, replyMarkup = OK_MARKUP) {
   });
 }
 
+// privateReply for an answer that is no record of anything: a refusal, a usage
+// line, a list to pick from. Clears like a panel.
+async function expiringReply(env, msg, html, replyMarkup = OK_MARKUP) {
+  const delivery = await privateReply(env, msg, html, replyMarkup);
+  await expirePanel(env, msg.chat.id, msg.from.id, delivery);
+  return delivery;
+}
+
 // Reads the same to the debtor and about them. A balance is only ever one of
 // three things, and saying which is what closes the loop a /debt entry opens:
 // the amount moved means little without where it left the person.
@@ -914,10 +942,10 @@ function isPublicMessage(msg) {
 async function clearSentMessage(env, msg, kind = 'booking message') {
   const deleted = await deleteMessage(env, msg.chat.id, msg.message_id);
   if (deleted.ok) return;
-  await sendMessage(env, msg.chat.id,
+  await sendCommandNote(env, msg,
     `⚠️ Your ${kind} is still in the group — I need the ` +
     '<b>Delete Messages</b> admin right to clear it.',
-    { receiverUserId: msg.from.id, replyMarkup: OK_MARKUP });
+    { replyToEphemeral: null });
 }
 
 // Every update is a sighting: the person behind it is in the group right now,
@@ -1100,14 +1128,9 @@ async function dispatchUpdate(env, update, identities = null) {
     // like a broken bot.
     if (!knownCommands.has(command)) {
       if (mention) return;
-      await sendMessage(env, msg.chat.id,
+      await sendCommandNote(env, msg,
         `I don't know <code>/${escapeHtml(command)}</code>. ` +
-        'Try /book, /courts, /tab, /cancel, or /help.',
-        {
-          receiverUserId: msg.from.id,
-          replyToEphemeral: msg.ephemeral_message_id || null,
-          replyMarkup: OK_MARKUP,
-        });
+        'Try /book, /courts, /tab, /cancel, or /help.');
       return;
     }
     // Only a public copy can be cleared. A command Telegram delivered
@@ -1127,11 +1150,7 @@ async function dispatchUpdate(env, update, identities = null) {
       const [replyMarkup] = await Promise.all([
         helpBoardMarkup(env, msg.chat.id), clearCommand,
       ]);
-      await sendMessage(env, msg.chat.id, helpHtml(env, msg.chat.id), {
-        receiverUserId: msg.from.id,
-        replyToEphemeral: msg.ephemeral_message_id || null,
-        replyMarkup,
-      });
+      await sendCommandNote(env, msg, helpHtml(env, msg.chat.id), { replyMarkup });
       return;
     }
     if (command === 'book') {
@@ -1155,13 +1174,9 @@ async function dispatchUpdate(env, update, identities = null) {
       const [pinned] = await Promise.all([
         updateBoard(env, msg.chat.id), clearCommand,
       ]);
-      await sendMessage(env, msg.chat.id,
+      await sendCommandNote(env, msg,
         pinned ? '🎾 Board refreshed — it is the pinned message.'
-          : '🎾 Nothing is booked right now, so there is no board. It returns with the next booking.', {
-          receiverUserId: msg.from.id,
-          replyToEphemeral: msg.ephemeral_message_id || null,
-          replyMarkup: OK_MARKUP,
-        });
+          : '🎾 Nothing is booked right now, so there is no board. It returns with the next booking.');
       return;
     }
     if (command === 'tab') {
@@ -1169,12 +1184,7 @@ async function dispatchUpdate(env, update, identities = null) {
         updateTab(env, msg.chat.id), clearCommand,
       ]);
       if (pinned) {
-        await sendMessage(env, msg.chat.id,
-          '💰 Tab refreshed — it is the pinned message.', {
-            receiverUserId: msg.from.id,
-            replyToEphemeral: msg.ephemeral_message_id || null,
-            replyMarkup: OK_MARKUP,
-          });
+        await sendCommandNote(env, msg, '💰 Tab refreshed — it is the pinned message.');
         return;
       }
       // With everyone settled there is no pinned tab and so no 🧾 button —
@@ -1200,14 +1210,14 @@ async function dispatchUpdate(env, update, identities = null) {
         isChatAdmin(env, msg.chat.id, msg.from), clearCommand,
       ]);
       if (!admin) {
-        await privateReply(env, msg, 'Only group admins can change what someone owes.');
+        await expiringReply(env, msg, 'Only group admins can change what someone owes.');
         return;
       }
       // The Undo button on a confirmation is gone once it is dismissed, so
       // this is the way back to an entry noticed late.
       if (/^undo$/i.test(args.trim())) {
         const recent = await recentAdjustments(env, msg.chat.id);
-        await privateReply(env, msg, recent.length
+        await expiringReply(env, msg, recent.length
           ? '↩️ <b>Undo a /debt entry</b>\n\nTap the one made by mistake. It comes off '
             + 'their tab as though it was never written, and they are told.'
           : 'There is no /debt entry from the last 7 days to undo.',
@@ -1222,13 +1232,13 @@ async function dispatchUpdate(env, update, identities = null) {
       }
       const parsed = parseDebtAdjustment(args);
       if (parsed.error) {
-        await privateReply(env, msg, DEBT_ERRORS[parsed.error]);
+        await expiringReply(env, msg, DEBT_ERRORS[parsed.error]);
         return;
       }
       const matched = matchAccount(await knownPlayers(env, msg.chat.id), parsed.target);
       if (matched.error) {
         const who = `<b>${escapeHtml(parsed.target)}</b>`;
-        await privateReply(env, msg, matched.error === 'ambiguous'
+        await expiringReply(env, msg, matched.error === 'ambiguous'
           ? `More than one player answers to ${who} — name them by @handle.`
           : `I don't know ${who}. Only somebody already on a court or on the tab `
             + 'can be charged, so that a typo never opens an account of its own.');
@@ -1238,7 +1248,7 @@ async function dispatchUpdate(env, update, identities = null) {
       // free: none of them has a tab, and a row for one would put the
       // organiser on their own tab as a debtor.
       if (isHouseholdPlayer(env, matched.player)) {
-        await privateReply(env, msg,
+        await expiringReply(env, msg,
           `<b>${escapeHtml(matched.player.name)}</b> plays for free and is never on the tab.`);
         return;
       }
@@ -1258,12 +1268,8 @@ async function dispatchUpdate(env, update, identities = null) {
     }
     if (command === 'cancel') {
       if (!/^\d+$/.test(args)) {
-        await Promise.all([clearCommand, sendMessage(env, msg.chat.id,
-          'Use <code>/cancel ID</code>, for example <code>/cancel 3</code>.', {
-            receiverUserId: msg.from.id,
-            replyToEphemeral: msg.ephemeral_message_id || null,
-            replyMarkup: OK_MARKUP,
-          })]);
+        await Promise.all([clearCommand, sendCommandNote(env, msg,
+          'Use <code>/cancel ID</code>, for example <code>/cancel 3</code>.')]);
         return;
       }
       // The reply goes out before the roster's notices and the board.
@@ -1297,14 +1303,10 @@ async function dispatchUpdate(env, update, identities = null) {
     // carry SQL, ids, or configuration. The wizard sends its own wording for
     // anything the person can actually act on before it throws.
     console.log(`Update failed: ${error.stack || error}`);
-    await sendMessage(env, msg.chat.id,
+    await sendCommandNote(env, msg,
       ((error && error.userMessage) || '⚠️ Something went wrong. Please try again.')
       // Their message was deleted before this failed, so it only exists here.
-      + (clearedText ? `\n\n<code>${escapeHtml(clearedText)}</code>` : ''), {
-        receiverUserId: msg.from.id,
-        replyToEphemeral: msg.ephemeral_message_id || null,
-        replyMarkup: OK_MARKUP,
-      });
+      + (clearedText ? `\n\n<code>${escapeHtml(clearedText)}</code>` : ''));
   }
 }
 

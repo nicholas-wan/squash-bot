@@ -270,7 +270,9 @@ day. Reminders clear themselves when the court ends, and receipts at the end
 of the day they are about. Telegram only guarantees a private message's
 deletion to a phone that is online at that moment, and court end reaches far
 more people than midnight did. Panels — the court list, Manage, a 🧾 tab breakdown — are working
-surfaces rather than records, so each clears itself a day after it opens.
+surfaces rather than records, so each clears itself a day after it opens. So
+do a command's status and error notes, such as "Board refreshed" or a usage
+line.
 Telegram does not guarantee ephemeral delivery when the recipient is
 offline; if it refuses, the private copy is deleted and the whole roster is
 reminded once in the group rather than one public post per player. Refusal is

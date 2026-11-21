@@ -1,10 +1,11 @@
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
-import { afterEach, beforeEach, expect, it, onTestFinished, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { NO_COURTS_HTML, syncAnnouncements } from '../src/announcements.js';
 import { addBooking, runMaintenance, updateBoard } from '../src/bookings.js';
 import { sendPrivateNote } from '../src/tab.js';
 import { handleBookingCallback } from '../src/wizard.js';
+import { handleUpdate } from '../src/index.js';
 
 let db, env, requests, failure, failWrite;
 const now = Date.UTC(2026, 8, 10);
@@ -551,6 +552,55 @@ it('takes down a typed-field prompt that came back public', async () => {
   expect(requests.find(r => r.method === 'answerCallbackQuery').text).toBe('Could not open the input box.');
   expect(db.prepare('SELECT pending_field, reply_prompt_message_id AS id FROM booking_drafts WHERE id = 9').get())
     .toEqual({ pending_field: null, id: null });
+});
+
+describe('command notes', () => {
+  let nextEphemeral;
+  const say = (text, ephemeral = false) => handleUpdate(env, { message: {
+    message_id: ephemeral ? 0 : 500,
+    ...(ephemeral ? { ephemeral_message_id: 44 } : {}),
+    chat: { id: -123, type: 'supergroup' },
+    from: { id: 7, first_name: 'Player', username: 'player' },
+    text,
+  } });
+  const notes = () => db.prepare(
+    'SELECT message_id, is_ephemeral, receiver_user_id, delete_after - created_at AS life FROM sent_messages ORDER BY id'
+  ).all();
+  beforeEach(() => {
+    nextEphemeral = 900;
+    vi.mocked(fetch).mockImplementation(async (url, init) => {
+      const method = String(url).split('/').at(-1);
+      const body = JSON.parse(init.body);
+      requests.push({ method, ...body });
+      const result = method === 'getChatMember' ? { status: 'member' }
+        : method === 'sendMessage' && body.ephemeral_message_parameters
+          ? { message_id: 0, ephemeral_message_id: nextEphemeral++ }
+          : { message_id: requests.length + 100 };
+      return new Response(JSON.stringify({ ok: true, result }), { headers: { 'Content-Type': 'application/json' } });
+    });
+  });
+
+  it.each(['/courts', '/tab', '/help', '/nonsense', '/cancel'])('%s clears itself a day later', async (command) => {
+    await say(command, true);
+    expect(notes()).toEqual([{ message_id: 900, is_ephemeral: 1, receiver_user_id: 7, life: DAY }]);
+  });
+
+  it('keeps a /cancel result, which is a receipt', async () => {
+    await say('/cancel 99', true);
+    expect(requests.find(r => r.method === 'sendMessage').text).toContain("couldn't find");
+    expect(notes()).toEqual([]);
+  });
+
+  it('clears a note Telegram delivered publicly, in the public id space', async () => {
+    vi.mocked(fetch).mockImplementation(async (url, init) => {
+      const method = String(url).split('/').at(-1);
+      requests.push({ method, ...JSON.parse(init.body) });
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 321 } }),
+        { headers: { 'Content-Type': 'application/json' } });
+    });
+    await say('/nonsense', true);
+    expect(notes()).toEqual([{ message_id: 321, is_ephemeral: 0, receiver_user_id: null, life: DAY }]);
+  });
 });
 
 it('puts a private note on the sweep when its public copy will not delete yet', async () => {
