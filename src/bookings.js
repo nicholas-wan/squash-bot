@@ -718,10 +718,11 @@ async function drawBoard(env, chatId, now) {
     // board, and a failed board still lets the announcement move on.
     const setting = board.settings ? board.settings[index] : undefined;
     let outcome;
+    let replyMarkup = null;
     try {
+      replyMarkup = board.html ? boardButtons(env, chat, board.bookings) : null;
       const id = await updatePinnedMessage(
-        env, chat, 'board_message_id', board.html,
-        board.html ? boardButtons(env, chat, board.bookings) : null, 'court board',
+        env, chat, 'board_message_id', board.html, replyMarkup, 'court board',
         setting === undefined ? {} : { existing: setting }
       );
       outcome = { chat, id };
@@ -735,7 +736,9 @@ async function drawBoard(env, chatId, now) {
       board_message_id: outcome.error ? setting?.board_message_id ?? null : outcome.id,
       tab_message_id: setting?.tab_message_id ?? null,
     };
-    try { await syncAnnouncements(env, chat, now, { pinned: known }); }
+    const drawn = board.html && !outcome.error
+      ? { column: 'board_message_id', html: board.html, replyMarkup } : undefined;
+    try { await syncAnnouncements(env, chat, now, { pinned: known, drawn }); }
     catch (error) { console.log(`Announcement refresh failed: ${error.message || error}`); }
     return outcome;
   }));
@@ -1302,6 +1305,14 @@ function endOfLocalDay(epochMs, tz) {
   );
 }
 
+// A court's reminder has done its job once the court ends. Telegram only tells
+// a phone about a private message's deletion if it is online at that moment,
+// so a midnight delete missed everyone asleep and their reminder stayed on
+// screen. Court end is when people are far more likely to have Telegram open.
+function reminderExpiry(booking, tz) {
+  return Math.min(booking.ends_at, endOfLocalDay(booking.starts_at, tz));
+}
+
 function cleanupStatement(env, chatId, sent, receiverUserId, deleteAfter) {
   const messageId = sent.ephemeral_message_id || sent.message_id;
   if (!messageId) return null;
@@ -1368,7 +1379,12 @@ async function sendPrivately(env, chatId, html, userId, deleteAfter, options = {
     return 'private';
   }
   if (sent.result && sent.result.message_id) {
-    await deleteMessage(env, chatId, sent.result.message_id);
+    // A public copy whose delete failed had no record, so it stayed for good.
+    // It goes on the sweep, which keeps trying.
+    const removed = await deleteMessage(env, chatId, sent.result.message_id);
+    if (!removed.ok && !ALREADY_DELETED.test(String(removed.description || ''))) {
+      await scheduleCleanup(env, chatId, sent.result, null, Date.now());
+    }
   }
   return 'not-ephemeral';
 }
@@ -1383,9 +1399,7 @@ async function remindPublicly(env, booking, roster, headline, tz) {
   const sent = await sendMessage(env, chatId,
     reminderHtml(booking, roster, headline, tz), { silent: true });
   if (sent.ok && sent.result) {
-    await scheduleCleanup(
-      env, chatId, sent.result, null, endOfLocalDay(booking.starts_at, tz)
-    );
+    await scheduleCleanup(env, chatId, sent.result, null, reminderExpiry(booking, tz));
   }
   return sent.ok;
 }
@@ -1442,6 +1456,11 @@ async function purgeFinishedMessages(env, now) {
           : await deleteMessage(env, row.chat_id, row.message_id);
         const deleted = outcome.ok
           || ALREADY_DELETED.test(String(outcome.description || ''));
+        // Dropped either way, but a message that is still in the chat should
+        // leave a trace for whoever asks why it was never cleared.
+        if (!outcome.ok && /can.t be deleted/i.test(String(outcome.description || ''))) {
+          console.log(`Telegram refused to delete ${row.chat_id}/${row.message_id}; it stays in the chat`);
+        }
         if (deleted || row.delete_after <= now - PURGE_GIVE_UP_MS) gone.push(row.id);
         else failures += 1;
       } catch (error) {
@@ -1560,7 +1579,7 @@ async function remindClaimed(env, rows, taken, roster, zones, column, headline) 
     const tz = zoneOf(row);
     const chatId = reachableChat(env, { chat_id: row.player_chat_id }, row.chat_id);
     return sendPrivately(env, chatId, reminderHtml(row, roster, headline, tz), row.player_user_id,
-      endOfLocalDay(row.starts_at, tz), { replyMarkup: OK_MARKUP, cleanups });
+      reminderExpiry(row, tz), { replyMarkup: OK_MARKUP, cleanups });
   }).catch((error) => {
     console.log(`${column} reminder for player ${row.player_row_id} failed: ${error.stack || error}`);
     return 'failed';
@@ -1678,7 +1697,7 @@ async function remindRosterlessBookings(env, now, column, headline) {
       const html = reminderHtml(booking, roster, headline, tz);
       const outcome = await sendPrivately(
         env, booking.chat_id, html, booking.created_by_user_id,
-        endOfLocalDay(booking.starts_at, tz), { replyMarkup: OK_MARKUP }
+        reminderExpiry(booking, tz), { replyMarkup: OK_MARKUP }
       );
       if (outcome === 'not-ephemeral') {
         if (!(await remindPublicly(env, booking, roster, headline, tz))) {

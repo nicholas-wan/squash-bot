@@ -2,8 +2,11 @@ import { compactTimeRange, courtName, formatCountdown, playerTags } from './form
 import { allowedChats, dataChatId } from './scope.js';
 import { DEFAULT_CAPACITY, rosterFor } from './players.js';
 import { miniAppLink } from './miniapp-link.js';
+import { queuePinnedRefresh } from './refresh-queue.js';
 import { getTimezone, pinnedIds } from './settings.js';
-import { deleteMessage, editMessage, escapeHtml, sendMessage } from './telegram.js';
+import {
+  deleteMessage, editMessage, escapeHtml, pinMessage, sendMessage, unpinMessage,
+} from './telegram.js';
 
 // One silent message per group, always about the earliest upcoming court with a
 // free slot. Slot counts and edits to that court change the message in place;
@@ -35,6 +38,61 @@ async function closeAnnouncement(env, chatId, messageId, text) {
   if (closed.ok || /message is not modified/i.test(closed.description || '')) return true;
   if (/message to edit not found/i.test(closed.description || '')) return false;
   throw new Error(closed.description || 'Announcement retirement failed');
+}
+
+// Telegram cannot move a message, and past 48 hours it may refuse to delete
+// one, which used to leave the announcement stranded above a newer board for
+// good. Editing has no such limit, so the two trade jobs instead: the older
+// message becomes the pinned one and the newest becomes the announcement.
+// Answers the id the announcement now lives in, or null if nothing changed.
+// `drawn` is the pinned message's content when the caller has it in hand;
+// otherwise a queued refresh redraws it.
+async function swapWithNewestPinned(env, chatId, noticeId, pinned, drawn) {
+  const column = (Number(pinned?.tab_message_id) || 0) > (Number(pinned?.board_message_id) || 0)
+    ? 'tab_message_id' : 'board_message_id';
+  const newestId = Number(pinned[column]);
+  const pin = await pinMessage(env, chatId, noticeId);
+  if (!pin.ok) {
+    console.log(`Could not pin ${chatId}/${noticeId} to reorder: ${pin.description || 'unknown error'}`);
+    return null;
+  }
+  try {
+    // The second write depends on the first, so a board replaced in the
+    // meantime leaves both rows as they were.
+    const writes = [
+      env.DB.prepare(`UPDATE settings SET ${column} = ? WHERE chat_id = ? AND ${column} = ?`)
+        .bind(noticeId, chatId, newestId),
+      env.DB.prepare(`UPDATE availability_notices SET message_id = ?, html = NULL, booking_id = NULL
+        WHERE chat_id = ? AND message_id = ?
+          AND EXISTS (SELECT 1 FROM settings WHERE chat_id = ? AND ${column} = ?)`)
+        .bind(newestId, chatId, noticeId, chatId, noticeId),
+    ];
+    const [moved] = typeof env.DB.batch === 'function'
+      ? await env.DB.batch(writes)
+      : [await writes[0].run(), await writes[1].run()];
+    if (!moved?.meta?.changes) {
+      await unpinMessage(env, chatId, noticeId);
+      return null;
+    }
+  } catch (error) {
+    await unpinMessage(env, chatId, noticeId);
+    throw error;
+  }
+  const unpinned = await unpinMessage(env, chatId, newestId);
+  if (!unpinned.ok) {
+    console.log(`Could not unpin ${chatId}/${newestId} after reorder: ${unpinned.description || 'unknown error'}`);
+  }
+  const redrawn = drawn?.column === column
+    ? await editMessage(env, chatId, noticeId, drawn.html, drawn.replyMarkup)
+    : null;
+  if (!redrawn?.ok) {
+    try {
+      await queuePinnedRefresh(env, chatId, column === 'board_message_id' ? 'board' : 'tab');
+    } catch (error) {
+      console.log(`Could not queue redraw after reorder in ${chatId}: ${error.message || error}`);
+    }
+  }
+  return newestId;
 }
 
 // The court and its roster are read together: the roster query finds the
@@ -70,7 +128,8 @@ async function nextOpenBooking(env, chatId, now) {
 }
 
 // `known.pinned` is the chat's pinned ids when the caller has them already, as
-// a board redraw does.
+// a board redraw does. `known.drawn` is the { column, html, replyMarkup } that
+// caller just drew, so a reorder can put it straight into its new message.
 export async function syncAnnouncements(env, chatId, now = Date.now(), known = {}) {
   // Serialize webhook/cron sends for this chat. Expiry recovers a dead worker.
   // One round trip creates the row if need be, claims the lease, and reads the
@@ -113,7 +172,8 @@ export async function syncAnnouncements(env, chatId, now = Date.now(), known = {
       // started, was cancelled, or was overtaken by a nearer booking, the
       // message goes so that a fresh one can land at the bottom of the chat.
       // A message Telegram will not delete is kept and rewritten in place
-      // instead: one long-lived message beats a trail of retired ones.
+      // instead: one long-lived message beats a trail of retired ones. If it
+      // is also above a pinned message, the two swap jobs to restore the order.
       const deleted = await deleteAnnouncement(env, chatId, current.message_id);
       if (deleted) {
         await env.DB.prepare(`UPDATE availability_notices
@@ -121,6 +181,13 @@ export async function syncAnnouncements(env, chatId, now = Date.now(), known = {
         current.message_id = null;
         current.html = null;
         current.booking_id = null;
+      } else if (buried) {
+        const moved = await swapWithNewestPinned(env, chatId, current.message_id, pinned, known.drawn);
+        if (moved) {
+          current.message_id = moved;
+          current.html = null;
+          current.booking_id = null;
+        }
       }
     }
     if (!next) {

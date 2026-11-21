@@ -402,8 +402,9 @@ async function drawTab(env, chatId) {
   const outcomes = await Promise.all(chats.map(async (chat, index) => {
     const setting = settings[index];
     let outcome;
+    let markup = null;
     try {
-      const markup = html ? tabMarkup(balances, miniAppLink(env, chat, 'tab')) : null;
+      markup = html ? tabMarkup(balances, miniAppLink(env, chat, 'tab')) : null;
       const id = await updatePinnedMessage(env, chat, 'tab_message_id', html, markup, 'squash tab',
         setting === undefined ? {} : { existing: setting });
       outcome = { chat, id };
@@ -419,6 +420,7 @@ async function drawTab(env, chatId) {
       try {
         await syncAnnouncements(env, chat, Date.now(), {
           pinned: { board_message_id: setting?.board_message_id ?? null, tab_message_id: outcome.id },
+          drawn: { column: 'tab_message_id', html, replyMarkup: markup },
         });
       } catch (error) { console.log(`Announcement refresh failed: ${error.message || error}`); }
     }

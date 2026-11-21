@@ -390,14 +390,113 @@ it('moves an announcement buried under a freshly posted board back to the bottom
   expect(requests.length).toBe(settled);
 });
 
-it('keeps a buried announcement in place when Telegram will not delete it', async () => {
+const pinnedRow = () => db.prepare(
+  'SELECT board_message_id, tab_message_id FROM settings WHERE chat_id = -123'
+).get();
+
+it('swaps jobs with the board when a buried announcement cannot be deleted', async () => {
+  seat(1);
+  await syncAnnouncements(env, -123, now);
+  // The live shape: tab oldest, then the stuck announcement, then a newer board.
+  db.prepare(`INSERT INTO settings (chat_id, board_message_id, tab_message_id)
+    VALUES (-123, 150, 17)`).run();
+  failure = undeletable;
+  requests = [];
+  await updateBoard(env, -123, now);
+  // The board's edit of 150 comes first, then the swap.
+  const swap = requests.slice(1);
+  expect(swap.map(r => [r.method, r.message_id])).toEqual([
+    ['deleteMessage', 101],
+    ['pinChatMessage', 101],
+    ['unpinChatMessage', 150],
+    ['editMessageText', 101],
+    ['editMessageText', 150],
+  ]);
+  expect(swap[3].text).toContain('Court schedule');
+  expect(swap[4].text).toContain('left on Court');
+  expect(pinnedRow()).toEqual({ board_message_id: 101, tab_message_id: 17 });
+  expect(notice().message_id).toBe(150);
+  expect(notice().booking_id).toBe(1);
+  expect(db.prepare('SELECT count(*) AS n FROM pending_refreshes').get().n).toBe(0);
+  // In order now: the next sync has nothing to do.
+  requests = [];
+  await syncAnnouncements(env, -123, now);
+  expect(requests).toEqual([]);
+});
+
+it('queues a redraw when maintenance swaps a message it did not draw', async () => {
+  seat(1);
+  await syncAnnouncements(env, -123, now);
+  db.prepare('INSERT INTO settings (chat_id, board_message_id, tab_message_id) VALUES (-123, 120, 150)').run();
+  failure = undeletable;
+  expect(await syncAnnouncements(env, -123, now)).toBe(0);
+  // The newest pinned message is the one traded, whichever it is.
+  expect(pinnedRow()).toEqual({ board_message_id: 120, tab_message_id: 101 });
+  expect(notice().message_id).toBe(150);
+  expect(db.prepare('SELECT board, tab FROM pending_refreshes WHERE chat_id = -123').get())
+    .toEqual({ board: 0, tab: 1 });
+});
+
+it('leaves everything in place when the swap cannot pin', async () => {
   seat(1);
   await syncAnnouncements(env, -123, now);
   db.prepare('INSERT INTO settings (chat_id, board_message_id) VALUES (-123, 150)').run();
-  failure = method => method === 'deleteMessage'
-    ? { ok: false, description: "Bad Request: message can't be deleted" } : null;
+  failure = method => undeletable(method)
+    || (method === 'pinChatMessage' ? { ok: false, description: 'Bad Request: not enough rights' } : null);
   requests = [];
   expect(await syncAnnouncements(env, -123, now)).toBe(0);
-  expect(requests.map(r => r.method)).toEqual(['deleteMessage']);
+  expect(requests.map(r => r.method)).toEqual(['deleteMessage', 'pinChatMessage']);
   expect(notice().message_id).toBe(101);
+  expect(pinnedRow().board_message_id).toBe(150);
+});
+
+it('takes the pin back when the swap cannot be saved', async () => {
+  seat(1);
+  await syncAnnouncements(env, -123, now);
+  db.prepare('INSERT INTO settings (chat_id, board_message_id) VALUES (-123, 150)').run();
+  failure = undeletable;
+  failWrite = sql => sql.startsWith('UPDATE settings');
+  requests = [];
+  expect(await syncAnnouncements(env, -123, now)).toBe(1);
+  expect(requests.map(r => [r.method, r.message_id])).toEqual([
+    ['deleteMessage', 101], ['pinChatMessage', 101], ['unpinChatMessage', 101],
+  ]);
+  expect(notice().message_id).toBe(101);
+  expect(pinnedRow().board_message_id).toBe(150);
+});
+
+it('clears a court reminder when the court ends, and retries a public copy it could not delete', async () => {
+  const startsAt = now + 3600000;
+  db.prepare('DELETE FROM bookings').run();
+  book(2, startsAt);
+  db.prepare(`INSERT INTO booking_players
+    (booking_id, chat_id, user_id, slug, name, heads, created_at)
+    VALUES (2, -123, 7, 'u7', 'Player', 1, ?)`).run(now - 1);
+  vi.mocked(fetch).mockImplementation(async (url, init) => {
+    const method = String(url).split('/').at(-1);
+    const body = JSON.parse(init.body);
+    requests.push({ method, ...body });
+    const result = method === 'sendMessage' && body.receiver_user_id
+      ? { ok: true, result: { ephemeral_message_id: 900 } }
+      : { ok: true, result: { message_id: requests.length + 100 } };
+    return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });
+  });
+  await runMaintenance(env, now);
+  const row = db.prepare('SELECT * FROM sent_messages WHERE message_id = 900').get();
+  expect(row.delete_after).toBe(startsAt + 3600000);
+
+  db.prepare('DELETE FROM sent_messages').run();
+  db.prepare('UPDATE booking_players SET reminder_sent = 0, pre_reminder_sent = 0').run();
+  vi.mocked(fetch).mockImplementation(async (url, init) => {
+    const method = String(url).split('/').at(-1);
+    requests.push({ method, ...JSON.parse(init.body) });
+    const result = method === 'deleteMessage'
+      ? { ok: false, error_code: 500, description: 'Internal Server Error' }
+      : { ok: true, result: { message_id: 777 } };
+    return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });
+  });
+  await runMaintenance(env, now);
+  // The private send fell back to a public copy (777) that would not delete.
+  expect(db.prepare('SELECT count(*) AS n FROM sent_messages WHERE message_id = 777 AND is_ephemeral = 0')
+    .get().n).toBeGreaterThan(0);
 });

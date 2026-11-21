@@ -58,7 +58,10 @@ is deleted as it arrives; pins made by people are left alone. A message Telegram
 48 hours in a group where the bot lacks the Delete Messages right — is kept and
 rewritten in place for the next court instead, or, when no court is open,
 rewritten to say "No courts available", with no button, rather than naming
-the court it last announced. The chat therefore never collects a trail of
+the court it last announced. If that kept message has a newer board or tab
+below it, the two swap jobs, since editing has no age limit: the older message
+is pinned and redrawn as the board or tab, and the newer one is unpinned and
+becomes the announcement. The chat therefore never collects a trail of
 retired announcements, and the bot never posts a line that only points at the
 board. A batch of new bookings therefore produces one message
 for the nearest of them, not one each, and a court further out is never
@@ -263,8 +266,10 @@ announcement shows the court, time, free slots and who is on it already, so
 "should I join" is answerable from the message; it does not name the booker.
 
 Each player is reminded two hours before their court and again at 10am on the
-day. Reminders and receipts clear themselves at the end of the day they are
-about. Panels — the court list, Manage, a 🧾 tab breakdown — are working
+day. Reminders clear themselves when the court ends, and receipts at the end
+of the day they are about. Telegram only guarantees a private message's
+deletion to a phone that is online at that moment, and court end reaches far
+more people than midnight did. Panels — the court list, Manage, a 🧾 tab breakdown — are working
 surfaces rather than records, so each clears itself a day after it opens.
 Telegram does not guarantee ephemeral delivery when the recipient is
 offline; if it refuses, the private copy is deleted and the whole roster is
