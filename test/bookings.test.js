@@ -84,7 +84,7 @@ describe('public booking announcements', () => {
     expect(sent[0].body.text).toContain('Court 4 booked');
     expect(sent[0].body.text).toContain('👥 <a href="tg://user?id=7">Nick</a> · 2 slots');
     // Visible only to whoever booked it, and dismissable.
-    expect(sent[0].body.receiver_user_id).toBe(7);
+    expect(sent[0].body.ephemeral_message_parameters?.receiver_user_id).toBe(7);
     expect(sent[0].body.reply_markup.inline_keyboard[0][0])
       .toEqual({ text: '👍 OK', callback_data: 'sb:ok' });
   });
@@ -309,7 +309,7 @@ describe('public booking announcements', () => {
     expect(result.status).toBe('cancelled');
     const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
     // Alice may already hold her morning reminder; the actor has their own toast.
-    expect(sent.map((request) => request.body.receiver_user_id)).toEqual([9]);
+    expect(sent.map((request) => request.body.ephemeral_message_parameters?.receiver_user_id)).toEqual([9]);
     expect(sent[0].body.text).toContain('Cancelled');
     expect(sent[0].body.text).toContain('Court 4');
     expect(sent[0].body.text).toContain('Nick');
@@ -332,7 +332,7 @@ describe('public booking announcements', () => {
     );
     expect(saved).toBe(true);
     const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
-    expect(sent.map((request) => request.body.receiver_user_id)).toEqual([9]);
+    expect(sent.map((request) => request.body.ephemeral_message_parameters?.receiver_user_id)).toEqual([9]);
     // Old details ride along so the change reads as a change.
     expect(sent[0].body.text).toContain('Now: Court 5');
     expect(sent[0].body.text).toContain('Was: Court 4');
@@ -515,7 +515,7 @@ describe('public booking announcements', () => {
     );
     const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
     // The joiner's confirmation first, then Nick once; @bo has no id to send to.
-    expect(sent.map((request) => request.body.receiver_user_id)).toEqual([11, 7]);
+    expect(sent.map((request) => request.body.ephemeral_message_parameters?.receiver_user_id)).toEqual([11, 7]);
     // Every one of them into the chat the tap came from. An ephemeral message
     // is only visible there, and these rows were created in the other group.
     expect(sent.every((request) => request.body.chat_id === -123)).toBe(true);
@@ -593,7 +593,7 @@ describe('public booking announcements', () => {
     );
     const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
     // The leaver first, then the one player left who has an id to send to.
-    expect(sent.map((request) => request.body.receiver_user_id)).toEqual([11, 7]);
+    expect(sent.map((request) => request.body.ephemeral_message_parameters?.receiver_user_id)).toEqual([11, 7]);
     expect(sent.every((request) => request.body.chat_id === -123)).toBe(true);
     expect(sent[0].body.text).toContain('You are off');
     expect(sent[0].body.reply_markup.inline_keyboard[0][0].text).toBe('👍 OK');
@@ -851,7 +851,7 @@ describe('public booking announcements', () => {
     expect(reminders).toHaveLength(2);
     // Posted in the group chat, but addressed to one player each.
     expect(reminders.every((request) => request.body.chat_id === -123)).toBe(true);
-    expect(reminders.map((request) => request.body.receiver_user_id)).toEqual([7, 9]);
+    expect(reminders.map((request) => request.body.ephemeral_message_parameters?.receiver_user_id)).toEqual([7, 9]);
     for (const reminder of reminders) {
       expect(reminder.body.text).toContain('Squash in 2 hours!');
       expect(reminder.body.text).toContain('Court 4');
@@ -1028,10 +1028,10 @@ describe('public booking announcements', () => {
     const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
     const deleted = requests.filter((request) => request.url.endsWith('/deleteMessage'));
     expect(sent).toHaveLength(2);
-    expect(sent[0].body.receiver_user_id).toBe(7);
+    expect(sent[0].body.ephemeral_message_parameters?.receiver_user_id).toBe(7);
     expect(deleted).toHaveLength(1);
     expect(deleted[0].body.message_id).toBe(77);
-    expect(sent[1].body).not.toHaveProperty('receiver_user_id');
+    expect(sent[1].body).not.toHaveProperty('ephemeral_message_parameters');
     expect(sent[1].body.text).toContain('tg://user?id=7');
     expect(sent[1].body.text).toContain('tg://user?id=9');
   });
@@ -1231,7 +1231,7 @@ describe('public booking announcements', () => {
     expect(sent).toHaveLength(1);
     // Into the chat they were last seated from, not the storage key.
     expect(sent[0].body.chat_id).toBe(-123);
-    expect(sent[0].body.receiver_user_id).toBe(9);
+    expect(sent[0].body.ephemeral_message_parameters?.receiver_user_id).toBe(9);
     expect(sent[0].body.text).toContain('• Court 4 · 15 Aug — $24.00');
     const settled = db.seen
       .filter((query) => query.sql.includes('SET status = ?'))
@@ -1532,7 +1532,7 @@ describe('public booking announcements', () => {
     expect(sent).toHaveLength(1);
     // Into the chat they are in right now, not the storage key.
     expect(sent[0].body.chat_id).toBe(-123);
-    expect(sent[0].body.receiver_user_id).toBe(9);
+    expect(sent[0].body.ephemeral_message_parameters?.receiver_user_id).toBe(9);
     expect(sent[0].body.text).toContain('August 2026');
     // The ask carries its own story: the itemised lines, no rate card, no
     // pointer to go tap something else first.

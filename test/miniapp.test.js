@@ -180,8 +180,8 @@ describe('Mini App API', () => {
     const sent = requests.filter((r) => r.url.endsWith('/sendMessage'));
     // Nick, already on it, hears; Sam has the app's own toast instead of a
     // private message nothing was tapped to receive.
-    expect(sent.find((r) => r.body.receiver_user_id === 7).body.text).toContain('joined');
-    expect(sent.some((r) => r.body.receiver_user_id === 8)).toBe(false);
+    expect(sent.find((r) => r.body.ephemeral_message_parameters?.receiver_user_id === 7).body.text).toContain('joined');
+    expect(sent.some((r) => r.body.ephemeral_message_parameters?.receiver_user_id === 8)).toBe(false);
     expect(requests.some((r) => r.url.endsWith('/editMessageText') && r.body.message_id === 55))
       .toBe(true);
   });
@@ -212,7 +212,7 @@ describe('Mini App API', () => {
     expect(body.court.id).toBe(3);
     expect(ran.some((sql) => sql.startsWith('INSERT OR IGNORE INTO booking_players'))).toBe(true);
     // The seated player hears it, and the pinned board is redrawn.
-    expect(requests.some((r) => r.url.endsWith('/sendMessage') && r.body.receiver_user_id === 42))
+    expect(requests.some((r) => r.url.endsWith('/sendMessage') && r.body.ephemeral_message_parameters?.receiver_user_id === 42))
       .toBe(true);
     expect(requests.some((r) => r.url.endsWith('/editMessageText') && r.body.message_id === 55))
       .toBe(true);
@@ -414,7 +414,7 @@ describe('Booking changes from the Mini App', () => {
       const body = JSON.parse(init.body);
       requests.push({ url: String(url), body });
       // Nick (7) is offline: his private copy is refused.
-      const refused = String(url).endsWith('/sendMessage') && body.receiver_user_id === 7;
+      const refused = String(url).endsWith('/sendMessage') && body.ephemeral_message_parameters?.receiver_user_id === 7;
       return new Response(JSON.stringify(refused
         ? { ok: false, description: 'Bad Request: message could not be delivered' }
         : { ok: true, result: { message_id: 1, ephemeral_message_id: 12 } }), {
@@ -425,7 +425,7 @@ describe('Booking changes from the Mini App', () => {
       apiRequest('court/3/delete', await initData(), {}), env(bookingDb(futureBooking()))
     );
     expect((await response.json()).ok).toBe(true);
-    const group = requests.find((r) => r.url.endsWith('/sendMessage') && !r.body.receiver_user_id);
+    const group = requests.find((r) => r.url.endsWith('/sendMessage') && !r.body.ephemeral_message_parameters?.receiver_user_id);
     expect(group.body.text).toContain('Cancelled');
     expect(group.body.text).toContain('tg://user?id=7');
     expect(group.body.disable_notification).toBe(true);
@@ -451,7 +451,7 @@ describe('Settling the tab', () => {
     // The pinned tab's keyboard is everyone's; it is left alone.
     expect(requests.some((r) => r.url.endsWith('/editMessageReplyMarkup'))).toBe(false);
     const panel = requests.find((r) => r.url.endsWith('/sendMessage'));
-    expect(panel.body.receiver_user_id).toBe(9);
+    expect(panel.body.ephemeral_message_parameters?.receiver_user_id).toBe(9);
     expect(panel.body.text).toContain('Settle the tab');
   });
 });

@@ -74,7 +74,7 @@ describe('Telegram commands', () => {
     });
     const send = requests.find((request) => request.url.endsWith('/sendMessage'));
     expect(send.body.text).toContain('<b>SquashBot</b>');
-    expect(send.body.receiver_user_id).toBe(7);
+    expect(send.body.ephemeral_message_parameters?.receiver_user_id).toBe(7);
     const removed = requests.find((request) => request.url.endsWith('/deleteMessage'));
     expect(removed.body.message_id).toBe(5);
   });
@@ -115,7 +115,7 @@ describe('Telegram commands', () => {
     });
     const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
     // Their own answer first; the notice rides behind it, to them alone.
-    expect(sent.map((request) => request.body.receiver_user_id)).toEqual([7, 7]);
+    expect(sent.map((request) => request.body.ephemeral_message_parameters?.receiver_user_id)).toEqual([7, 7]);
     expect(sent[0].body.text).toContain('<b>SquashBot</b>');
     expect(sent[1].body.text).toContain('Your squash tab');
     expect(sent[1].body.text).toContain('$24.00');
@@ -142,7 +142,7 @@ describe('Telegram commands', () => {
     const send = requests.find((request) => request.url.endsWith('/sendMessage'));
     expect(send.body.text).toContain('/froots');
     expect(send.body.text).toContain('/courts');
-    expect(send.body.receiver_user_id).toBe(7);
+    expect(send.body.ephemeral_message_parameters?.receiver_user_id).toBe(7);
   });
 
   it('ignores an unknown command aimed at another bot', async () => {
@@ -190,7 +190,7 @@ describe('Telegram commands', () => {
     const send = requests.find((request) => request.url.endsWith('/sendMessage'));
     expect(send.body.text).toContain('Nothing outstanding on the group tab.');
     expect(send.body.text).toContain('Your squash tab');
-    expect(send.body.receiver_user_id).toBe(7);
+    expect(send.body.ephemeral_message_parameters?.receiver_user_id).toBe(7);
   });
 
   it('clears a public command while its response is being prepared', async () => {
@@ -286,7 +286,7 @@ describe('Telegram commands', () => {
     });
     const send = requests
       .filter((request) => request.url.endsWith('/sendMessage'))
-      .find((request) => request.body.receiver_user_id === 7);
+      .find((request) => request.body.ephemeral_message_parameters?.receiver_user_id === 7);
     expect(send.body.text).toContain('Nothing is booked right now');
     expect(send.body.reply_markup.inline_keyboard[0][0].text).toBe('👍 OK');
   });
@@ -314,7 +314,7 @@ describe('Telegram commands', () => {
     expect(requests.some((request) => request.url.endsWith('/editMessageReplyMarkup')))
       .toBe(false);
     const send = requests.find((request) => request.url.endsWith('/sendMessage'));
-    expect(send.body.receiver_user_id).toBe(7);
+    expect(send.body.ephemeral_message_parameters?.receiver_user_id).toBe(7);
     expect(send.body.text).toContain('Manage bookings');
   });
 
@@ -563,7 +563,7 @@ describe('Telegram commands', () => {
     });
     const warning = requests.find((request) => request.url.endsWith('/sendMessage')
       && request.body.text.includes('Delete Messages'));
-    expect(warning.body.receiver_user_id).toBe(7);
+    expect(warning.body.ephemeral_message_parameters?.receiver_user_id).toBe(7);
   });
 
   // The intent gate is loose on purpose — "I booked 2 tickets" matches it — and
@@ -929,7 +929,7 @@ describe('Telegram commands', () => {
     // not depend on finding her in the post-delete roster.
     const told = leaving.requests
       .filter((request) => request.url.endsWith('/sendMessage'))
-      .filter((request) => request.body.receiver_user_id === 11);
+      .filter((request) => request.body.ephemeral_message_parameters?.receiver_user_id === 11);
     expect(told).toHaveLength(1);
     expect(told[0].body.text).toContain('You are off');
   });
@@ -941,7 +941,7 @@ describe('Telegram commands', () => {
       requests.push({ url: String(url), body });
       const result = String(url).endsWith('/getChatMember')
         ? { status: 'creator' }
-        : (String(url).endsWith('/sendMessage') && body.receiver_user_id
+        : (String(url).endsWith('/sendMessage') && body.ephemeral_message_parameters?.receiver_user_id
           ? { ephemeral_message_id: 55 } : { message_id: 55 });
       return new Response(JSON.stringify({ ok: true, result }), {
         headers: { 'Content-Type': 'application/json' },
@@ -988,9 +988,9 @@ describe('Telegram commands', () => {
     const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
     // The seated player is confirmed as if they joined; the court hears who
     // was put on, worded as an admin action.
-    expect(sent.find((request) => request.body.receiver_user_id === 42).body.text)
+    expect(sent.find((request) => request.body.ephemeral_message_parameters?.receiver_user_id === 42).body.text)
       .toContain('You are on');
-    expect(sent.find((request) => request.body.receiver_user_id === 7).body.text)
+    expect(sent.find((request) => request.body.ephemeral_message_parameters?.receiver_user_id === 7).body.text)
       .toContain('was seated on');
     const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
     expect(answer.body.text).toContain('@bo is on this court');
@@ -1046,7 +1046,7 @@ describe('Telegram commands', () => {
       expect(requests.some((r) => r.url.endsWith('/editMessageText'))).toBe(false);
       expect(requests.some((r) => r.url.endsWith('/editMessageReplyMarkup'))).toBe(false);
       const send = requests.find((r) => r.url.endsWith('/sendMessage'));
-      expect(send.body.receiver_user_id).toBe(9);
+      expect(send.body.ephemeral_message_parameters?.receiver_user_id).toBe(9);
       expect(send.body.text).toContain(heading);
       expect(send.body.reply_markup.inline_keyboard.flat().map((b) => b.callback_data))
         .toContain(button);
@@ -1060,7 +1060,7 @@ describe('Telegram commands', () => {
       requests.push({ url: String(url), body });
       const result = String(url).endsWith('/getChatMember')
         ? { status: 'creator' }
-        : (String(url).endsWith('/sendMessage') && body.receiver_user_id
+        : (String(url).endsWith('/sendMessage') && body.ephemeral_message_parameters?.receiver_user_id
           ? { ephemeral_message_id: 55 } : { message_id: 55 });
       return new Response(JSON.stringify({ ok: true, result }), {
         headers: { 'Content-Type': 'application/json' },
@@ -1109,7 +1109,7 @@ describe('Telegram commands', () => {
     const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
     // The rest of the court hears that a friend came with him, and reads the
     // court as full: one name short, but no slots left.
-    const toNick = sent.find((request) => request.body.receiver_user_id === 7).body.text;
+    const toNick = sent.find((request) => request.body.ephemeral_message_parameters?.receiver_user_id === 7).body.text;
     expect(toNick).toContain('<b>@bo</b> (+1) were seated on');
     expect(toNick).toContain('@bo +1');
     expect(toNick).toContain('full');
@@ -1171,7 +1171,7 @@ describe('Telegram commands', () => {
       requests.push({ url: String(url), body });
       const result = String(url).endsWith('/getChatMember')
         ? { status: 'creator' }
-        : (String(url).endsWith('/sendMessage') && body.receiver_user_id
+        : (String(url).endsWith('/sendMessage') && body.ephemeral_message_parameters?.receiver_user_id
           ? { ephemeral_message_id: 55 } : { message_id: 55 });
       return new Response(JSON.stringify({ ok: true, result }), {
         headers: { 'Content-Type': 'application/json' },
@@ -1218,9 +1218,9 @@ describe('Telegram commands', () => {
     });
     expect(ran.some((sql) => sql.includes('SET heads = 2'))).toBe(true);
     const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
-    expect(sent.find((request) => request.body.receiver_user_id === 42).body.text)
+    expect(sent.find((request) => request.body.ephemeral_message_parameters?.receiver_user_id === 42).body.text)
       .toContain('Your +1 is on');
-    expect(sent.find((request) => request.body.receiver_user_id === 7).body.text)
+    expect(sent.find((request) => request.body.ephemeral_message_parameters?.receiver_user_id === 7).body.text)
       .toContain('bringing a friend');
     const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
     expect(answer.body.text).toContain('now brings a +1');
@@ -1280,7 +1280,7 @@ describe('Telegram commands', () => {
     });
     const receipt = requests
       .filter((request) => request.url.endsWith('/sendMessage'))
-      .find((request) => request.body.receiver_user_id === 42);
+      .find((request) => request.body.ephemeral_message_parameters?.receiver_user_id === 42);
     expect(receipt.body.text).toContain('Payment received');
     expect(receipt.body.text).toContain('$14.00');
     expect(receipt.body.reply_markup.inline_keyboard[0][0].text).toBe('👍 OK');
@@ -1342,7 +1342,7 @@ describe('Telegram commands', () => {
       },
     });
     expect(writes).toHaveLength(0);
-    expect(requests.some((request) => request.body.receiver_user_id === 42)).toBe(false);
+    expect(requests.some((request) => request.body.ephemeral_message_parameters?.receiver_user_id === 42)).toBe(false);
     const answer = requests.find((request) => request.url.endsWith('/answerCallbackQuery'));
     expect(answer.body.text).toContain('$20.00');
     expect(answer.body.show_alert).toBe(true);
@@ -1451,7 +1451,7 @@ describe('Telegram commands', () => {
     });
     const send = requests.find((request) => request.url.endsWith('/sendMessage'));
     expect(send.body.text).toBe('Only @nick or a group admin can cancel that booking.');
-    expect(send.body.receiver_user_id).toBe(11);
+    expect(send.body.ephemeral_message_parameters?.receiver_user_id).toBe(11);
     expect(db.ran.some((sql) => sql.startsWith('DELETE FROM bookings'))).toBe(false);
   });
 
@@ -1895,9 +1895,9 @@ describe('Telegram commands', () => {
       expect(boardEditAt).toBeGreaterThan(answerAt);
       const actorNotice = requests
         .filter((request) => request.url.endsWith('/sendMessage'))
-        .find((request) => request.body.receiver_user_id === 11
+        .find((request) => request.body.ephemeral_message_parameters?.receiver_user_id === 11
           && request.body.text.includes('You are on'));
-      expect(actorNotice.body.callback_query_id).toBe('callback-1');
+      expect(actorNotice.body.ephemeral_message_parameters.callback_query_id).toBe('callback-1');
     });
 
     it('reports a failed in-place picker refresh without losing the join confirmation', async () => {
@@ -1911,7 +1911,7 @@ describe('Telegram commands', () => {
             ok: false, description: 'MESSAGE_CANNOT_BE_EDITED',
           }), { headers: { 'Content-Type': 'application/json' } });
         }
-        const result = String(url).endsWith('/sendMessage') && body.receiver_user_id
+        const result = String(url).endsWith('/sendMessage') && body.ephemeral_message_parameters?.receiver_user_id
           ? { ephemeral_message_id: 77 } : { message_id: 55 };
         return new Response(JSON.stringify({ ok: true, result }), {
           headers: { 'Content-Type': 'application/json' },
@@ -2287,7 +2287,7 @@ describe('Telegram commands', () => {
     const sends = requests.filter((request) => request.url.endsWith('/sendMessage'));
     // The person whose money moved was not in the conversation, so they hear it
     // from the bot with the reason attached.
-    const receipt = sends.find((send) => send.body.receiver_user_id === 11);
+    const receipt = sends.find((send) => send.body.ephemeral_message_parameters?.receiver_user_id === 11);
     expect(receipt.body.text).toContain('$2.00 added to your squash tab');
     expect(receipt.body.text).toContain('mcdonalds ice cream');
     expect(receipt.body.text).toContain('You now owe <b>$7.00</b>.');
@@ -2333,7 +2333,7 @@ describe('Telegram commands', () => {
     // The preview is the only message sent: there is nobody to receipt.
     const sends = requests.filter((request) => request.url.endsWith('/sendMessage'));
     expect(sends).toHaveLength(1);
-    expect(sends[0].body.receiver_user_id).toBe(7);
+    expect(sends[0].body.ephemeral_message_parameters?.receiver_user_id).toBe(7);
     expect(editedPanel(requests).body.text).toContain('never posted here, so they were not told');
   });
 
@@ -2540,7 +2540,7 @@ describe('Telegram commands', () => {
     expect(deletes[0].sql).toContain('created_at > ?');
     expect(ledger.map((row) => row.id)).toEqual([34]);
     const receipt = requests.filter((request) => request.url.endsWith('/sendMessage'))
-      .find((send) => send.body.receiver_user_id === 64);
+      .find((send) => send.body.ephemeral_message_parameters?.receiver_user_id === 64);
     expect(receipt.body.text).toContain('+$5.00 entry on your squash tab was undone');
     expect(receipt.body.text).toContain('You are <b>$10.00</b> in credit.');
     const panel = requests.find((request) => request.url.endsWith('/editEphemeralMessageText'));

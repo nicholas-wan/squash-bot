@@ -108,7 +108,7 @@ it('posts one silent message for the next open court, edits its slot count, and 
         { text: '➖ Admin: remove', callback_data: 'sb:kick:1' },
       ],
     ] } });
-  expect(requests[0].receiver_user_id).toBeUndefined();
+  expect(requests[0].ephemeral_message_parameters?.receiver_user_id).toBeUndefined();
   // An invitation: the free slots lead, then when, then who is on it already,
   // tagged where the id is known.
   expect(requests[0].text).toMatch(new RegExp('^🙋 <b>2 slots left on Court 4</b>\\n'
@@ -476,7 +476,7 @@ it('clears a court reminder when the court ends, and retries a public copy it co
     const method = String(url).split('/').at(-1);
     const body = JSON.parse(init.body);
     requests.push({ method, ...body });
-    const result = method === 'sendMessage' && body.receiver_user_id
+    const result = method === 'sendMessage' && body.ephemeral_message_parameters?.receiver_user_id
       ? { ok: true, result: { ephemeral_message_id: 900 } }
       : { ok: true, result: { message_id: requests.length + 100 } };
     return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });

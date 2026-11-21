@@ -90,8 +90,13 @@ export function sendMessage(env, chatId, html, {
   if (replyMarkup) body.reply_markup = replyMarkup;
   if (replyTo) body.reply_parameters = { message_id: replyTo };
   if (replyToEphemeral) body.reply_parameters = { ephemeral_message_id: replyToEphemeral };
-  if (receiverUserId) body.receiver_user_id = receiverUserId;
-  if (callbackQueryId) body.callback_query_id = callbackQueryId;
+  // Bot API 10.3 moved these two out of sendMessage's own parameters.
+  if (receiverUserId || callbackQueryId) {
+    body.ephemeral_message_parameters = {
+      ...(receiverUserId ? { receiver_user_id: receiverUserId } : {}),
+      ...(callbackQueryId ? { callback_query_id: callbackQueryId } : {}),
+    };
+  }
   return telegram(env, 'sendMessage', body);
 }
 

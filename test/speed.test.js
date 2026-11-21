@@ -115,7 +115,7 @@ beforeEach(() => {
         result = { status: body.user_id === OWNER_ID ? 'creator' : 'member' };
       }
       if (method === 'sendMessage') {
-        result = body.receiver_user_id ? { ephemeral_message_id: ++nextId } : { message_id: ++nextId };
+        result = body.ephemeral_message_parameters?.receiver_user_id ? { ephemeral_message_id: ++nextId } : { message_id: ++nextId };
       }
       return new Response(JSON.stringify({ ok: true, result }));
     });
@@ -275,7 +275,7 @@ describe('a send cut off by the timeout', () => {
     const now = Date.now();
     sql.prepare('UPDATE bookings SET reminder_at = ? WHERE id = 7').run(now - 1000);
     sql.exec('UPDATE maintenance_schedule SET next_due = 0');
-    sendFails = (method, body) => (method === 'sendMessage' && body.receiver_user_id
+    sendFails = (method, body) => (method === 'sendMessage' && body.ephemeral_message_parameters?.receiver_user_id
       ? Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' })
       : null);
     await worker.scheduled({}, env, ctx());

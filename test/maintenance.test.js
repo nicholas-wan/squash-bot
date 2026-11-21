@@ -105,14 +105,14 @@ it('never reminds a player twice when the public fallback fails', async () => {
   reply = (method, body) => {
     if (method !== 'sendMessage') return null;
     // Player 2 cannot be reached privately, and the group fallback fails too.
-    if (body.receiver_user_id === 2) return { ok: true, result: { message_id: 9 } };
-    if (!body.receiver_user_id) return { ok: false, description: 'Internal Server Error' };
-    return { ok: true, result: { message_id: 8, ephemeral_message_id: body.receiver_user_id } };
+    if (body.ephemeral_message_parameters?.receiver_user_id === 2) return { ok: true, result: { message_id: 9 } };
+    if (!body.ephemeral_message_parameters?.receiver_user_id) return { ok: false, description: 'Internal Server Error' };
+    return { ok: true, result: { message_id: 8, ephemeral_message_id: body.ephemeral_message_parameters?.receiver_user_id } };
   };
   await runMaintenance(env, now);
   await runMaintenance(env, now + 60000);
   const remindersTo = (userId) => requests.filter((request) => request.method === 'sendMessage'
-    && request.receiver_user_id === userId).length;
+    && request.ephemeral_message_parameters?.receiver_user_id === userId).length;
   expect(remindersTo(1)).toBe(1);
   expect(remindersTo(3)).toBe(1);
   // Player 2 is still owed theirs, and gets another try.
@@ -207,12 +207,12 @@ it('does not remind somebody who joined after the reminder was due', async () =>
   seat(1, 5);
   db.prepare(`INSERT INTO booking_players (booking_id, chat_id, user_id, slug, name, created_at)
     VALUES (1, -123, 6, 'u6', 'Late', ?)`).run(now - 10 * 60000);
-  reply = (method, body) => (method === 'sendMessage' && body.receiver_user_id
+  reply = (method, body) => (method === 'sendMessage' && body.ephemeral_message_parameters?.receiver_user_id
     ? { ok: true, result: { ephemeral_message_id: 7 } } : null);
   await runMaintenance(env, now);
   const reminded = requests
     .filter((request) => request.method === 'sendMessage' && String(request.text).includes('in 2 hours'))
-    .map((request) => request.receiver_user_id);
+    .map((request) => request.ephemeral_message_parameters?.receiver_user_id);
   // The player seated yesterday is reminded; the one who joined ten minutes
   // ago already has their join confirmation, and gets nothing overdue.
   expect(reminded).toEqual([5]);
@@ -228,7 +228,7 @@ it('says tomorrow when a morning court is reminded the evening before', async ()
   seat(1, 5);
   await runMaintenance(env, evening);
   const reminder = requests.find((request) => request.method === 'sendMessage'
-    && request.receiver_user_id === 5);
+    && request.ephemeral_message_parameters?.receiver_user_id === 5);
   expect(reminder.text).toContain('Squash tomorrow!');
 });
 

@@ -31,7 +31,7 @@ function stubTelegram(reply = () => null) {
     }
     if (method === 'sendMessage') {
       const id = 500 + requests.length;
-      return json({ ok: true, result: body.receiver_user_id ? { ephemeral_message_id: id } : { message_id: id } });
+      return json({ ok: true, result: body.ephemeral_message_parameters?.receiver_user_id ? { ephemeral_message_id: id } : { message_id: id } });
     }
     return json({ ok: true, result: true });
   }));

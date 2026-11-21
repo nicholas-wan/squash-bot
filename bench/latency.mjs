@@ -79,7 +79,7 @@ globalThis.fetch = async (url, init) => {
   await sleep(LAT);
   let result = true;
   if (method === 'getChatMember') result = { status: body.user_id === OWNER_ID ? 'creator' : 'member' };
-  if (method === 'sendMessage') result = body.receiver_user_id ? { ephemeral_message_id: ++msgId } : { message_id: ++msgId };
+  if (method === 'sendMessage') result = body.ephemeral_message_parameters?.receiver_user_id ? { ephemeral_message_id: ++msgId } : { message_id: ++msgId };
   if (method === 'getMe') result = { username: 'squashbot' };
   return new Response(JSON.stringify({ ok: true, result }), { headers: { 'Content-Type': 'application/json' } });
 };

@@ -86,6 +86,6 @@ describe('shared data across groups', () => {
     );
     expect(receipts).toHaveLength(1);
     expect(receipts[0].body.chat_id).toBe(GROUP_B);
-    expect(receipts[0].body.receiver_user_id).toBe(9);
+    expect(receipts[0].body.ephemeral_message_parameters?.receiver_user_id).toBe(9);
   });
 });

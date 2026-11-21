@@ -33,7 +33,7 @@ beforeEach(() => {
   vi.stubGlobal('fetch', vi.fn(async (url, init) => {
     const body = JSON.parse(init.body);
     requests.push({ method: String(url).split('/').at(-1), ...body });
-    const result = body.receiver_user_id ? { ephemeral_message_id: 7 } : { message_id: 100 };
+    const result = body.ephemeral_message_parameters?.receiver_user_id ? { ephemeral_message_id: 7 } : { message_id: 100 };
     return new Response(JSON.stringify({ ok: true, result }), {
       headers: { 'Content-Type': 'application/json' },
     });
@@ -156,14 +156,14 @@ describe('The tab in the Mini App', () => {
     expect(paid.ok).toBe(true);
     expect(paid.message).toBe('$10.00 from u5 recorded.');
     expect(paid.person.balance).toBe(735);
-    const receipt = requests.find((r) => r.method === 'sendMessage' && r.receiver_user_id === 5);
+    const receipt = requests.find((r) => r.method === 'sendMessage' && r.ephemeral_message_parameters?.receiver_user_id === 5);
     expect(receipt.text).toContain('Payment received');
     expect(receipt.text).toContain('You now owe <b>$7.35</b>');
     // The undo comes back the same way, and they are told.
     const line = paid.person.lines.find((entry) => entry.cents === -1000);
     const undone = await call(`tab/entry/${line.id}/undo`, admin, {});
     expect(undone.person.balance).toBe(1735);
-    expect(requests.filter((r) => r.receiver_user_id === 5).at(-1).text).toContain('was undone');
+    expect(requests.filter((r) => r.ephemeral_message_parameters?.receiver_user_id === 5).at(-1).text).toContain('was undone');
   });
 
   it('answers a saved payment and undo while Telegram is still delivering their follow-ups', async () => {
