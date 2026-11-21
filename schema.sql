@@ -290,17 +290,17 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS schedule_sent_messages_insert
 AFTER INSERT ON sent_messages BEGIN
-  UPDATE maintenance_schedule SET next_due = 0, revision = revision + 1 WHERE id = 1;
+  UPDATE maintenance_schedule SET next_due = MIN(next_due, NEW.delete_after), revision = revision + 1 WHERE id = 1;
 END;
 
 CREATE TRIGGER IF NOT EXISTS schedule_sent_messages_update
 AFTER UPDATE ON sent_messages BEGIN
-  UPDATE maintenance_schedule SET next_due = 0, revision = revision + 1 WHERE id = 1;
+  UPDATE maintenance_schedule SET next_due = MIN(next_due, NEW.delete_after), revision = revision + 1 WHERE id = 1;
 END;
 
 CREATE TRIGGER IF NOT EXISTS schedule_sent_messages_delete
 AFTER DELETE ON sent_messages BEGIN
-  UPDATE maintenance_schedule SET next_due = 0, revision = revision + 1 WHERE id = 1;
+  UPDATE maintenance_schedule SET revision = revision + 1 WHERE id = 1;
 END;
 
 CREATE TRIGGER IF NOT EXISTS schedule_pending_refreshes_insert

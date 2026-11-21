@@ -23,7 +23,7 @@ import {
   tabBalances, takeDraft, theirTabView, undoAdjustment, updateTab,
 } from './tab.js';
 import {
-  answerCallback, armWebhookAnswer, botId, botUsername, deleteEphemeralMessage,
+  answerCallback, armWebhookAnswer, botId, botUsername, DELETE_SETTLED, deleteEphemeralMessage,
   deleteMessage, editEphemeralMessage, editReplyMarkup, escapeHtml, OK_MARKUP, removePublicCopy,
   sendMessage, setBotProfilePhoto, telegram,
 } from './telegram.js';
@@ -477,21 +477,14 @@ async function sendPrivatePanel(env, callback, view) {
 const PANEL_LIFETIME_MS = 24 * 60 * 60 * 1000;
 
 async function expirePanel(env, chatId, userId, delivery) {
-  if (delivery.status === 'private') await expireSent(env, chatId, userId, delivery.sent);
-}
-
-// Hands a sent message to the sweep, in whichever id space it landed.
-async function expireSent(env, chatId, userId, sent) {
-  const ephemeralId = sent && sent.ok && sent.result && sent.result.ephemeral_message_id;
-  const messageId = ephemeralId || (sent && sent.ok && sent.result && sent.result.message_id);
-  if (!messageId) return;
+  if (delivery.status !== 'private') return;
   const now = Date.now();
   try {
     await env.DB.prepare(
       `INSERT INTO sent_messages
         (chat_id, receiver_user_id, message_id, is_ephemeral, delete_after, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    ).bind(chatId, ephemeralId ? userId : null, messageId, ephemeralId ? 1 : 0,
+       VALUES (?, ?, ?, 1, ?, ?)`
+    ).bind(chatId, userId, delivery.sent.result.ephemeral_message_id,
       now + PANEL_LIFETIME_MS, now).run();
   } catch (error) {
     // The panel is already in front of them; only its tidying is lost.
@@ -499,17 +492,31 @@ async function expireSent(env, chatId, userId, sent) {
   }
 }
 
+// Takes the tapped message off the sweep, once it is gone or has become a
+// receipt that whoever was told something can keep.
+async function leaveSweep(env, callback) {
+  const ephemeralId = callback.message.ephemeral_message_id;
+  try {
+    await env.DB.prepare(
+      `DELETE FROM sent_messages WHERE chat_id = ? AND message_id = ? AND is_ephemeral = ?
+         AND (is_ephemeral = 0 OR receiver_user_id = ?)`
+    ).bind(callback.message.chat.id, ephemeralId || callback.message.message_id,
+      ephemeralId ? 1 : 0, callback.from.id).run();
+  } catch (error) {
+    console.log(`Panel cleanup removal failed: ${error.stack || error}`);
+  }
+}
+
 // A command's status or error note: useful for a moment and no record of
 // anything, so it clears like a panel instead of staying until somebody taps OK.
 async function sendCommandNote(env, msg, html, options = {}) {
-  const sent = await sendMessage(env, msg.chat.id, html, {
-    receiverUserId: msg.from.id,
+  const delivery = await deliverPrivately(env, msg.chat.id, msg.from.id, html, {
     replyToEphemeral: msg.ephemeral_message_id || null,
     replyMarkup: OK_MARKUP,
     ...options,
   });
-  await expireSent(env, msg.chat.id, msg.from.id, sent);
-  return sent;
+  await expirePanel(env, msg.chat.id, msg.from.id, delivery);
+  return delivery;
 }
 
 function editSucceeded(result) {
@@ -566,7 +573,10 @@ async function refreshJoinPicker(env, callback) {
 async function dismissMessage(env, callback) {
   const ephemeralId = callback.message && callback.message.ephemeral_message_id;
   if (ephemeralId) {
-    await deleteEphemeralMessage(env, callback.message.chat.id, callback.from.id, ephemeralId);
+    const removed = await deleteEphemeralMessage(
+      env, callback.message.chat.id, callback.from.id, ephemeralId
+    );
+    if (deleteIsSettled(removed)) await leaveSweep(env, callback);
     return;
   }
   const messageId = callback.message && callback.message.message_id;
@@ -591,7 +601,12 @@ async function dismissMessage(env, callback) {
     notice && notice.message_id,
   ].filter(Boolean).map(Number);
   if (shared.includes(Number(messageId))) return;
-  await deleteMessage(env, chatId, messageId);
+  if (deleteIsSettled(await deleteMessage(env, chatId, messageId))) await leaveSweep(env, callback);
+}
+
+// A delete that failed for now stays on the sweep, which tries it again.
+function deleteIsSettled(result) {
+  return result.ok || DELETE_SETTLED.test(String(result.description || ''));
 }
 
 // tb:mine carries no guard on purpose: anyone may read their own breakdown.
@@ -779,6 +794,8 @@ async function undoAndAnswer(env, callback, match, defer) {
       + standingLine(escapeHtml(undone.name), undone.balance) + told,
     replyMarkup: OK_MARKUP,
   });
+  // The /debt undo list it was tapped on is a receipt now.
+  await leaveSweep(env, callback);
   await answerCallback(env, callback.id);
 }
 
@@ -868,6 +885,8 @@ async function confirmDebtAndAnswer(env, callback, match, defer) {
       ? { inline_keyboard: [[undoButton(entry.id), ...OK_MARKUP.inline_keyboard[0]]] }
       : OK_MARKUP,
   });
+  // The preview it was tapped on is a receipt now.
+  await leaveSweep(env, callback);
   await answerCallback(env, callback.id);
 }
 
@@ -901,10 +920,8 @@ function privateReply(env, msg, html, replyMarkup = OK_MARKUP) {
 
 // privateReply for an answer that is no record of anything: a refusal, a usage
 // line, a list to pick from. Clears like a panel.
-async function expiringReply(env, msg, html, replyMarkup = OK_MARKUP) {
-  const delivery = await privateReply(env, msg, html, replyMarkup);
-  await expirePanel(env, msg.chat.id, msg.from.id, delivery);
-  return delivery;
+function expiringReply(env, msg, html, replyMarkup = OK_MARKUP) {
+  return sendCommandNote(env, msg, html, { replyMarkup });
 }
 
 // Reads the same to the debtor and about them. A balance is only ever one of
@@ -1253,11 +1270,12 @@ async function dispatchUpdate(env, update, identities = null) {
         return;
       }
       // Nothing is written yet: the admin reads back what the sign means and
-      // confirms it. See draftAdjustment.
+      // confirms it. See draftAdjustment. A preview nobody answers clears with
+      // the draft, a day later; Confirm takes it off the sweep as a receipt.
       const draft = await draftAdjustment(
         env, msg.chat.id, matched.player, parsed.cents, parsed.reason, msg.from
       );
-      await privateReply(env, msg,
+      await expiringReply(env, msg,
         debtPreviewHtml(env, msg.from, matched.player.name, parsed.cents, parsed.reason,
           draft.balance),
         { inline_keyboard: [[
@@ -1284,15 +1302,17 @@ async function dispatchUpdate(env, update, identities = null) {
           cancelled: `🗑 Removed booking <b>#${escapeHtml(args)}</b>.`,
           gone: `I couldn't find booking <b>#${escapeHtml(args)}</b>.`,
         };
-        await sendMessage(env, msg.chat.id,
-          replies[result.status] || escapeHtml(result.message),
-          {
+        const html = replies[result.status] || escapeHtml(result.message);
+        // A removal is a receipt and stays. A refusal or a wrong id is a note.
+        if (result.status === 'cancelled') {
+          await deliverPrivately(env, msg.chat.id, msg.from.id, html, {
             silent: true,
-            receiverUserId: msg.from.id,
             replyToEphemeral: msg.ephemeral_message_id || null,
             replyMarkup: OK_MARKUP,
-          }
-        );
+          });
+        } else {
+          await sendCommandNote(env, msg, html, { silent: true });
+        }
       } finally {
         await later.drain();
       }
@@ -1303,10 +1323,19 @@ async function dispatchUpdate(env, update, identities = null) {
     // carry SQL, ids, or configuration. The wizard sends its own wording for
     // anything the person can actually act on before it throws.
     console.log(`Update failed: ${error.stack || error}`);
-    await sendCommandNote(env, msg,
-      ((error && error.userMessage) || '⚠️ Something went wrong. Please try again.')
-      // Their message was deleted before this failed, so it only exists here.
-      + (clearedText ? `\n\n<code>${escapeHtml(clearedText)}</code>` : ''));
+    const note = (error && error.userMessage) || '⚠️ Something went wrong. Please try again.';
+    if (clearedText) {
+      // Their message was deleted before this failed, so it only exists here:
+      // it never expires, and a public fallback stays, showing only what they
+      // had already posted to the group.
+      await sendMessage(env, msg.chat.id, `${note}\n\n<code>${escapeHtml(clearedText)}</code>`, {
+        receiverUserId: msg.from.id,
+        replyToEphemeral: msg.ephemeral_message_id || null,
+        replyMarkup: OK_MARKUP,
+      });
+    } else {
+      await sendCommandNote(env, msg, note);
+    }
   }
 }
 

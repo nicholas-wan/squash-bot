@@ -87,6 +87,22 @@ it('booking edits and roster changes invalidate the cached deadline', async () =
   expect(db.prepare('SELECT next_due FROM maintenance_schedule').get().next_due).toBe(0);
 });
 
+it('a message due later moves the deadline only as far as it needs', async () => {
+  db.prepare('UPDATE maintenance_schedule SET next_due = ?, revision = 5').run(now + 7200000);
+  const add = (due) => db.prepare(`INSERT INTO sent_messages
+    (chat_id, receiver_user_id, message_id, is_ephemeral, delete_after, created_at)
+    VALUES (-123, 7, ?, 1, ?, ?)`).run(due, due, now);
+  add(now + 9000000);
+  expect(db.prepare('SELECT next_due, revision FROM maintenance_schedule').get())
+    .toEqual({ next_due: now + 7200000, revision: 6 });
+  add(now + 3600000);
+  expect(db.prepare('SELECT next_due FROM maintenance_schedule').get().next_due).toBe(now + 3600000);
+  // Removing one leaves the deadline, which can only be early and is recomputed.
+  db.prepare('DELETE FROM sent_messages').run();
+  expect(db.prepare('SELECT next_due, revision FROM maintenance_schedule').get())
+    .toEqual({ next_due: now + 3600000, revision: 9 });
+});
+
 it('preserves an invalidation arriving during deadline calculation', async () => {
   booking();
   mutateDuringCalculation = () => db.exec('UPDATE bookings SET capacity=4');

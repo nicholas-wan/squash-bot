@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { NO_COURTS_HTML, syncAnnouncements } from '../src/announcements.js';
 import { addBooking, runMaintenance, updateBoard } from '../src/bookings.js';
+import { clearAdminCache } from '../src/players.js';
 import { sendPrivateNote } from '../src/tab.js';
 import { handleBookingCallback } from '../src/wizard.js';
 import { handleUpdate } from '../src/index.js';
@@ -585,13 +586,23 @@ describe('command notes', () => {
     expect(notes()).toEqual([{ message_id: 900, is_ephemeral: 1, receiver_user_id: 7, life: DAY }]);
   });
 
-  it('keeps a /cancel result, which is a receipt', async () => {
+  it('clears a failed /cancel, which is no record of anything', async () => {
     await say('/cancel 99', true);
     expect(requests.find(r => r.method === 'sendMessage').text).toContain("couldn't find");
+    expect(notes()).toEqual([{ message_id: 900, is_ephemeral: 1, receiver_user_id: 7, life: DAY }]);
+  });
+
+  it('keeps a /cancel that removed a court, which is a receipt', async () => {
+    await admin();
+    // A court already played cannot be cancelled, so this one is still to come.
+    db.prepare('UPDATE bookings SET starts_at = ?, ends_at = ? WHERE id = 1')
+      .run(Date.now() + DAY, Date.now() + DAY + 3600000);
+    await say('/cancel 1', true);
+    expect(requests.find(r => r.method === 'sendMessage' && /Removed booking/.test(r.text))).toBeTruthy();
     expect(notes()).toEqual([]);
   });
 
-  it('clears a note Telegram delivered publicly, in the public id space', async () => {
+  it('takes a note Telegram delivered publicly straight back out of the group', async () => {
     vi.mocked(fetch).mockImplementation(async (url, init) => {
       const method = String(url).split('/').at(-1);
       requests.push({ method, ...JSON.parse(init.body) });
@@ -599,8 +610,92 @@ describe('command notes', () => {
         { headers: { 'Content-Type': 'application/json' } });
     });
     await say('/nonsense', true);
-    expect(notes()).toEqual([{ message_id: 321, is_ephemeral: 0, receiver_user_id: null, life: DAY }]);
+    expect(requests.find(r => r.method === 'deleteMessage').message_id).toBe(321);
+    expect(notes()).toEqual([]);
   });
+
+  it('never expires the only copy of a booking that failed', async () => {
+    failWrite = sql => /INSERT INTO booking_drafts/.test(sql);
+    await admin();
+    await handleUpdate(env, { message: {
+      message_id: 500,
+      chat: { id: -123, type: 'supergroup' },
+      from: { id: 7, first_name: 'Player', username: 'player' },
+      text: 'court 4 tomorrow 7pm',
+    } });
+    const handedBack = requests.find(r => r.method === 'sendMessage' && r.text.includes('court 4 tomorrow 7pm'));
+    expect(handedBack).toBeTruthy();
+    expect(notes()).toEqual([]);
+  });
+
+  const tapInNote = (data, ephemeralId) => handleUpdate(env, { callback_query: {
+    id: 'tap',
+    data,
+    from: { id: 7, first_name: 'Player', username: 'player' },
+    message: { message_id: 0, ephemeral_message_id: ephemeralId, chat: { id: -123, type: 'supergroup' }, text: 'note' },
+  } });
+  const seatDebtor = () => db.prepare(`INSERT INTO booking_players
+    (booking_id, chat_id, user_id, slug, name, heads, created_at)
+    VALUES (1, -123, 8, 'u8', 'Jared', 1, ?)`).run(now);
+  const buttonData = (pattern) => requests.filter(r => r.method === 'sendMessage')
+    .flatMap(r => r.reply_markup?.inline_keyboard.flat() || [])
+    .map(b => b.callback_data).find(d => pattern.test(d || ''));
+
+  it('keeps the receipt that an abandoned-preview sweep would have taken', async () => {
+    await admin();
+    seatDebtor();
+    await say('/debt +2 jared ice cream', true);
+    expect(notes()).toEqual([{ message_id: 900, is_ephemeral: 1, receiver_user_id: 7, life: DAY }]);
+    await tapInNote(buttonData(/^tb:debt:/), 900);
+    expect(notes().filter(n => n.message_id === 900)).toEqual([]);
+  });
+
+  it('keeps the receipt when the /debt undo list becomes one', async () => {
+    await admin();
+    seatDebtor();
+    await say('/debt +2 jared ice cream', true);
+    await tapInNote(buttonData(/^tb:debt:/), 900);
+    db.prepare('DELETE FROM sent_messages').run();
+    requests.length = 0;
+    nextEphemeral = 950;
+    await say('/debt undo', true);
+    expect(notes().map(n => n.message_id)).toEqual([950]);
+    await tapInNote(buttonData(/^tb:undo:/), 950);
+    expect(notes().filter(n => n.message_id === 950)).toEqual([]);
+  });
+
+  it('takes a dismissed note off the sweep, but not one whose delete failed', async () => {
+    await say('/nonsense', true);
+    expect(notes()).toHaveLength(1);
+    const real = vi.mocked(fetch).getMockImplementation();
+    vi.mocked(fetch).mockImplementation(async (url, init) => {
+      if (String(url).endsWith('/deleteEphemeralMessage')) {
+        return new Response(JSON.stringify({ ok: false, error_code: 500, description: 'Internal Server Error' }),
+          { headers: { 'Content-Type': 'application/json' } });
+      }
+      return real(url, init);
+    });
+    await tapInNote('sb:ok', 900);
+    expect(notes()).toHaveLength(1);
+    vi.mocked(fetch).mockImplementation(real);
+    await tapInNote('sb:ok', 900);
+    expect(notes()).toEqual([]);
+  });
+
+  // The default mock answers getChatMember as a plain member, and the role is
+  // remembered across tests unless the cache is cleared on both sides.
+  async function admin() {
+    clearAdminCache();
+    onTestFinished(() => clearAdminCache());
+    const real = vi.mocked(fetch).getMockImplementation();
+    vi.mocked(fetch).mockImplementation(async (url, init) => {
+      if (String(url).endsWith('/getChatMember')) {
+        return new Response(JSON.stringify({ ok: true, result: { status: 'administrator' } }),
+          { headers: { 'Content-Type': 'application/json' } });
+      }
+      return real(url, init);
+    });
+  }
 });
 
 it('puts a private note on the sweep when its public copy will not delete yet', async () => {

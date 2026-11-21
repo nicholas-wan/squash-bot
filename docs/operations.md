@@ -181,6 +181,7 @@ npm run db:migrate:017
 npm run db:migrate:018
 npm run db:migrate:019
 npm run db:migrate:020
+npm run db:migrate:021
 npm run db:verify
 ```
 

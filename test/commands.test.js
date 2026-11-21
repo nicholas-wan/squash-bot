@@ -239,7 +239,7 @@ describe('Telegram commands', () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
       requests.push({ url: String(url), body: JSON.parse(init.body) });
-      return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), {
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 0, ephemeral_message_id: 90 } }), {
         headers: { 'Content-Type': 'application/json' },
       });
     }));
