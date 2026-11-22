@@ -711,38 +711,35 @@ it('puts a private note on the sweep when its public copy will not delete yet', 
   expect(db.prepare('SELECT count(*) AS n FROM sent_messages').get().n).toBe(0);
 });
 
-it('clears a court reminder when the court ends, and retries a public copy it could not delete', async () => {
+it('clears a court reminder when the court ends, and retries a delete that failed', async () => {
   const startsAt = now + 3600000;
   db.prepare('DELETE FROM bookings').run();
   book(2, startsAt);
   db.prepare(`INSERT INTO booking_players
     (booking_id, chat_id, user_id, slug, name, heads, created_at)
     VALUES (2, -123, 7, 'u7', 'Player', 1, ?)`).run(now - 1);
+  let deletes = 'fail';
   vi.mocked(fetch).mockImplementation(async (url, init) => {
     const method = String(url).split('/').at(-1);
     const body = JSON.parse(init.body);
     requests.push({ method, ...body });
-    const result = method === 'sendMessage' && body.ephemeral_message_parameters?.receiver_user_id
-      ? { ok: true, result: { ephemeral_message_id: 900 } }
-      : { ok: true, result: { message_id: requests.length + 100 } };
-    return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });
-  });
-  await runMaintenance(env, now);
-  const row = db.prepare('SELECT * FROM sent_messages WHERE message_id = 900').get();
-  expect(row.delete_after).toBe(startsAt + 3600000);
-
-  db.prepare('DELETE FROM sent_messages').run();
-  db.prepare('UPDATE booking_players SET reminder_sent = 0, pre_reminder_sent = 0').run();
-  vi.mocked(fetch).mockImplementation(async (url, init) => {
-    const method = String(url).split('/').at(-1);
-    requests.push({ method, ...JSON.parse(init.body) });
-    const result = method === 'deleteMessage'
+    const result = method === 'deleteMessage' && body.message_id === 900 && deletes === 'fail'
       ? { ok: false, error_code: 500, description: 'Internal Server Error' }
-      : { ok: true, result: { message_id: 777 } };
+      : method === 'sendMessage' && String(body.text).includes('Squash in 2 hours')
+        ? { ok: true, result: { message_id: 900 } }
+        : { ok: true, result: { message_id: requests.length + 100 } };
     return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });
   });
   await runMaintenance(env, now);
-  // The private send fell back to a public copy (777) that would not delete.
-  expect(db.prepare('SELECT count(*) AS n FROM sent_messages WHERE message_id = 777 AND is_ephemeral = 0')
-    .get().n).toBeGreaterThan(0);
+  // A group message, queued for deletion when the court ends.
+  const row = db.prepare('SELECT * FROM sent_messages WHERE message_id = 900').get();
+  expect(row).toMatchObject({ is_ephemeral: 0, receiver_user_id: null, delete_after: startsAt + 3600000 });
+
+  // A delete that fails for now is kept for the next tick...
+  await runMaintenance(env, startsAt + 3600000);
+  expect(db.prepare('SELECT count(*) AS n FROM sent_messages WHERE message_id = 900').get().n).toBe(1);
+  // ...and the row goes once the message does.
+  deletes = 'ok';
+  await runMaintenance(env, startsAt + 3660000);
+  expect(db.prepare('SELECT count(*) AS n FROM sent_messages WHERE message_id = 900').get().n).toBe(0);
 });

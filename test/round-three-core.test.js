@@ -128,7 +128,8 @@ it('lets the booker cancel from their receipt, and puts the receipt back on Keep
   const id = await addBooking(env, -123, {
     court: '4', startsAt, endsAt: startsAt + HOUR, reminderAt: startsAt - 3 * HOUR,
   }, BOOKER);
-  const receipt = sent('sendMessage').find((request) => request.body.text.includes('Court 4 booked'));
+  const receipt = sent('sendMessage').find((request) => request.body.text.includes('Court 4 booked')
+    && request.body.ephemeral_message_parameters);
   expect(receipt.body.reply_markup.inline_keyboard[0]).toEqual([
     { text: '👍 OK', callback_data: 'sb:ok' },
     { text: '🗑 Cancel booking', callback_data: `sb:delete:${id}:r` },

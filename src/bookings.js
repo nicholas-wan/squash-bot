@@ -124,6 +124,26 @@ async function confirmToBooker(env, chatId, bookingId, booking, capacity, from, 
   );
 }
 
+// Every new court is also posted to the group, tagging its roster, so each
+// player is notified — even with the group muted — however the court was
+// booked, on their behalf included. The private receipt alone was an ephemeral
+// message only the booker saw, and the players they added heard nothing
+// reliable until a reminder. It is deleted when the court ends, like the
+// reminders. A booking stored under the data chat id is posted to a chat the
+// bot is actually in.
+async function announceBooking(env, chatId, bookingId, booking, capacity) {
+  const [tz, roster] = await Promise.all([getTimezone(env, chatId), rosterFor(env, bookingId)]);
+  const target = reachableChat(env, { chat_id: chatId }, chatId);
+  const sent = await sendMessage(env, target, receiptHtml(booking, roster, capacity, tz));
+  if (!sent.ok || !sent.result) {
+    throw new Error(sent.description || 'Telegram refused the message');
+  }
+  const startsAt = booking.startsAt ?? booking.starts_at;
+  const endsAt = booking.endsAt ?? booking.ends_at;
+  await scheduleCleanup(env, target, sent.result, null,
+    reminderExpiry({ starts_at: startsAt, ends_at: endsAt }, tz));
+}
+
 function receiptHtml(booking, roster, capacity, tz) {
   const startsAt = booking.startsAt ?? booking.starts_at;
   const endsAt = booking.endsAt ?? booking.ends_at;
@@ -245,6 +265,9 @@ export async function addBooking(
           console.log(`Receipt for booking ${bookingId} failed: ${error.stack || error}`);
         })
       : null,
+    announceBooking(env, chatId, bookingId, parsed, capacity).catch((error) => {
+      console.log(`Group notice for booking ${bookingId} failed: ${error.stack || error}`);
+    }),
   ]), defer);
   return bookingId;
 }
@@ -1384,19 +1407,29 @@ async function sendPrivately(env, chatId, html, userId, deleteAfter, options = {
   return 'not-ephemeral';
 }
 
+// Reminders are group messages, one per court, tagging its roster. Until 22 Nov
+// 2026 each player was reminded privately, but Telegram accepts an ephemeral
+// send for somebody offline, reports it delivered, and drops it — and a cron
+// reminder has no tap behind it to guarantee delivery, so the people asleep at
+// 10am or busy at 7pm were exactly the ones it missed. The tags notify each
+// player, even with the group muted, so the message is not silent. It is
+// deleted when the court ends. The booking row lives under the data chat id,
+// which may be no chat the bot can still post to, so it goes to a chat the bot
+// is actually in.
+//
+// Answers 'sent'; 'uncertain' for a send cut off by the timeout (it may have
+// landed, so it is not sent again); 'refused' when the group itself is gone
+// for good, which a retry every minute until the court starts would not fix;
+// or 'failed', which is worth another go on the next tick.
 async function remindPublicly(env, booking, roster, headline, tz) {
-  // The roster line already tags everyone, so this needs nothing extra — and it
-  // goes out silently, because the one message the group cannot avoid seeing
-  // should not also buzz every phone in it. The booking row lives under the
-  // data chat id, which may be no chat the bot can still post to, so the
-  // fallback goes to a chat it is actually in.
   const chatId = reachableChat(env, { chat_id: booking.chat_id }, booking.chat_id);
-  const sent = await sendMessage(env, chatId,
-    reminderHtml(booking, roster, headline, tz), { silent: true });
+  const sent = await sendMessage(env, chatId, reminderHtml(booking, roster, headline, tz));
   if (sent.ok && sent.result) {
     await scheduleCleanup(env, chatId, sent.result, null, reminderExpiry(booking, tz));
+    return 'sent';
   }
-  return sent.ok;
+  if (sent.timedOut) return 'uncertain';
+  return CHAT_GONE.test(String(sent.description || '')) ? 'refused' : 'failed';
 }
 
 // Maintenance has no incoming update to tell it which chat it is running for, so
@@ -1553,116 +1586,47 @@ async function remindCourt(env, rows, column, headline) {
   }
 }
 
-// `taken` are the rows whose claim this pass won; only those with an account
-// can be written to. Anything thrown from here hands every one of them back,
-// so nothing here may throw once a reminder has gone out.
+// `taken` are the rows whose claim this pass won. The court gets one group
+// message tagging its whole roster, so the rest of the roster is claimed first
+// and the message is sent once; a player seated by handle alone is tagged and
+// notified with everyone else. Anything thrown from here hands every claim
+// back, so nothing here may throw once the reminder has gone out.
 async function remindClaimed(env, rows, taken, roster, zones, column, headline) {
-  const mine = taken.filter((row) => row.player_user_id);
-  if (!mine.length) return 0;
-  const zoneOf = (row) => zones[rows.indexOf(row)];
-  const booking = mine[0];
-  const cleanups = [];
-  // Built inside the promise, so even a throw while drawing the message (a bad
-  // timezone, say) becomes this player's 'failed' rather than escaping after
-  // earlier players were sent to.
-  const send = (row) => Promise.resolve().then(() => {
-    const tz = zoneOf(row);
-    const chatId = reachableChat(env, { chat_id: row.player_chat_id }, row.chat_id);
-    return sendPrivately(env, chatId, reminderHtml(row, roster, headline, tz), row.player_user_id,
-      reminderExpiry(row, tz), { replyMarkup: OK_MARKUP, cleanups });
-  }).catch((error) => {
-    console.log(`${column} reminder for player ${row.player_row_id} failed: ${error.stack || error}`);
-    return 'failed';
-  });
-  const first = await send(mine[0]);
-  const outcomes = first === 'not-ephemeral'
-    ? [first]
-    : [first, ...await Promise.all(mine.slice(1).map(send))];
-  // The messages are out; their cleanup rows failing must not hand the
-  // claims back and send them all again.
+  if (!taken.length) return 0;
+  const booking = taken[0];
+  const { results: unclaimed } = await env.DB.prepare(
+    `SELECT id FROM booking_players WHERE booking_id = ? AND ${column}_sent = 0`
+  ).bind(booking.id).all();
+  await env.DB.prepare(
+    `UPDATE booking_players SET ${column}_sent = 1 WHERE booking_id = ? AND ${column}_sent = 0`
+  ).bind(booking.id).run();
+  let outcome;
   try {
-    if (cleanups.length) {
-      if (typeof env.DB.batch === 'function') await env.DB.batch(cleanups);
-      else for (const statement of cleanups) await statement.run();
-    }
+    outcome = await remindPublicly(env, booking, roster, headline, zones[rows.indexOf(booking)]);
   } catch (error) {
-    console.log(`${column} reminder cleanup rows failed: ${error.stack || error}`);
+    console.log(`${column} reminder for booking ${booking.id} failed: ${error.stack || error}`);
+    outcome = 'failed';
   }
-  let failures = 0;
-  const failed = [];
-  const publicly = [];
-  outcomes.forEach((outcome, index) => {
-    const row = mine[index];
-    if (outcome === 'private') return;
-    // Cut off by the timeout, it may have arrived: handing the claim back
-    // used to send it again next minute, a second reminder for one court.
-    if (outcome === 'uncertain') {
-      console.log(`${column} reminder for player ${row.player_row_id} timed out; not resent`);
-      return;
-    }
-    // Telegram will refuse this player every minute until the court starts,
-    // and a claim handed back sorts straight to the front of the next
-    // window's LIMIT. The claim stays spent: one line in the log is the whole
-    // record, and the rest of the roster still gets reminded.
-    if (outcome === 'refused') {
-      console.log(
-        `${column} reminder for player ${row.player_row_id} refused by Telegram; not retried`
-      );
-      return;
-    }
-    if (outcome === 'not-ephemeral') {
-      publicly.push(row);
-      return;
-    }
-    failed.push(row.player_row_id);
-  });
-  let handBack = failed;
-  if (publicly.length) {
-    // Claim the rest of this roster so the public fallback is sent once.
-    // Only the claims taken here are handed back if it fails: a player whose
-    // private reminder already went out earlier in this pass would otherwise
-    // be reminded a second time on the next tick. Anyone claimed above but
-    // not yet sent to is covered by the public copy, and handed back with it,
-    // as is anyone whose private copy failed: the public one tags them too.
-    try {
-      const unsent = mine.slice(outcomes.length).map((row) => row.player_row_id);
-      const { results: unclaimed } = await env.DB.prepare(
-        `SELECT id FROM booking_players WHERE booking_id = ? AND ${column}_sent = 0`
-      ).bind(booking.id).all();
-      await env.DB.prepare(
-        `UPDATE booking_players SET ${column}_sent = 1 WHERE booking_id = ? AND ${column}_sent = 0`
-      ).bind(booking.id).run();
-      if (await remindPublicly(env, booking, roster, headline, zoneOf(booking))) {
-        handBack = [];
-      } else {
-        handBack = [...failed, ...publicly.map((row) => row.player_row_id), ...unsent,
-          ...unclaimed.map((player) => player.id)];
-        failures += 1;
-      }
-    } catch (error) {
-      console.log(`${column} public reminder for booking ${booking.id} failed: ${error.stack || error}`);
-      handBack = [...failed, ...publicly.map((row) => row.player_row_id),
-        ...mine.slice(outcomes.length).map((row) => row.player_row_id)];
-      failures += 1;
-    }
+  if (outcome === 'uncertain' || outcome === 'refused') {
+    console.log(`${column} reminder for booking ${booking.id} ${outcome === 'refused'
+      ? 'refused by Telegram' : 'timed out, may have arrived'}; not retried`);
   }
-  failures += failed.length && handBack.length ? failed.length : 0;
-  if (handBack.length) {
-    try {
-      await env.DB.prepare(
-        `UPDATE booking_players SET ${column}_sent = 0
-         WHERE id IN (${handBack.map(() => '?').join(', ')})`
-      ).bind(...handBack).run();
-    } catch (error) {
-      console.log(`${column} reminder hand-back failed: ${error.stack || error}`);
-      failures += 1;
-    }
+  if (outcome !== 'failed') return 0;
+  const handBack = [...taken.map((row) => row.player_row_id),
+    ...unclaimed.map((player) => player.id)];
+  try {
+    await env.DB.prepare(
+      `UPDATE booking_players SET ${column}_sent = 0
+       WHERE id IN (${handBack.map(() => '?').join(', ')})`
+    ).bind(...handBack).run();
+  } catch (error) {
+    console.log(`${column} reminder hand-back failed: ${error.stack || error}`);
   }
-  return failures;
+  return 1;
 }
 
 // Bookings made before rosters existed have nobody to remind individually, so
-// they keep the original booking-level reminder to whoever booked them.
+// they keep the original booking-level reminder, tagging whoever booked them.
 async function remindRosterlessBookings(env, now, column, headline) {
   const scope = chatScope(env, 'b.chat_id');
   const { results } = await env.DB.prepare(
@@ -1684,25 +1648,12 @@ async function remindRosterlessBookings(env, now, column, headline) {
         user_id: booking.created_by_user_id,
         name: booking.created_by_name || 'Squash player',
       }];
-      const html = reminderHtml(booking, roster, headline, tz);
-      const outcome = await sendPrivately(
-        env, booking.chat_id, html, booking.created_by_user_id,
-        reminderExpiry(booking, tz), { replyMarkup: OK_MARKUP }
-      );
-      if (outcome === 'not-ephemeral') {
-        if (!(await remindPublicly(env, booking, roster, headline, tz))) {
-          await env.DB.prepare(`UPDATE bookings SET ${column}_sent = 0 WHERE id = ?`)
-            .bind(booking.id).run();
-          failures += 1;
-        }
-      } else if (outcome === 'failed') {
-        // Only a transient failure is handed back. A refusal — blocked, gone,
-        // never reachable — would come back the same every minute, so the flag
-        // stays spent there, the same as on the roster path.
+      const outcome = await remindPublicly(env, booking, roster, headline, tz);
+      if (outcome === 'failed') {
         await env.DB.prepare(`UPDATE bookings SET ${column}_sent = 0 WHERE id = ?`)
           .bind(booking.id).run();
         failures += 1;
-      } else if (outcome === 'refused' || outcome === 'uncertain') {
+      } else if (outcome === 'uncertain' || outcome === 'refused') {
         console.log(`${column} reminder ${booking.id} ${outcome === 'refused'
           ? 'refused by Telegram' : 'timed out, may have arrived'}; not retried`);
       }

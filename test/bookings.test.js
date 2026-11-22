@@ -73,20 +73,28 @@ describe('public booking announcements', () => {
     return requests;
   }
 
-  it('confirms a new booking to the booker alone, never to the group', async () => {
+  it('sends the booker a private receipt and tags the roster in the group', async () => {
     const requests = captureTelegram();
     const roster = [{ id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick' }];
     await addBooking({ BOT_TOKEN: 'test', DB: bookingDb([storedBooking], roster) }, -123, {
       court: '4', startsAt, endsAt, reminderAt: startsAt - 3600000,
     }, { id: 7, first_name: 'Nick' });
     const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
-    expect(sent).toHaveLength(1);
-    expect(sent[0].body.text).toContain('Court 4 booked');
-    expect(sent[0].body.text).toContain('👥 <a href="tg://user?id=7">Nick</a> · 2 slots');
-    // Visible only to whoever booked it, and dismissable.
-    expect(sent[0].body.ephemeral_message_parameters?.receiver_user_id).toBe(7);
-    expect(sent[0].body.reply_markup.inline_keyboard[0][0])
+    expect(sent).toHaveLength(2);
+    for (const message of sent) {
+      expect(message.body.text).toContain('Court 4 booked');
+      expect(message.body.text).toContain('👥 <a href="tg://user?id=7">Nick</a> · 2 slots');
+    }
+    // The receipt is visible only to whoever booked it, and dismissable.
+    const receipt = sent.find((message) => message.body.ephemeral_message_parameters);
+    expect(receipt.body.ephemeral_message_parameters.receiver_user_id).toBe(7);
+    expect(receipt.body.reply_markup.inline_keyboard[0][0])
       .toEqual({ text: '👍 OK', callback_data: 'sb:ok' });
+    // The group copy notifies the players it tags, and has no buttons.
+    const notice = sent.find((message) => !message.body.ephemeral_message_parameters);
+    expect(notice.body.chat_id).toBe(-123);
+    expect(notice.body.disable_notification).toBe(false);
+    expect(notice.body.reply_markup).toBeUndefined();
   });
 
   it('removes a booking without posting to the group', async () => {
@@ -836,29 +844,35 @@ describe('public booking announcements', () => {
     };
   }
 
-  it('sends the two-hour reminder to each player, visible only to them', async () => {
+  it('sends one two-hour reminder to the group, tagging every player', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
       requests.push({ url: String(url), body: JSON.parse(init.body) });
       return new Response(JSON.stringify({
-        ok: true, result: { message_id: 1, ephemeral_message_id: 12 },
+        ok: true, result: { message_id: 1 },
       }), { headers: { 'Content-Type': 'application/json' } });
     }));
+    const db = reminderDb();
     await runMaintenance(
-      { BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: reminderDb() }, startsAt - 2 * 60 * 60 * 1000
+      { BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: db }, startsAt - 2 * 60 * 60 * 1000
     );
+    // One message for the court, not one per player, and never ephemeral:
+    // Telegram drops an ephemeral cron message for anybody offline.
     const reminders = requests.filter((request) => request.url.endsWith('/sendMessage'));
-    expect(reminders).toHaveLength(2);
-    // Posted in the group chat, but addressed to one player each.
-    expect(reminders.every((request) => request.body.chat_id === -123)).toBe(true);
-    expect(reminders.map((request) => request.body.ephemeral_message_parameters?.receiver_user_id)).toEqual([7, 9]);
-    for (const reminder of reminders) {
-      expect(reminder.body.text).toContain('Squash in 2 hours!');
-      expect(reminder.body.text).toContain('Court 4');
-      expect(reminder.body.text).toContain(
-        '<a href="tg://user?id=7">Nick</a>, <a href="tg://user?id=9">@alice</a>, @dodgerblueee'
-      );
-    }
+    expect(reminders).toHaveLength(1);
+    const [reminder] = reminders;
+    expect(reminder.body.chat_id).toBe(-123);
+    expect(reminder.body).not.toHaveProperty('ephemeral_message_parameters');
+    // The tags are what notify each player, so it is not sent silently.
+    expect(reminder.body.disable_notification).toBe(false);
+    expect(reminder.body.text).toContain('Squash in 2 hours!');
+    expect(reminder.body.text).toContain('Court 4');
+    expect(reminder.body.text).toContain(
+      '<a href="tg://user?id=7">Nick</a>, <a href="tg://user?id=9">@alice</a>, @dodgerblueee'
+    );
+    // Queued for deletion when the court ends.
+    const cleanup = db.ran.find((query) => query.sql.includes('INSERT INTO sent_messages'));
+    expect(cleanup.args).toContain(endsAt);
   });
 
   // Rosters are seeded with their own flags unspent, so a booking made inside a
@@ -1011,34 +1025,9 @@ describe('public booking announcements', () => {
     expect(sweep.args).toContain(-123);
   });
 
-  it('falls back to one public reminder instead of one per player', async () => {
-    // Telegram returns an ordinary group message when it cannot deliver an
-    // ephemeral one. Sending to every player regardless would post the same
-    // reminder to the group once per person.
-    const requests = [];
-    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
-      requests.push({ url: String(url), body: JSON.parse(init.body) });
-      return new Response(JSON.stringify({ ok: true, result: { message_id: 77 } }), {
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }));
-    await runMaintenance(
-      { BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: reminderDb() }, startsAt - 2 * 60 * 60 * 1000
-    );
-    const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
-    const deleted = requests.filter((request) => request.url.endsWith('/deleteMessage'));
-    expect(sent).toHaveLength(2);
-    expect(sent[0].body.ephemeral_message_parameters?.receiver_user_id).toBe(7);
-    expect(deleted).toHaveLength(1);
-    expect(deleted[0].body.message_id).toBe(77);
-    expect(sent[1].body).not.toHaveProperty('ephemeral_message_parameters');
-    expect(sent[1].body.text).toContain('tg://user?id=7');
-    expect(sent[1].body.text).toContain('tg://user?id=9');
-  });
-
-  // Every cron tick sends to the same player until the court starts, so a
-  // Telegram that will never take the message has to be told apart from one
-  // that is briefly busy.
+  // Every cron tick sends to the same court until it starts, so a Telegram
+  // that will never take the message has to be told apart from one that is
+  // briefly busy.
   function refusingTelegram(description) {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
@@ -1053,14 +1042,14 @@ describe('public booking announcements', () => {
     return requests;
   }
 
-  it('stops reminding a player Telegram has permanently refused', async () => {
-    refusingTelegram('Forbidden: bot was blocked by the user');
+  it('stops reminding a court whose group Telegram has permanently refused', async () => {
+    refusingTelegram('Forbidden: bot was kicked from the supergroup chat');
     const db = reminderDb();
     await runMaintenance(
       { BOT_TOKEN: 'test', ALLOWED_CHATS: '-123', DB: db }, startsAt - 2 * 60 * 60 * 1000
     );
-    // Handing the claim back would retry the same refusal every minute until
-    // the court starts, and sort that player to the front of the next window.
+    // Handing the claims back would retry the same refusal every minute until
+    // the court starts, and sort that court to the front of the next window.
     expect(db.ran.some((query) => query.sql.includes('SET pre_reminder_sent = 0')))
       .toBe(false);
   });
@@ -1073,8 +1062,8 @@ describe('public booking announcements', () => {
     );
     const reset = db.ran.find((query) => query.sql.includes('SET pre_reminder_sent = 0'));
     expect(reset).toBeTruthy();
-    // By player row, never the whole booking: the rest of the court's
-    // reminders went out and must stay spent.
+    // By player row, never the whole booking: only the claims this pass took
+    // are handed back.
     expect(reset.sql).toMatch(/WHERE id (= \?|IN \()/);
     expect(reset.sql).not.toContain('booking_id');
   });

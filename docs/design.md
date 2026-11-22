@@ -232,10 +232,10 @@ list in force never reaches charges it off-peak and logs a warning that
 
 ## Privacy
 
-The pinned board, pinned tab, availability announcements, and reminder fallback
-below are addressed to the group. Everything else it sends — forms,
-receipts, reminders, errors, and every reply to a command — is ephemeral: only
-the recipient and the bot see them.
+The pinned board, pinned tab, availability announcements, new-court notices
+and reminders are addressed to the group. Everything else it sends — forms,
+receipts, errors, and every reply to a command — is ephemeral: only the
+recipient and the bot see them.
 
 What you send is a different matter. Commands other than `/debt` are registered
 without `is_ephemeral`, so a command, like a booking typed as ordinary text, is
@@ -269,25 +269,31 @@ cancelling asks to confirm first. The separate availability
 announcement shows the court, time, free slots and who is on it already, so
 "should I join" is answerable from the message; it does not name the booker.
 
-Each player is reminded two hours before their court and again at 10am on the
-day. Reminders clear themselves when the court ends, and receipts at the end
-of the day they are about. Telegram only guarantees a private message's
-deletion to a phone that is online at that moment, and court end reaches far
-more people than midnight did. Panels — the court list, Manage, a 🧾 tab breakdown — are working
+Every new court is posted to the group as it is booked — on somebody's behalf
+or from the Mini App included — with its court, time and roster, and each
+court is reminded in the group two hours before and again at 10am on the day:
+one message per court, tagging every player. The tags notify each player even
+with the group muted, so these are not sent silently. All three are deleted
+when the court ends. Receipts clear at the end of the day they are about.
+Telegram only guarantees a private message's deletion to a phone that is
+online at that moment, and court end reaches far more people than midnight
+did. Panels — the court list, Manage, a 🧾 tab breakdown — are working
 surfaces rather than records, so each clears itself a day after it opens. So
 do a command's status and error notes, such as "Board refreshed" or a usage
 line.
-Telegram does not guarantee ephemeral delivery when the recipient is
-offline; if it refuses, the private copy is deleted and the whole roster is
-reminded once in the group rather than one public post per player. Refusal is
-the detectable case only: Telegram can also accept an ephemeral send — id
-returned, success reported — and still drop it for an offline recipient,
-which is documented Bot API behaviour and was confirmed live. A tap's
-`callback_query_id` grants reliable delivery, which is why every panel and
-receipt arrives; a cron reminder has no tap to ride on, so it only reliably
-reaches players who are online when it fires. The fix would be reminders as
-ordinary DMs — stored and pushed, needing each player to Start the bot once —
-considered and declined to keep the bot group-only.
+
+Until 22 Nov 2026 reminders were private, one per player. Telegram can accept
+an ephemeral send — id returned, success reported — and still drop it for an
+offline recipient, which is documented Bot API behaviour and was confirmed
+live. A tap's `callback_query_id` grants reliable delivery, which is why every
+panel and receipt arrives; a cron reminder has no tap to ride on, so it only
+reliably reached players who were online when it fired, and a player missed a
+court's reminders that way. Ordinary DMs would fix it too, but need each player
+to Start the bot once, and were declined to keep the bot group-only. A private
+reminder that missed a phone also left a copy behind once the bot deleted it:
+the phone never heard of the delete, and its OK did nothing. Group messages
+have neither problem. A reminder for a court that is cancelled before it starts
+stays up until the time the court would have ended.
 
 ## Commands
 

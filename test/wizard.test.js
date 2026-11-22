@@ -163,8 +163,12 @@ describe('booking wizard save', () => {
     expect(state.insertArgs[9]).toBe(null);
     expect(state.insertArgs[10]).toBe('@alice');
     expect(state.seated[0]).toBe('@alice');
-    // Record-keeping, not a notification: no receipt goes anywhere.
-    expect(requests.some((request) => request.url.endsWith('/sendMessage'))).toBe(false);
+    // No private receipt, since nobody tapped for one; the group is told,
+    // tagging the court's players.
+    const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
+    expect(sent).toHaveLength(1);
+    expect(sent[0].body.ephemeral_message_parameters).toBeUndefined();
+    expect(sent[0].body.text).toContain('booked');
   });
 
   it('saves a free court from the booked-by picker', async () => {

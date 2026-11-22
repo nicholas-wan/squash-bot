@@ -35,10 +35,12 @@ played its cost is split and added to a running tab.
 - **Cost splitting and a tab.** Courts are charged once played, at peak and
   off-peak rates, split across the roster and recorded in an append-only
   ledger. A second pinned message shows who owes what.
-- **Reminders and monthly notices.** Players are reminded before their court,
-  and larger balances get a private, itemised notice once a month.
-- **Private by default.** Forms, receipts and reminders are ephemeral
-  messages that only the recipient sees.
+- **Reminders and monthly notices.** Each new court and both of its reminders
+  are posted to the group, tagging the players so each one is notified, and
+  are deleted when the court ends. Larger balances get a private, itemised
+  notice once a month.
+- **Private by default.** Forms, receipts and replies are ephemeral messages
+  that only the recipient sees.
 - **Admin tools.** Seat or remove players, open extra slots, record who booked,
   settle balances, and add or undo one-off `/debt` entries.
 - **Mini App.** A Telegram Mini App for managing courts and the tab from a

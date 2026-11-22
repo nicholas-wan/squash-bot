@@ -96,27 +96,28 @@ it('keeps retrying a chat whose failure is only temporary', async () => {
   expect(db.prepare('SELECT board FROM pending_refreshes WHERE chat_id = -123').get().board).toBe(1);
 });
 
-it('never reminds a player twice when the public fallback fails', async () => {
+it('retries a court reminder the group could not take, and sends it only once', async () => {
   // Starts in an hour, so the two-hour reminder is due.
   book(1, now + HOUR);
   seat(1, 1);
   seat(1, 2);
   seat(1, 3);
-  reply = (method, body) => {
+  let attempts = 0;
+  reply = (method) => {
     if (method !== 'sendMessage') return null;
-    // Player 2 cannot be reached privately, and the group fallback fails too.
-    if (body.ephemeral_message_parameters?.receiver_user_id === 2) return { ok: true, result: { message_id: 9 } };
-    if (!body.ephemeral_message_parameters?.receiver_user_id) return { ok: false, description: 'Internal Server Error' };
-    return { ok: true, result: { message_id: 8, ephemeral_message_id: body.ephemeral_message_parameters?.receiver_user_id } };
+    attempts += 1;
+    return attempts === 1 ? { ok: false, description: 'Internal Server Error' } : null;
   };
   await runMaintenance(env, now);
   await runMaintenance(env, now + 60000);
-  const remindersTo = (userId) => requests.filter((request) => request.method === 'sendMessage'
-    && request.ephemeral_message_parameters?.receiver_user_id === userId).length;
-  expect(remindersTo(1)).toBe(1);
-  expect(remindersTo(3)).toBe(1);
-  // Player 2 is still owed theirs, and gets another try.
-  expect(remindersTo(2)).toBe(2);
+  await runMaintenance(env, now + 120000);
+  const reminders = requests.filter((request) => request.method === 'sendMessage'
+    && String(request.text).includes('in 2 hours'));
+  // One failed try, then one reminder for the whole court, never repeated.
+  expect(reminders).toHaveLength(2);
+  expect(reminders.every((request) => !request.ephemeral_message_parameters)).toBe(true);
+  expect(db.prepare('SELECT COUNT(*) AS n FROM booking_players WHERE pre_reminder_sent = 0').get().n)
+    .toBe(0);
 });
 
 it('never offers the same person twice under their handle and their account', async () => {
@@ -201,21 +202,20 @@ it('never charges the organiser\'s guest, only the members beside them', async (
   expect(charges).toEqual([{ slug: 'u5', amount_cents: 100 }]);
 });
 
-it('does not remind somebody who joined after the reminder was due', async () => {
+it('sends a court one reminder when somebody joined after it was due', async () => {
   // A court in an hour: its two-hour reminder was due an hour ago.
   book(1, now + HOUR);
   seat(1, 5);
   db.prepare(`INSERT INTO booking_players (booking_id, chat_id, user_id, slug, name, created_at)
     VALUES (1, -123, 6, 'u6', 'Late', ?)`).run(now - 10 * 60000);
-  reply = (method, body) => (method === 'sendMessage' && body.ephemeral_message_parameters?.receiver_user_id
-    ? { ok: true, result: { ephemeral_message_id: 7 } } : null);
   await runMaintenance(env, now);
+  await runMaintenance(env, now + 60000);
   const reminded = requests
-    .filter((request) => request.method === 'sendMessage' && String(request.text).includes('in 2 hours'))
-    .map((request) => request.ephemeral_message_parameters?.receiver_user_id);
-  // The player seated yesterday is reminded; the one who joined ten minutes
-  // ago already has their join confirmation, and gets nothing overdue.
-  expect(reminded).toEqual([5]);
+    .filter((request) => request.method === 'sendMessage' && String(request.text).includes('in 2 hours'));
+  // The player seated yesterday is owed it; the late joiner's own row is not
+  // due, so it cannot set off a second copy on the next tick.
+  expect(reminded).toHaveLength(1);
+  expect(reminded[0].text).toContain('tg://user?id=5');
 });
 
 it('says tomorrow when a morning court is reminded the evening before', async () => {
@@ -228,7 +228,8 @@ it('says tomorrow when a morning court is reminded the evening before', async ()
   seat(1, 5);
   await runMaintenance(env, evening);
   const reminder = requests.find((request) => request.method === 'sendMessage'
-    && request.ephemeral_message_parameters?.receiver_user_id === 5);
+    && String(request.text).startsWith('🎾'));
+  expect(reminder.ephemeral_message_parameters).toBeUndefined();
   expect(reminder.text).toContain('Squash tomorrow!');
 });
 
