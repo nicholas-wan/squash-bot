@@ -248,43 +248,33 @@ describe('A command sent as a group message', () => {
         .toBe(0);
     });
 
-    it('stays while its form is open, on the sweep, and goes on Confirm', async () => {
+    it('with details goes as soon as its form opens, off the sweep', async () => {
       await post('/book 20 Aug 2027 c4 9pm');
-      expect(deletes()).toEqual([]);
+      expect(deletes()).toEqual([[CHAT, 5]]);
       expectAnsweredPrivately();
-      expect(sql.prepare(
-        'SELECT receiver_user_id, is_ephemeral FROM sent_messages WHERE message_id = 5'
-      ).get()).toEqual({ receiver_user_id: 7, is_ephemeral: 0 });
+      expect(sql.prepare('SELECT source_message_id FROM booking_drafts').get())
+        .toEqual({ source_message_id: null });
+      expect(sql.prepare('SELECT COUNT(*) AS n FROM sent_messages WHERE message_id = 5').get().n)
+        .toBe(0);
 
       await tap(`bw:${draftId()}:y`);
       expect(sql.prepare('SELECT COUNT(*) AS n FROM bookings').get().n).toBe(1);
-      expect(deletes()).toContainEqual([CHAT, 5]);
       expect(deletes().filter(([, id]) => id === 5)).toHaveLength(1);
-      expect(sql.prepare('SELECT COUNT(*) AS n FROM sent_messages WHERE message_id = 5').get().n)
-        .toBe(0);
     });
 
-    it('with @handles and a court, like the one in the screenshot, goes on Confirm', async () => {
+    it('with @handles and a court, like the one in the screenshot, goes as the form opens', async () => {
       await post('/book@squash_book_bot 20 Aug 2027 9pm @wsthang c3');
-      expect(deletes()).toEqual([]);
+      expect(deletes()).toEqual([[CHAT, 5]]);
       await tap(`bw:${draftId()}:y`);
       expect(deletes().filter(([, id]) => id === 5)).toHaveLength(1);
       const booked = sql.prepare('SELECT court FROM bookings').get();
       expect(String(booked.court)).toContain('3');
     });
 
-    it('stays after Cancel until the notice’s OK clears it', async () => {
-      await post('/book 20 Aug 2027 c4 9pm');
-      await tap(`bw:${draftId()}:n`);
-      expect(deletes()).toEqual([]);
-      await tap('sb:ok:5');
-      expect(deletes()).toEqual([[CHAT, 5]]);
-    });
-
-    it('takes the old one down when /book is sent again', async () => {
+    it('is not deleted twice when /book is sent again', async () => {
       await post('/book 20 Aug 2027 c4 9pm');
       await post('/book 20 Aug 2027 c5 9pm', 6);
-      expect(deletes()).toEqual([[CHAT, 5]]);
+      expect(deletes()).toEqual([[CHAT, 5], [CHAT, 6]]);
     });
 
     it('is cleared at once, wording handed back, when the form cannot open', async () => {

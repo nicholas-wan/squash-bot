@@ -163,12 +163,10 @@ describe('booking wizard save', () => {
     expect(state.insertArgs[9]).toBe(null);
     expect(state.insertArgs[10]).toBe('@alice');
     expect(state.seated[0]).toBe('@alice');
-    // No private receipt, since nobody tapped for one; the group is told,
-    // tagging the court's players.
+    // No private receipt, since nobody tapped for one, and no group notice:
+    // the board carries the new court.
     const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
-    expect(sent).toHaveLength(1);
-    expect(sent[0].body.ephemeral_message_parameters).toBeUndefined();
-    expect(sent[0].body.text).toContain('booked');
+    expect(sent.some((request) => String(request.body.text).includes('booked'))).toBe(false);
   });
 
   it('saves a free court from the booked-by picker', async () => {

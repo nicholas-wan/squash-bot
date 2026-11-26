@@ -35,10 +35,15 @@ played its cost is split and added to a running tab.
 - **Cost splitting and a tab.** Courts are charged once played, at peak and
   off-peak rates, split across the roster and recorded in an append-only
   ledger. A second pinned message shows who owes what.
-- **Reminders and monthly notices.** Each new court and both of its reminders
-  are posted to the group, tagging the players so each one is notified, and
-  are deleted when the court ends. Larger balances get a private, itemised
-  notice once a month.
+- **Reminders and monthly notices.** Each court is reminded in the group at
+  10am on the day and two hours before, tagging the players so each one is
+  notified. The 2-hour reminder replaces the day's one, and the last is
+  deleted when the court ends. Larger balances get a private, itemised notice
+  once a month.
+- **A quiet group.** The group holds only the pinned board, the pinned tab, the
+  next open court and at most one reminder per court. Typed bookings and
+  `/book` go as soon as their private form opens, and a new court is shown on
+  the board rather than announced.
 - **Private by default.** Forms, receipts and replies are ephemeral messages
   that only the recipient sees.
 - **Admin tools.** Seat or remove players, open extra slots, record who booked,

@@ -220,12 +220,13 @@ function wizardView(id, payload, now, tz) {
   return { html: lines.join('\n'), replyMarkup: { inline_keyboard: keyboard }, payload };
 }
 
-// The message a booking was typed in stays in the group while its form is
-// open, the same as a /chore in nag-bot: whoever typed it can check the form
-// against what they actually wrote, and copy it back if the parse was wrong.
-// Confirm takes it down with the form; Cancel leaves it, with an OK beside
-// the notice that clears both. It is on the sweep from the start, so a form
-// nobody finishes still takes it with the day. Only the typer's own message is
+// Until 26 Nov 2026 the message a booking was typed in stayed in the group
+// while its form was open; it is now deleted as the form opens (the form
+// quotes it), and the webhook passes no sourceMessageId. This stays for forms
+// opened before that, and for any caller that still keeps one: Confirm takes
+// it down with the form; Cancel leaves it, with an OK beside the notice that
+// clears both. It is on the sweep from the start, so a form nobody finishes
+// still takes it with the day. Only the typer's own message is
 // ever recorded here, and this reads that back before deleting: the id
 // rides in callback data, which Telegram never checks against the keyboard.
 export async function dismissKeptSource(env, chatId, userId, messageId) {

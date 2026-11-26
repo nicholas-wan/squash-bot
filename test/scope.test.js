@@ -77,16 +77,15 @@ describe('shared data across groups', () => {
     // Booked from group B, but stored under group A's id so both groups see it.
     expect(inserted[0][0]).toBe(GROUP_A);
     // Both pinned boards are rewritten; the receipt goes only to the booker,
-    // and it and the group notice only to the group they booked from.
+    // in the group they booked from, and no group notice goes anywhere.
     const boards = requests.filter((request) => request.url.endsWith('/editMessageText'));
     expect(boards.map((request) => request.body.chat_id)).toEqual([GROUP_A, GROUP_B]);
     const receipts = requests.filter(
       (request) => request.url.endsWith('/sendMessage')
         && String(request.body.text).includes('booked')
     );
-    expect(receipts).toHaveLength(2);
-    expect(receipts.map((request) => request.body.chat_id)).toEqual([GROUP_B, GROUP_B]);
-    expect(receipts.map((request) => request.body.ephemeral_message_parameters?.receiver_user_id)
-      .sort()).toEqual([9, undefined]);
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0].body.chat_id).toBe(GROUP_B);
+    expect(receipts[0].body.ephemeral_message_parameters?.receiver_user_id).toBe(9);
   });
 });

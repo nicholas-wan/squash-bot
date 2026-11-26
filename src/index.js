@@ -1098,10 +1098,11 @@ async function dispatchUpdate(env, update, identities = null) {
     await settleIdentities(env, msg.chat, msg.from, identities);
     if (await handleBookingReply(env, msg)) return;
     if (!text.startsWith('/')) {
-      // The original message stays while its form is open and goes when the
-      // form is confirmed (dismissKeptSource), so a misread booking can be
-      // checked against what was typed. A form that fails to open clears it
-      // here instead, in a finally, and hands the wording back below.
+      // The original message goes as soon as its private form opens: the form
+      // quotes it ("From: …"), so a misread booking can still be checked
+      // against what was typed, and the group is not left holding it. Until
+      // 26 Nov 2026 it stayed until Confirm. A form that fails to open clears
+      // it too, in a finally, and hands the wording back below.
       const isBooking = bookingIntent(text, msg);
       // The gate is deliberately loose — "I booked 2 tickets" reads as a
       // booking — and it is the delete that makes that expensive: ordinary
@@ -1115,12 +1116,10 @@ async function dispatchUpdate(env, update, identities = null) {
       // A form that declined to open must not take the message with it.
       let opened = null;
       try {
-        opened = await beginBooking(env, msg, text, {
-          sourceMessageId: isPublicMessage(msg) ? msg.message_id : null,
-        });
+        opened = await beginBooking(env, msg, text);
       } finally {
-        if (isBooking && opened === null && isPublicMessage(msg)) {
-          clearedText = text;
+        if (isPublicMessage(msg) && (opened === true || (isBooking && opened === null))) {
+          if (opened === null) clearedText = text;
           await clearSentMessage(env, msg);
         }
       }
@@ -1165,8 +1164,8 @@ async function dispatchUpdate(env, update, identities = null) {
     // only the bot's own messages — and so leaves alone.
     // clearSentMessage reports Telegram failures itself and resolves, so it is
     // safe to start here and await alongside the command's useful work.
-    // /book is the exception: like a typed booking, it stays until its form
-    // is confirmed, and is cleared here only when no form opened.
+    // /book is cleared once its form has opened or failed to, so a failure
+    // can still hand its wording back.
     if (command !== 'book' && isPublicMessage(msg)) {
       if (args) clearedText = text;
       clearCommand = clearSentMessage(env, msg, 'command');
@@ -1181,15 +1180,12 @@ async function dispatchUpdate(env, update, identities = null) {
     }
     if (command === 'book') {
       let opened = null;
-      // A bare /book, as the menu sends it, has no wording to check the form
-      // against, so it goes at once whether or not the form opens.
-      const keepSource = isPublicMessage(msg) && Boolean(args);
+      // Like a typed booking, "/book <details>" goes as soon as the form opens,
+      // which quotes it.
       try {
-        opened = await beginBooking(env, msg, args, {
-          forceIntent: true, sourceMessageId: keepSource ? msg.message_id : null,
-        });
+        opened = await beginBooking(env, msg, args, { forceIntent: true });
       } finally {
-        if (isPublicMessage(msg) && (opened !== true || !keepSource)) {
+        if (isPublicMessage(msg)) {
           if (opened === null && args) clearedText = text;
           await clearSentMessage(env, msg, 'command');
         }

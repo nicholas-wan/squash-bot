@@ -743,3 +743,59 @@ it('clears a court reminder when the court ends, and retries a delete that faile
   await runMaintenance(env, startsAt + 3660000);
   expect(db.prepare('SELECT count(*) AS n FROM sent_messages WHERE message_id = 900').get().n).toBe(0);
 });
+
+describe('one reminder per court in the group', () => {
+  const HOUR = 3600000;
+  const startsAt = now + 6 * HOUR;
+  beforeEach(() => {
+    db.prepare('DELETE FROM bookings').run();
+    book(2, startsAt);
+    db.prepare('UPDATE bookings SET pre_reminder_at = ? WHERE id = 2').run(startsAt - 2 * HOUR);
+    seat(7, 1, 2);
+  });
+  const reminder = (headline) => sends().find(r => String(r.text).includes(headline));
+  const idOf = (request) => requests.indexOf(request) + 101;
+  const deleted = () => requests.filter(r => r.method === 'deleteMessage').map(r => r.message_id);
+  const kept = () => db.prepare('SELECT reminder_message_id FROM bookings WHERE id = 2').get().reminder_message_id;
+
+  it('takes the day reminder down when the 2-hour one posts, and the last at court end', async () => {
+    await runMaintenance(env, now);
+    const day = idOf(reminder('Squash today!'));
+    expect(kept()).toBe(day);
+    expect(deleted()).not.toContain(day);
+
+    await runMaintenance(env, startsAt - 2 * HOUR);
+    const twoHour = idOf(reminder('Squash in 2 hours!'));
+    expect(deleted()).toContain(day);
+    expect(kept()).toBe(twoHour);
+    // The day reminder is off the sweep; the 2-hour one waits for court end.
+    expect(db.prepare('SELECT message_id FROM sent_messages WHERE is_ephemeral = 0')
+      .all().map(row => row.message_id)).toEqual([twoHour]);
+
+    await runMaintenance(env, startsAt + HOUR);
+    expect(deleted()).toContain(twoHour);
+  });
+
+  it('counts the new reminder as sent when the earlier one will not delete', async () => {
+    await runMaintenance(env, now);
+    const day = idOf(reminder('Squash today!'));
+    failure = method => (method === 'deleteMessage'
+      ? { ok: false, error_code: 500, description: 'Internal Server Error' } : null);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    await runMaintenance(env, startsAt - 2 * HOUR);
+    await runMaintenance(env, startsAt - 2 * HOUR + 60000);
+    expect(sends().filter(r => String(r.text).includes('Squash in 2 hours!'))).toHaveLength(1);
+    // Still on the sweep, so it goes when the court ends.
+    expect(db.prepare('SELECT count(*) AS n FROM sent_messages WHERE message_id = ?').get(day).n)
+      .toBe(1);
+  });
+
+  it('leaves the 2-hour reminder standing when one tick finds both due', async () => {
+    await runMaintenance(env, startsAt - 2 * HOUR);
+    const day = idOf(reminder('Squash today!'));
+    const twoHour = idOf(reminder('Squash in 2 hours!'));
+    expect(deleted()).toContain(day);
+    expect(deleted()).not.toContain(twoHour);
+    expect(kept()).toBe(twoHour);
+  });
+});

@@ -31,6 +31,9 @@ Found by review, none of them load-bearing enough to hold a release:
 - Telegram does not guarantee that a private reminder's deletion reaches a phone
   that is offline at that moment. The bot's delete succeeds, but that one phone
   can keep showing the reminder until Telegram expires it or the app restarts.
+- A player whose private "moved" or "cancelled" notice does not arrive only
+  finds out from the pinned board. Until 26 Nov 2026 they were tagged in a
+  silent group message; the owner chose a quiet group over that backup.
 - A reminder's removal time is set when it is sent. A court moved or cancelled
   afterwards keeps that reminder until the original court's end.
 - A message the cleanup sweep cannot delete is retried on the next tick, but

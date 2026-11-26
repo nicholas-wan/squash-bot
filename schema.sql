@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS bookings (
   source_text TEXT,
   created_at INTEGER NOT NULL,
   -- 1 when whoever booked it paid and is not charging anyone: never billed.
-  free INTEGER NOT NULL DEFAULT 0
+  free INTEGER NOT NULL DEFAULT 0,
+  -- The court's latest group reminder, deleted when the next one posts.
+  reminder_message_id INTEGER
 );
 
 -- Who is playing. slug is the stable identity: "u<telegram id>" for anyone who

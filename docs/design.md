@@ -128,7 +128,10 @@ tapped gets a confirmation, everyone else on the court gets word of it, both
 naming the roster as it stands after the tap — so a freed slot is news rather
 than something noticed later on the board. A cancelled or moved booking is
 announced to its roster the same private way — a reminder may already be in
-hand, and silence there is how no-shows happen. These and
+hand, and silence there is how no-shows happen. Whoever that private notice
+does not reach finds out from the pinned board: until 26 Nov 2026 they were
+tagged in a silent group message instead, which the quiet group no longer
+allows. These and
 the removal notice go to the chat the tap came from, not the one each roster row
 was created in — an ephemeral message is only visible where it is posted, and
 under `DATA_CHAT_ID` a roster spans groups, so a notice sent by the row would
@@ -232,8 +235,9 @@ list in force never reaches charges it off-peak and logs a warning that
 
 ## Privacy
 
-The pinned board, pinned tab, availability announcements, new-court notices
-and reminders are addressed to the group. Everything else it sends — forms,
+The pinned board, pinned tab, the availability announcement for the next open
+court, and reminders are addressed to the group, and nothing else stays there:
+at most one reminder per court is up at a time. Everything else it sends — forms,
 receipts, errors, and every reply to a command — is ephemeral: only the
 recipient and the bot see them.
 
@@ -247,14 +251,13 @@ may only delete its own ephemeral messages — so each one stayed in the sender'
 chat for good. A client still holding that old menu sends ephemeral commands for
 a while; they are answered and left where they are. `/debt` keeps that trade on
 purpose: it names a player, an amount and a reason, so it stays out of the group
-and remains in the admin's own chat. Every other command goes at once, except a
-`/book` with details. That, like a typed booking, stays while its form is open,
-as with a `/chore` in nag-bot, so the form can be checked against what was
-typed, and goes when the form is confirmed. Cancel leaves it, with an **OK** on the cancelled notice that clears
-both; typing the booking again clears the old one; an abandoned form takes it
-with the day's sweep. Only the typer's own message can be cleared that way. A
-form that fails to open clears it at once and hands the wording back, and
-without the right the bot says so privately rather than failing quietly. That delete is why free text is only read as a booking from group
+and remains in the admin's own chat. Every other command goes at once. A typed
+booking and a `/book` with details go as soon as the private form opens: the
+form quotes what was typed ("From: …"), so it can still be checked against the
+wording. Until 26 Nov 2026 they stayed in the group until the form was
+confirmed, as with a `/chore` in nag-bot. A form that fails to open clears it
+at once and hands the wording back, and without the right the bot says so
+privately rather than failing quietly. That delete is why free text is only read as a booking from group
 admins: the intent gate is loose on purpose, and applied to everyone it cleared
 ordinary chat out of the group for looking like a court. Anybody else's
 booking-shaped message is ignored where it stands — no form, nothing removed —
@@ -269,12 +272,19 @@ cancelling asks to confirm first. The separate availability
 announcement shows the court, time, free slots and who is on it already, so
 "should I join" is answerable from the message; it does not name the booker.
 
-Every new court is posted to the group as it is booked — on somebody's behalf
-or from the Mini App included — with its court, time and roster, and each
-court is reminded in the group two hours before and again at 10am on the day:
-one message per court, tagging every player. The tags notify each player even
-with the group muted, so these are not sent silently. All three are deleted
-when the court ends. Receipts clear at the end of the day they are about.
+A new court is not announced in the group; the board shows it. From 22 to 26
+Nov 2026 a "Court X booked" notice tagged its roster, but it had no button, so
+nobody could clear it, and it stayed until the court ended. Each court is
+reminded in the group at 10am on the day (the evening before, for a morning
+court) and two hours before: one message per court, tagging every player. The
+tags notify each player even with the group muted, so these are not sent
+silently. Each booking keeps its latest reminder's message id
+(`bookings.reminder_message_id`), and the next reminder deletes that message,
+so the 2-hour reminder replaces the day's one; the last is deleted when the
+court ends. That delete is best effort: if it fails, the new reminder still
+counts as sent and is never resent, and the old one goes at court end. Day
+reminders run before 2-hour ones in each tick, so a tick that finds both due
+leaves the 2-hour one up. Receipts clear at the end of the day they are about.
 Telegram only guarantees a private message's deletion to a phone that is
 online at that moment, and court end reaches far more people than midnight
 did. Panels — the court list, Manage, a 🧾 tab breakdown — are working

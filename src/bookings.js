@@ -124,25 +124,11 @@ async function confirmToBooker(env, chatId, bookingId, booking, capacity, from, 
   );
 }
 
-// Every new court is also posted to the group, tagging its roster, so each
-// player is notified — even with the group muted — however the court was
-// booked, on their behalf included. The private receipt alone was an ephemeral
-// message only the booker saw, and the players they added heard nothing
-// reliable until a reminder. It is deleted when the court ends, like the
-// reminders. A booking stored under the data chat id is posted to a chat the
-// bot is actually in.
-async function announceBooking(env, chatId, bookingId, booking, capacity) {
-  const [tz, roster] = await Promise.all([getTimezone(env, chatId), rosterFor(env, bookingId)]);
-  const target = reachableChat(env, { chat_id: chatId }, chatId);
-  const sent = await sendMessage(env, target, receiptHtml(booking, roster, capacity, tz));
-  if (!sent.ok || !sent.result) {
-    throw new Error(sent.description || 'Telegram refused the message');
-  }
-  const startsAt = booking.startsAt ?? booking.starts_at;
-  const endsAt = booking.endsAt ?? booking.ends_at;
-  await scheduleCleanup(env, target, sent.result, null,
-    reminderExpiry({ starts_at: startsAt, ends_at: endsAt }, tz));
-}
+// A new court is not posted to the group. From 22 to 26 Nov 2026 a "Court X
+// booked" notice tagged the roster, but it had no button, so nobody could
+// clear it, and it sat in the group until the court ended. The group now
+// holds only the pinned messages, the next open court and the reminders; the
+// board shows the new court, and the reminders tag its players.
 
 function receiptHtml(booking, roster, capacity, tz) {
   const startsAt = booking.startsAt ?? booking.starts_at;
@@ -265,9 +251,6 @@ export async function addBooking(
           console.log(`Receipt for booking ${bookingId} failed: ${error.stack || error}`);
         })
       : null,
-    announceBooking(env, chatId, bookingId, parsed, capacity).catch((error) => {
-      console.log(`Group notice for booking ${bookingId} failed: ${error.stack || error}`);
-    }),
   ]), defer);
   return bookingId;
 }
@@ -1119,30 +1102,21 @@ export async function removePlayerView(env, chatId, bookingId) {
 //
 // A private message nobody tapped for is the kind Telegram drops for somebody
 // who is offline, and for these two that is how a person turns up at 9pm for
-// a court that moved to 8. Whoever the private copy did not reach — and anyone
-// seated by handle alone, who has no account to write to — is tagged in one
-// silent group message instead, which stays until the end of that day.
+// a court that moved to 8. Until 26 Nov 2026 whoever the private copy did not
+// reach was tagged in a silent group message instead, but the group is kept
+// to the pinned messages, the next open court and its reminders, so the
+// pinned board is where they see the change. Owner's call, in
+// docs/known-gaps.md.
 async function notifyRosterDirectly(env, chatId, roster, html, deleteAfter, excludeUserId = null) {
   const told = new Set();
   const cleanups = [];
-  const missed = [];
   await Promise.all(roster.map(async (player) => {
-    if (player.user_id && (player.user_id === excludeUserId || told.has(player.user_id))) return;
-    if (!player.user_id) {
-      missed.push(player);
-      return;
-    }
+    if (!player.user_id || player.user_id === excludeUserId || told.has(player.user_id)) return;
     told.add(player.user_id);
-    const outcome = await sendPrivately(env, chatId, html, player.user_id, deleteAfter,
+    await sendPrivately(env, chatId, html, player.user_id, deleteAfter,
       { replyMarkup: OK_MARKUP, cleanups });
-    // A timed-out copy may well have landed; tagging them in the group as
-    // well would tell them twice, once in front of everybody.
-    if (outcome !== 'private' && outcome !== 'uncertain') missed.push(player);
   }));
   await saveCleanups(env, cleanups);
-  if (!missed.length) return;
-  const sent = await sendMessage(env, chatId, `${html}\n${playerTags(missed)}`, { silent: true });
-  if (sent.ok && sent.result) await scheduleCleanup(env, chatId, sent.result, null, deleteAfter);
 }
 
 // The person taken off is told privately. Deliberately narrower than the
@@ -1425,11 +1399,46 @@ async function remindPublicly(env, booking, roster, headline, tz) {
   const chatId = reachableChat(env, { chat_id: booking.chat_id }, booking.chat_id);
   const sent = await sendMessage(env, chatId, reminderHtml(booking, roster, headline, tz));
   if (sent.ok && sent.result) {
-    await scheduleCleanup(env, chatId, sent.result, null, reminderExpiry(booking, tz));
+    await Promise.all([
+      scheduleCleanup(env, chatId, sent.result, null, reminderExpiry(booking, tz)),
+      replaceEarlierReminder(env, chatId, booking, sent.result.message_id),
+    ]);
     return 'sent';
   }
   if (sent.timedOut) return 'uncertain';
   return CHAT_GONE.test(String(sent.description || '')) ? 'refused' : 'failed';
+}
+
+// The group holds at most one reminder per court: the 2-hour reminder takes
+// the day's one down, and the last is deleted when the court ends. The booking
+// keeps its latest reminder's id for the next one to remove. Best effort, and
+// it never throws: the new reminder is out, and a throw here would hand its
+// claims back and send it again.
+async function replaceEarlierReminder(env, chatId, booking, messageId) {
+  const earlier = booking.reminder_message_id;
+  const remember = (async () => env.DB.prepare(
+    'UPDATE bookings SET reminder_message_id = ? WHERE id = ?'
+  ).bind(messageId || null, booking.id).run())().catch((error) => {
+      console.log(`Reminder id for booking ${booking.id} not kept: ${error.stack || error}`);
+    });
+  if (!earlier || Number(earlier) === Number(messageId)) {
+    await remember;
+    return;
+  }
+  const remove = (async () => {
+    const removed = await deleteMessage(env, chatId, earlier);
+    if (!removed.ok && !DELETE_SETTLED.test(String(removed.description || ''))) {
+      // Its cleanup row still takes it down when the court ends.
+      console.log(`Earlier reminder ${chatId}/${earlier} not deleted: ${removed.description}`);
+      return;
+    }
+    await env.DB.prepare(
+      'DELETE FROM sent_messages WHERE chat_id = ? AND message_id = ? AND is_ephemeral = 0'
+    ).bind(chatId, earlier).run();
+  })().catch((error) => {
+    console.log(`Earlier reminder for booking ${booking.id} failed: ${error.stack || error}`);
+  });
+  await Promise.all([remember, remove]);
 }
 
 // Maintenance has no incoming update to tell it which chat it is running for, so
@@ -2116,13 +2125,16 @@ export async function deliverSightedTabNotice(env, chatId, from, now = Date.now(
 export async function runMaintenance(env, now = Date.now()) {
   const stages = [
     ['availability announcements', () => maintainAnnouncements(env, now)],
+    // Day reminders before 2-hour ones: each court's newest reminder deletes
+    // the one before, so a tick that finds both due (after an outage, say)
+    // must leave the 2-hour one standing, not the day's.
+    ['day reminders', () => sendDueReminders(env, now)],
     ['two-hour reminders', () => sendPreReminders(env, now)],
     ['queued pinned refreshes', () => flushPendingRefreshes(env)],
     ['board refresh', () => refreshStaleBoards(env, now)],
     ['court start redraw', () => refreshStartedBoards(env, now)],
     ['monthly tab notices', () => queueMonthlyTabNotices(env, now)],
     ['overdue tab notices', () => sendOverdueTabNotices(env, now)],
-    ['day reminders', () => sendDueReminders(env, now)],
     ['message cleanup', () => purgeFinishedMessages(env, now)],
     ['booking cleanup', () => removeExpiredBookings(env, now)],
   ];

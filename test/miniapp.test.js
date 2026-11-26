@@ -408,7 +408,7 @@ describe('Booking changes from the Mini App', () => {
     expect(ran.some((sql) => sql.startsWith('UPDATE bookings'))).toBe(false);
   });
 
-  it('tags in the group whoever a cancellation could not reach privately', async () => {
+  it('posts nothing to the group when a cancellation cannot reach somebody privately', async () => {
     const requests = [];
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
       const body = JSON.parse(init.body);
@@ -425,10 +425,13 @@ describe('Booking changes from the Mini App', () => {
       apiRequest('court/3/delete', await initData(), {}), env(bookingDb(futureBooking()))
     );
     expect((await response.json()).ok).toBe(true);
-    const group = requests.find((r) => r.url.endsWith('/sendMessage') && !r.body.ephemeral_message_parameters?.receiver_user_id);
-    expect(group.body.text).toContain('Cancelled');
-    expect(group.body.text).toContain('tg://user?id=7');
-    expect(group.body.disable_notification).toBe(true);
+    // The private copy was tried; the pinned board shows the change.
+    expect(requests.some((r) => r.url.endsWith('/sendMessage')
+      && r.body.ephemeral_message_parameters?.receiver_user_id === 7
+      && String(r.body.text).includes('Cancelled'))).toBe(true);
+    const group = requests.filter((r) => r.url.endsWith('/sendMessage')
+      && !r.body.ephemeral_message_parameters?.receiver_user_id);
+    expect(group).toEqual([]);
   });
 });
 

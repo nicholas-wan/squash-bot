@@ -383,8 +383,9 @@ describe('Telegram commands', () => {
     // the form is at its confirm step.
     const labels = send.body.reply_markup.inline_keyboard.flat().map((button) => button.text);
     expect(labels).toContain('✅ Add booking');
-    // Like a typed booking, the command stays until the form is confirmed.
-    expect(requests.some((request) => request.url.endsWith('/deleteMessage'))).toBe(false);
+    // Like a typed booking, the command goes as soon as the form opens.
+    expect(requests.filter((request) => request.url.endsWith('/deleteMessage'))
+      .map((request) => request.body.message_id)).toEqual([5]);
   });
 
   it('opens a blank form for a bare command with trailing punctuation', async () => {
@@ -467,8 +468,10 @@ describe('Telegram commands', () => {
     const labels = send.body.reply_markup.inline_keyboard.flat().map((button) => button.text);
     expect(labels).toContain('✅ Add booking');
     expect(sqlSeen.some((sql) => sql.includes('INSERT INTO bookings'))).toBe(false);
-    // The booking text stays in the group until the form is confirmed.
-    expect(requests.some((request) => request.url.endsWith('/deleteMessage'))).toBe(false);
+    // The form quotes the booking text, so the group copy goes as it opens.
+    expect(send.body.text).toContain('From: <code>20 Aug 2027 Court 4 9pm</code>');
+    expect(requests.filter((request) => request.url.endsWith('/deleteMessage'))
+      .map((request) => request.body.message_id)).toEqual([5]);
   });
 
   it('clears the booking message even when the form fails to open', async () => {
@@ -616,12 +619,12 @@ describe('Telegram commands', () => {
     expect(member.some((request) => request.url.endsWith('/deleteMessage'))).toBe(false);
     expect(member.some((request) => request.url.endsWith('/sendMessage'))).toBe(false);
 
-    // An admin books exactly as before; the group message stays until the
-    // form is confirmed.
+    // An admin books exactly as before; the group message goes as the form
+    // opens.
     const admin = await run('administrator');
     const form = admin.find((request) => request.url.endsWith('/sendMessage'));
     expect(form.body.text).toContain('Confirm this squash booking');
-    expect(admin.some((request) => request.url.endsWith('/deleteMessage'))).toBe(false);
+    expect(admin.filter((request) => request.url.endsWith('/deleteMessage'))).toHaveLength(1);
   });
 
   // Telegram never checks callback data against the keyboard it drew, and the

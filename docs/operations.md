@@ -182,11 +182,13 @@ npm run db:migrate:018
 npm run db:migrate:019
 npm run db:migrate:020
 npm run db:migrate:021
+npm run db:migrate:022
 npm run db:verify
 ```
 
 Run them in that order. Everything the migrations used to create now lives in
-`schema.sql`, leaving 002, 003, 005, 006, and 016 (free courts) as `ALTER TABLE` alone, 004 as a
+`schema.sql`, leaving 002, 003, 005, 006, 016 (free courts) and 022 (each
+court's latest reminder, `bookings.reminder_message_id`) as `ALTER TABLE` alone, 004 as a
 no-op, and 007–013, 015 and 017 (pending `/debt` drafts) as idempotent
 table/index/trigger migrations. 018 replaces the alias-claim trigger, which
 `schema.sql` cannot do on a live database because its triggers are

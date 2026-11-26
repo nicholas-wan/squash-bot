@@ -73,28 +73,21 @@ describe('public booking announcements', () => {
     return requests;
   }
 
-  it('sends the booker a private receipt and tags the roster in the group', async () => {
+  it('sends the booker a private receipt and posts no notice to the group', async () => {
     const requests = captureTelegram();
     const roster = [{ id: 1, booking_id: 3, user_id: 7, slug: 'u7', name: 'Nick' }];
     await addBooking({ BOT_TOKEN: 'test', DB: bookingDb([storedBooking], roster) }, -123, {
       court: '4', startsAt, endsAt, reminderAt: startsAt - 3600000,
     }, { id: 7, first_name: 'Nick' });
     const sent = requests.filter((request) => request.url.endsWith('/sendMessage'));
-    expect(sent).toHaveLength(2);
-    for (const message of sent) {
-      expect(message.body.text).toContain('Court 4 booked');
-      expect(message.body.text).toContain('👥 <a href="tg://user?id=7">Nick</a> · 2 slots');
-    }
+    expect(sent).toHaveLength(1);
     // The receipt is visible only to whoever booked it, and dismissable.
-    const receipt = sent.find((message) => message.body.ephemeral_message_parameters);
+    const [receipt] = sent;
+    expect(receipt.body.text).toContain('Court 4 booked');
+    expect(receipt.body.text).toContain('👥 <a href="tg://user?id=7">Nick</a> · 2 slots');
     expect(receipt.body.ephemeral_message_parameters.receiver_user_id).toBe(7);
     expect(receipt.body.reply_markup.inline_keyboard[0][0])
       .toEqual({ text: '👍 OK', callback_data: 'sb:ok' });
-    // The group copy notifies the players it tags, and has no buttons.
-    const notice = sent.find((message) => !message.body.ephemeral_message_parameters);
-    expect(notice.body.chat_id).toBe(-123);
-    expect(notice.body.disable_notification).toBe(false);
-    expect(notice.body.reply_markup).toBeUndefined();
   });
 
   it('removes a booking without posting to the group', async () => {
